@@ -116,6 +116,29 @@ cmd.exe /c scripts\devenv.bat python scripts\verify_kernel.py
 This checks the kernel against the baseline's exact arithmetic across 12 shapes and prints
 per-shape timings. It should end with `all cases match the reference`.
 
+### Troubleshooting
+
+**`custom CUDA kernel unavailable, using SDPA instead`** — not an error. The extension could
+not be built, so attention fell back to SDPA; results are still correct and the benchmark
+still reports a real speedup. It happens whenever the harness is run from a plain shell,
+because `cl.exe` is only on `PATH` inside a Visual Studio developer environment. To use the
+kernel, go through `devenv.bat`:
+
+```bash
+cmd.exe /c scripts\devenv.bat python torch_transformer_benchmark.py
+```
+
+To use SDPA deliberately and silence the message, set `ATTENTION_BACKEND = "sdpa"` at the
+top of the file. To make a missing kernel a hard error instead of a fallback, set it to
+`"custom"`.
+
+**`'vswhere.exe' is not recognized`** — harmless, printed by `vcvarsall.bat` itself. The
+build succeeds regardless.
+
+**Extension builds but the harness is slower than expected** — confirm which backend
+actually ran. With `"auto"`, a silent fallback means you may be timing SDPA rather than the
+kernel; `"custom"` raises instead of falling back.
+
 ### Targeting a different GPU
 
 The build hard-codes SM 8.6. For another card, change the `-gencode` flag in
@@ -157,16 +180,23 @@ cmd.exe /c scripts\devenv.bat python torch_transformer_benchmark.py
 
 ### Choosing the attention backend
 
-Set `TTB_ATTN_BACKEND`:
+Edit `ATTENTION_BACKEND` near the top of
+[`torch_transformer_benchmark.py`](torch_transformer_benchmark.py):
+
+```python
+ATTENTION_BACKEND = "auto"
+```
 
 | Value | Behavior |
 | --- | --- |
-| `auto` *(default)* | Use the CUDA kernel if it loads, otherwise fall back to SDPA with a one-time warning. |
+| `auto` | Use the CUDA kernel if it loads, otherwise fall back to SDPA with a one-time notice. |
 | `sdpa` | Always use `F.scaled_dot_product_attention`. No build required. |
 | `custom` | Require the CUDA kernel; raise if it is unavailable, so a broken build fails loudly instead of quietly benchmarking the fallback and looking slow. |
 
+For a single run without editing the file, `--attn-backend` overrides it:
+
 ```bash
-set TTB_ATTN_BACKEND=sdpa
+python torch_transformer_benchmark.py --attn-backend sdpa
 ```
 
 ### Helper scripts

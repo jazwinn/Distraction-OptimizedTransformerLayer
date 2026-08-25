@@ -15,6 +15,8 @@ scripts/devenv.bat which calls vcvarsall.bat first:
 from __future__ import annotations
 
 import os
+import shutil
+import sys
 from typing import Optional
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -40,6 +42,17 @@ def get_kernels(verbose: bool = False):
 
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
+
+        # Bail out before calling load() when the host compiler is missing.
+        # torch probes for cl.exe itself, but it logs a full traceback at
+        # WARNING level when the probe fails, which looks like a crash for what
+        # is really just "not built, using the fallback". Checking first keeps
+        # that noise out of a run that is working as intended.
+        if sys.platform == "win32" and shutil.which("cl") is None:
+            raise RuntimeError(
+                "MSVC (cl.exe) is not on PATH, so the CUDA extension cannot be "
+                "built. Run through scripts/devenv.bat to put it there."
+            )
 
         os.makedirs(_BUILD_DIR, exist_ok=True)
         _kernels = load(

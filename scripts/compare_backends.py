@@ -32,10 +32,9 @@ BACKENDS = ("sdpa", "custom")
 
 
 def run(backend: str, args: list[str]):
-    env = dict(os.environ, TTB_ATTN_BACKEND=backend)
     proc = subprocess.run(
-        [sys.executable, SCRIPT, *args],
-        capture_output=True, text=True, cwd=REPO, env=env,
+        [sys.executable, SCRIPT, "--attn-backend", backend, *args],
+        capture_output=True, text=True, cwd=REPO,
     )
     out = proc.stdout
     status = re.search(r"summary: (PASS|FAIL)", out)

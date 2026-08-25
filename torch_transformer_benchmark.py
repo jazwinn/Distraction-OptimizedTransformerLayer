@@ -175,22 +175,20 @@ class BaselineTransformer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Attention backend selection.
+# Attention backend. Edit this line to switch.
 #
-#   "auto"   (default) use the custom CUDA kernel when it builds and loads,
-#                      otherwise silently fall back to SDPA. This is the
-#                      "custom kernel with SDPA as backup" mode.
-#   "sdpa"             always use F.scaled_dot_product_attention. Use this to
-#                      get a reference number without rebuilding anything.
-#   "custom"           require the custom kernel; raise if it is unavailable,
-#                      so a broken build fails loudly instead of quietly
-#                      benchmarking the fallback and looking slow.
+#   "auto"     use the custom CUDA kernel when it builds and loads, otherwise
+#              fall back to SDPA. This is the "custom kernel, SDPA as backup"
+#              mode.
+#   "sdpa"     always use F.scaled_dot_product_attention. No build required.
+#   "custom"   require the custom kernel; raise if it is unavailable, so a
+#              broken build fails loudly instead of quietly benchmarking the
+#              fallback and looking slow.
 #
-# Override from the shell without editing this file:
-#     set TTB_ATTN_BACKEND=sdpa       (cmd)
-#     $env:TTB_ATTN_BACKEND="sdpa"    (PowerShell)
+# (--attn-backend overrides this for a single run; scripts/compare_backends.py
+# uses that to time every backend without editing this file.)
 # ---------------------------------------------------------------------------
-ATTENTION_BACKEND = os.environ.get("TTB_ATTN_BACKEND", "auto").lower()
+ATTENTION_BACKEND = "auto"
 
 _fallback_warned = False
 
@@ -216,17 +214,19 @@ def _attention_dispatch(
             )
         if ATTENTION_BACKEND == "custom":
             raise RuntimeError(
-                f"TTB_ATTN_BACKEND={ATTENTION_BACKEND} but the CUDA extension "
-                "failed to load. "
-                f"Build it with scripts/build_ext.bat. Cause: {kernel_ext.load_error()}"
+                'ATTENTION_BACKEND is "custom" but the CUDA extension failed to '
+                "load. Build it with scripts/build_ext.bat. "
+                f"Cause: {kernel_ext.load_error()}"
             )
         if not _fallback_warned:
             _fallback_warned = True
             print(
-                f"[info] custom CUDA kernel unavailable, falling back to SDPA "
-                f"({type(kernel_ext.load_error()).__name__}). "
-                f"Build it with scripts/build_ext.bat, or set "
-                f"TTB_ATTN_BACKEND=sdpa to silence this."
+                f"[info] custom CUDA kernel unavailable, using SDPA instead "
+                f"(results are still correct). Reason: {kernel_ext.load_error()}\n"
+                f"[info] to use the kernel:  cmd.exe /c scripts\\devenv.bat "
+                f"python {os.path.basename(__file__)}\n"
+                f'[info] to silence this:    set ATTENTION_BACKEND = "sdpa" '
+                f"at the top of this file"
             )
 
     return F.scaled_dot_product_attention(
@@ -857,6 +857,13 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="enable/disable TF32 on CUDA for both implementations",
     )
+    parser.add_argument(
+        "--attn-backend",
+        choices=("auto", "sdpa", "custom"),
+        default=None,
+        help="override ATTENTION_BACKEND for this run only (default: use the "
+             "value set at the top of this file)",
+    )
     return parser.parse_args()
 
 
@@ -878,7 +885,12 @@ def validate_args(args: argparse.Namespace, device: torch.device, dtype: torch.d
 
 
 def main() -> int:
+    global ATTENTION_BACKEND
+
     args = parse_args()
+    if args.attn_backend is not None:
+        ATTENTION_BACKEND = args.attn_backend
+
     device = resolve_device(args.device)
     dtype = resolve_dtype(args.dtype)
 
