@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import copy
 import math
+import os
 import statistics
 import time
 from dataclasses import dataclass
@@ -173,6 +174,66 @@ class BaselineTransformer(nn.Module):
         return x
 
 
+# ---------------------------------------------------------------------------
+# Attention backend selection.
+#
+#   "auto"   (default) use the custom CUDA kernel when it builds and loads,
+#                      otherwise silently fall back to SDPA. This is the
+#                      "custom kernel with SDPA as backup" mode.
+#   "sdpa"             always use F.scaled_dot_product_attention. Use this to
+#                      get a reference number without rebuilding anything.
+#   "custom"           require the custom kernel; raise if it is unavailable,
+#                      so a broken build fails loudly instead of quietly
+#                      benchmarking the fallback and looking slow.
+#
+# Override from the shell without editing this file:
+#     set TTB_ATTN_BACKEND=sdpa       (cmd)
+#     $env:TTB_ATTN_BACKEND="sdpa"    (PowerShell)
+# ---------------------------------------------------------------------------
+ATTENTION_BACKEND = os.environ.get("TTB_ATTN_BACKEND", "auto").lower()
+
+_fallback_warned = False
+
+
+def _attention_dispatch(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+    is_causal: bool,
+    scale: float,
+) -> torch.Tensor:
+    """Route attention to the custom CUDA kernel or to SDPA."""
+    global _fallback_warned
+
+    if ATTENTION_BACKEND != "sdpa":
+        import kernel_ext
+
+        kernels = kernel_ext.get_kernels()
+        if kernels is not None:
+            return kernels.fused_attention_forward(
+                q, k, v, attn_mask, is_causal, scale
+            )
+        if ATTENTION_BACKEND == "custom":
+            raise RuntimeError(
+                f"TTB_ATTN_BACKEND={ATTENTION_BACKEND} but the CUDA extension "
+                "failed to load. "
+                f"Build it with scripts/build_ext.bat. Cause: {kernel_ext.load_error()}"
+            )
+        if not _fallback_warned:
+            _fallback_warned = True
+            print(
+                f"[info] custom CUDA kernel unavailable, falling back to SDPA "
+                f"({type(kernel_ext.load_error()).__name__}). "
+                f"Build it with scripts/build_ext.bat, or set "
+                f"TTB_ATTN_BACKEND=sdpa to silence this."
+            )
+
+    return F.scaled_dot_product_attention(
+        q, k, v, attn_mask=attn_mask, is_causal=is_causal, scale=scale
+    )
+
+
 class MyLinear(nn.Module):
     """Same parameter names/shapes as nn.Linear -> free strict weight loading."""
 
@@ -272,8 +333,8 @@ class MySelfAttention(nn.Module):
             # so this path only applies once we know there's no padding to fold in.
             is_causal = causal
 
-        context = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, is_causal=is_causal
+        context = _attention_dispatch(
+            q, k, v, attn_mask=attn_mask, is_causal=is_causal, scale=self.scale
         )
         context = context.transpose(1, 2).reshape(batch, seq_len, d_model)
         output = self.out_proj(context)
