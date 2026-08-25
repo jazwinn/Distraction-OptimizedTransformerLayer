@@ -126,7 +126,7 @@ class BaselineSelfAttention(nn.Module):
 class BaselineTransformerBlock(nn.Module):
     def __init__(self, d_model: int, num_heads: int, ffn_dim: int) -> None:
         super().__init__()
-        self.norm1 = nn.LayerNorm(d_model)
+        self.norm1 = nn.LayerNorm(normalized_shape=d_model)
         self.attention = BaselineSelfAttention(d_model, num_heads)
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn_in = nn.Linear(d_model, ffn_dim)
@@ -173,6 +173,145 @@ class BaselineTransformer(nn.Module):
         return x
 
 
+class MyLinear(nn.Module):
+    """Same parameter names/shapes as nn.Linear -> free strict weight loading."""
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features)) if bias else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # ====================== your codes here ======================
+        return F.linear(x, self.weight, self.bias)
+        # ============================================================
+
+
+class MyLayerNorm(nn.Module):
+    """Same parameter names/shapes as nn.LayerNorm -> free strict weight loading."""
+
+    def __init__(self, d_model: int, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d_model))
+        self.bias = nn.Parameter(torch.zeros(d_model))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # ====================== your codes here ======================
+        return F.layer_norm(x, (x.shape[-1],), self.weight, self.bias, self.eps)
+        # ============================================================
+
+
+class MySelfAttention(nn.Module):
+    """Same submodule names as BaselineSelfAttention -> free strict weight loading."""
+
+    def __init__(self, d_model: int, num_heads: int) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.scale = self.head_dim**-0.5
+        self.q_proj = MyLinear(d_model, d_model)
+        self.k_proj = MyLinear(d_model, d_model)
+        self.v_proj = MyLinear(d_model, d_model)
+        self.out_proj = MyLinear(d_model, d_model)
+
+        # Lazily-built causal mask cache. seq_len is fixed for the lifetime of
+        # a given model instance in this harness, so rebuilding this tensor on
+        # every layer's every call (6x per forward pass) was pure waste. Plain
+        # attribute, not a buffer/parameter, so it stays out of state_dict()
+        # and strict weight copying keeps working.
+        self._causal_mask_key: Optional[Tuple] = None
+        self._causal_mask: Optional[torch.Tensor] = None
+
+    def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        key = (seq_len, device)
+        if self._causal_mask_key != key:
+            self._causal_mask = torch.ones(
+                seq_len, seq_len, device=device, dtype=torch.bool
+            ).tril()
+            self._causal_mask_key = key
+        return self._causal_mask
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor] = None,
+        causal: bool = False,
+        mask_is_trivial: bool = False,
+    ) -> torch.Tensor:
+        # ====================== your codes here ======================
+        # scaled_dot_product_attention fuses matmul -> mask -> softmax -> matmul
+        # into one call instead of four separate ops, and never materializes
+        # the full [B,H,S,S] score matrix in memory the way the manual version
+        # above did.
+        batch, seq_len, d_model = x.shape
+
+        q = self.q_proj(x).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # An all-valid mask (the default --padding-ratio 0 case) still costs a
+        # real tensor and blocks the faster is_causal-only path below, so it's
+        # worth treating it as "no mask" instead. mask_is_trivial is computed
+        # once per forward pass by the caller, not re-derived on every layer.
+        use_mask = valid_token_mask is not None and not mask_is_trivial
+
+        attn_mask = None
+        is_causal = False
+        if use_mask:
+            # SDPA's bool mask means the OPPOSITE of masked_fill's:
+            # True = allowed to attend, not blocked.
+            key_mask = valid_token_mask[:, None, None, :]
+            if causal:
+                causal_allowed = self._get_causal_mask(seq_len, x.device)
+                attn_mask = key_mask & causal_allowed  # [B, 1, S, S]
+            else:
+                attn_mask = key_mask  # [B, 1, 1, S], broadcasts over queries
+        else:
+            # is_causal and attn_mask can't be combined -- SDPA rejects that --
+            # so this path only applies once we know there's no padding to fold in.
+            is_causal = causal
+
+        context = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, is_causal=is_causal
+        )
+        context = context.transpose(1, 2).reshape(batch, seq_len, d_model)
+        output = self.out_proj(context)
+
+        if valid_token_mask is not None:
+            output = output.masked_fill(~valid_token_mask[..., None], 0)
+        return output
+        # ============================================================
+
+
+class MyTransformerBlock(nn.Module):
+    """Same submodule names as BaselineTransformerBlock -> free strict weight loading."""
+
+    def __init__(self, d_model: int, num_heads: int, ffn_dim: int, causal: bool) -> None:
+        super().__init__()
+        self.norm1 = MyLayerNorm(d_model)
+        self.attention = MySelfAttention(d_model, num_heads)
+        self.norm2 = MyLayerNorm(d_model)
+        self.ffn_in = MyLinear(d_model, ffn_dim)
+        self.ffn_out = MyLinear(ffn_dim, d_model)
+        self.causal = causal  # stored once, not threaded through every forward call
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor] = None,
+        mask_is_trivial: bool = False,
+    ) -> torch.Tensor:
+        # ====================== your codes here ======================
+        x = x + self.attention(self.norm1(x), valid_token_mask, self.causal, mask_is_trivial)
+        x = x + self.ffn_out(F.gelu(self.ffn_in(self.norm2(x)), approximate="none"))
+
+        if valid_token_mask is not None:
+            x = x.masked_fill(~valid_token_mask[..., None], 0)
+        return x
+        # ============================================================
+
+
 class UserOptimizedTransformer(BaselineTransformer):
     """
     Replace this class with the optimized implementation.
@@ -183,21 +322,34 @@ class UserOptimizedTransformer(BaselineTransformer):
       3. Keep compatible parameter names, or customize copy_model_weights().
     """
 
+    def __init__(self, config: TransformerConfig) -> None:
+        nn.Module.__init__(self)  # skip BaselineTransformer.__init__ on purpose
+        self.config = config
+        self.layers = nn.ModuleList(
+            [
+                MyTransformerBlock(config.d_model, config.num_heads, config.ffn_dim, config.causal)
+                for _ in range(config.num_layers)
+            ]
+        )
+        self.final_norm = MyLayerNorm(config.d_model)
+
     def forward(
         self,
         x: torch.Tensor,
         valid_token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # ====================== your codes here ======================
-        # Example optimization directions:
-        #   * torch.nn.functional.scaled_dot_product_attention
-        #   * torch.compile
-        #   * Triton/CUDA fused kernels
-        #   * fused LayerNorm / residual / FFN
-        #
-        # The default implementation calls the baseline so that this script
-        # remains directly runnable before the optimized code is inserted.
-        return super().forward(x, valid_token_mask)
+        # Computed once per forward pass instead of once per layer (6x
+        # redundant GPU->CPU syncs otherwise) -- valid_token_mask doesn't
+        # change between layers.
+        mask_is_trivial = valid_token_mask is not None and bool(valid_token_mask.all().item())
+
+        for layer in self.layers:
+            x = layer(x, valid_token_mask, mask_is_trivial)
+        x = self.final_norm(x)
+        if valid_token_mask is not None:
+            x = x.masked_fill(~valid_token_mask[..., None], 0)
+        return x
         # ============================================================
 
 
