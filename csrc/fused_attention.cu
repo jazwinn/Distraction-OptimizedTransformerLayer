@@ -27,9 +27,12 @@
 //             programming model (cuTile) instead of per-thread. Lives in
 //             tile_attention.cu, which is a separate translation unit because
 //             it needs -std=c++20 and -enable-tile. float32 and head_dim in
-//             {8,16,32,64} only; selected with impl=3. Present only when the
-//             build found CUDA 13.3+, otherwise it declines and the caller
-//             falls back.
+//             {8,16,32,64} only. Present only when the build found CUDA 13.3+,
+//             otherwise it declines and the caller falls back.
+//
+//             Two math modes, same kernel: impl=3 keeps fp32 operands (CUDA
+//             cores, exact, ~1e-6) and impl=4 narrows them to bf16 (tensor
+//             cores, ~2-3x faster, ~4e-3). Neither is picked by impl=0.
 //
 // Coverage: head_dim in {8,16,32,64,128} for wmma and {8,16,32,64} for the
 // scalar and tile kernels, in float/half/bfloat16 (tile is float32 only). A
@@ -797,18 +800,20 @@ bool dispatch_wmma(const torch::Tensor& q, const torch::Tensor& k,
 // ---------------------------------------------------------------------------
 
 enum class Impl : int64_t {
-    Auto   = 0,
-    Scalar = 1,
-    Wmma   = 2,
-    Tile   = 3,
+    Auto     = 0,
+    Scalar   = 1,
+    Wmma     = 2,
+    Tile     = 3,   // cuTile, fp32 operands -- CUDA cores,   ~1e-6
+    TileBf16 = 4,   // cuTile, bf16 operands -- tensor cores, ~4e-3
 };
 
 const char* impl_name(Impl impl) {
     switch (impl) {
-        case Impl::Auto:   return "auto";
-        case Impl::Scalar: return "scalar";
-        case Impl::Wmma:   return "wmma";
-        case Impl::Tile:   return "tile";
+        case Impl::Auto:     return "auto";
+        case Impl::Scalar:   return "scalar";
+        case Impl::Wmma:     return "wmma";
+        case Impl::Tile:     return "tile";
+        case Impl::TileBf16: return "tile-bf16";
     }
     return "?";
 }
@@ -858,7 +863,7 @@ bool launch_wmma(const AttnArgs& a) {
     return launched;
 }
 
-bool launch_tile(const AttnArgs& a) {
+bool launch_tile(const AttnArgs& a, tile_attn::MathMode math) {
     // Unlike the other two, these are hard requirements rather than coverage
     // gaps: a caller asking for the tile kernel on a build or dtype that cannot
     // have it wants to hear so, not to be quietly given a different kernel.
@@ -867,13 +872,18 @@ bool launch_tile(const AttnArgs& a) {
                 "has no tile support. It needs CUDA 13.3+ with -std=c++20 "
                 "-enable-tile; see kernel_ext.py.");
     TORCH_CHECK(a.q.scalar_type() == torch::kFloat32,
-                "fused_attention_forward: impl=3 (tile) is float32 only, got ",
+                "fused_attention_forward: the tile kernels take float32 in and "
+                "out -- the math mode narrows only the GEMM operands. Got ",
                 a.q.scalar_type());
+    TORCH_CHECK(tile_attn::supports(math),
+                "fused_attention_forward: this build has no tile kernel for that "
+                "math mode. tf32 needs a CUDA toolkit that defines __nv_tf32, "
+                "plus -DTILE_HAVE_TF32; see csrc/tile_attention.h.");
     return tile_attn::launch(
         a.q.const_data_ptr<float>(), a.k.const_data_ptr<float>(),
         a.v.const_data_ptr<float>(), a.mask_ptr, a.ms,
         a.out.data_ptr<float>(), a.B, a.H, a.S, a.head_dim, a.is_causal,
-        static_cast<float>(a.scale), at::cuda::getCurrentCUDAStream());
+        static_cast<float>(a.scale), math, at::cuda::getCurrentCUDAStream());
 }
 
 // Runs the first kernel that covers this case, honouring what the caller asked
@@ -882,13 +892,14 @@ bool launch_tile(const AttnArgs& a) {
 // by the caller, not here.
 bool run_kernel(Impl impl, const AttnArgs& a) {
     switch (impl) {
-        case Impl::Scalar: return launch_scalar(a);
-        case Impl::Wmma:   return launch_wmma(a);
-        case Impl::Tile:   return launch_tile(a);
+        case Impl::Scalar:   return launch_scalar(a);
+        case Impl::Wmma:     return launch_wmma(a);
+        case Impl::Tile:     return launch_tile(a, tile_attn::MathMode::Fp32);
+        case Impl::TileBf16: return launch_tile(a, tile_attn::MathMode::Bf16);
         // Tile is deliberately absent here: it covers only float32 and is a
         // separate programming model whose performance the caller should opt
         // into deliberately rather than inherit.
-        case Impl::Auto:   return launch_wmma(a) || launch_scalar(a);
+        case Impl::Auto:     return launch_wmma(a) || launch_scalar(a);
     }
     return false;
 }
@@ -959,9 +970,9 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
                                       bool is_causal,
                                       double scale,
                                       int64_t impl) {
-    TORCH_CHECK(impl >= 0 && impl <= 3,
+    TORCH_CHECK(impl >= 0 && impl <= 4,
                 "fused_attention_forward: impl must be 0 (auto), 1 (scalar), "
-                "2 (wmma) or 3 (tile)");
+                "2 (wmma), 3 (tile) or 4 (tile-bf16)");
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(),
                 "fused_attention_forward: q/k/v must be CUDA tensors");
     TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
@@ -1013,14 +1024,16 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
         // scalar does *not* raise here, only because it never has. That is an
         // inconsistency rather than a decision -- it can time ATen and label it
         // "scalar" -- but changing it is a behaviour change, not a cleanup.
-        TORCH_CHECK(mode != Impl::Wmma && mode != Impl::Tile,
+        TORCH_CHECK(mode != Impl::Wmma && mode != Impl::Tile &&
+                        mode != Impl::TileBf16,
                     "fused_attention_forward: impl=", impl, " (", impl_name(mode),
                     ") does not cover dtype=", qc.scalar_type(),
                     ", head_dim=", head_dim, " on compute capability ",
                     at::cuda::getCurrentDeviceProperties()->major, ".",
                     at::cuda::getCurrentDeviceProperties()->minor,
                     ". wmma needs SM 8.0+ and head_dim in {8,16,32,64,128}; "
-                    "tile needs float32 and head_dim in {8,16,32,64}.");
+                    "the tile kernels need float32 and head_dim in "
+                    "{8,16,32,64}.");
         return attention_aten(qc, kc, vc, attn_mask, is_causal, scale);
     }
 

@@ -23,10 +23,12 @@
 // materialised in global memory, K/V are streamed a tile at a time, and the
 // softmax is accumulated online with a running max and running sum.
 //
-// Scope: float32 only, head_dim in {8,16,32,64}. half/bfloat16 fall back to
-// the existing kernels -- cuTile's matmul accumulates __half in __half, which
-// would not hold the accuracy budget the harness checks against, and the
-// tf32/bf16 paths that do accumulate in float are already what wmma covers.
+// Scope: float32 tensors in and out, head_dim in {8,16,32,64}. The MathMode
+// parameter narrows only the two GEMMs' operands, which is what decides
+// whether the tensor cores run: Fp32 stays on the CUDA cores everywhere and is
+// exact, Bf16 reaches the MMA units and costs ~4 orders of magnitude of
+// accuracy. There is no Fp16 mode -- cuTile accumulates a __half matmul into
+// __half, and this kernel sums hundreds of products per output.
 //
 // Requires CUDA 13.3+ (for <cuda_tile.h>), -std=c++20 and -enable-tile.
 // TRANSFORMER_HAVE_TILE is defined by the build only when all of that is
@@ -38,8 +40,14 @@
 #ifdef TRANSFORMER_HAVE_TILE
 
 #include <cuda_tile.h>
+// <cuda_tile.h> only forward-declares __nv_bfloat16; this is what completes it,
+// and is the whole reason bf16 tiles can be instantiated where tf32 tiles
+// cannot -- __nv_tf32 has no defining header in CUDA 13.3.
+#include <cuda_bf16.h>
 
 namespace ct = cuda::tiles;
+
+using tile_attn::MathMode;
 
 namespace {
 
@@ -56,7 +64,38 @@ constexpr float NEG_THRESH = -1e29f;
 // three separate specialisations rather than two independent flags.
 enum class MaskMode { None, Causal, Explicit };
 
-template <int BLOCK_M, int BLOCK_N, int HEAD_DIM, MaskMode MODE>
+// The element type each GEMM's operands are cast to. Only this changes between
+// math modes -- the accumulator stays fp32 in all of them, which cuTile
+// guarantees for float, bf16 and tf32 operands (and pointedly does not for
+// __half, which accumulates into __half; that is why there is no Fp16 mode).
+template <MathMode MODE> struct Operand;
+template <> struct Operand<MathMode::Fp32> { using type = float; };
+template <> struct Operand<MathMode::Bf16> { using type = __nv_bfloat16; };
+#ifdef TILE_HAVE_TF32
+template <> struct Operand<MathMode::Tf32> { using type = __nv_tf32; };
+#endif
+
+template <MathMode MODE>
+constexpr bool mode_compiled =
+    MODE == MathMode::Fp32 || MODE == MathMode::Bf16
+#ifdef TILE_HAVE_TF32
+    || MODE == MathMode::Tf32
+#endif
+    ;
+
+// Narrows a tile to the mode's operand type. For Fp32 this is the identity, so
+// that path emits exactly the code it did before math modes existed.
+template <MathMode MODE, size_t R, size_t C, typename In>
+__tile__ auto as_operand(In x) {
+    using E = typename Operand<MODE>::type;
+    if constexpr (ct::same_as<E, float>) {
+        return x;
+    } else {
+        return ct::tile<E, ct::shape<R, C>>(x);
+    }
+}
+
+template <int BLOCK_M, int BLOCK_N, int HEAD_DIM, MaskMode MODE, MathMode MATH>
 __tile_global__ void tile_attention_kernel(const float* __restrict__ q,
                                            const float* __restrict__ k,
                                            const float* __restrict__ v,
@@ -116,7 +155,12 @@ __tile_global__ void tile_attention_kernel(const float* __restrict__ q,
         auto vv = v_view.load_masked(kt / BLOCK_N, 0);
 
         // S = Q @ K^T, scaled. One expression per block; no fragments.
-        auto s = ct::matmul(qq, ct::transpose(kk)) * scale;
+        // Under a narrow MATH mode the operands are cast here and nowhere
+        // else: this cast is the entire difference between running on the
+        // CUDA cores and running on the tensor cores.
+        auto s = ct::matmul(as_operand<MATH, BLOCK_M, HEAD_DIM>(qq),
+                            as_operand<MATH, HEAD_DIM, BLOCK_N>(ct::transpose(kk)))
+                 * scale;
 
         // The bounds test alone is [1, BLOCK_N]. AND-ing an all-true column
         // widens it to [BLOCK_M, BLOCK_N] up front, so the causal/explicit
@@ -149,7 +193,8 @@ __tile_global__ void tile_attention_kernel(const float* __restrict__ q,
         auto p     = ct::exp(s - m_new);
 
         l_run = l_run * corr + ct::sum<1>(p);
-        acc   = acc * corr + ct::matmul(p, vv);
+        acc   = acc * corr + ct::matmul(as_operand<MATH, BLOCK_M, BLOCK_N>(p),
+                                        as_operand<MATH, BLOCK_N, HEAD_DIM>(vv));
         m_run = m_new;
     }
 
@@ -163,27 +208,47 @@ __tile_global__ void tile_attention_kernel(const float* __restrict__ q,
     o_view.store_masked(acc * inv, m_tile, 0);
 }
 
-// Block shape per head_dim, measured on SM 8.6 (see the sweep in the commit
-// that added this file). The kernel holds Q, O, K, V and the score tile live
-// at once, so the footprint goes as BLOCK_M*HEAD_DIM*2 + BLOCK_N*HEAD_DIM*2 +
-// BLOCK_M*BLOCK_N; past a threshold the compiler starts spilling and the cost
-// jumps by an order of magnitude rather than degrading smoothly. On this card
-// the cliff sits between the entries below and their immediate neighbours --
-// at head_dim 64, BLOCK_N 16 runs at 1.5 ms where BLOCK_N 32 runs at 10.9 ms.
-// These are worth re-measuring on a different architecture.
-template <int HEAD_DIM> struct BlockCfg;
-template <> struct BlockCfg<8>  { static constexpr int M = 64; static constexpr int N = 64; };
-template <> struct BlockCfg<16> { static constexpr int M = 32; static constexpr int N = 16; };
-template <> struct BlockCfg<32> { static constexpr int M = 64; static constexpr int N = 16; };
-template <> struct BlockCfg<64> { static constexpr int M = 32; static constexpr int N = 16; };
+// Block shape per (head_dim, math mode), measured on SM 8.6.
+//
+// The kernel holds Q, O, K, V and the score tile live at once, so the footprint
+// goes as BLOCK_M*HEAD_DIM*2 + BLOCK_N*HEAD_DIM*2 + BLOCK_M*BLOCK_N. Past a
+// threshold the compiler spills and the cost jumps an order of magnitude rather
+// than degrading smoothly -- at head_dim 64 in Fp32, BLOCK_N 16 runs at 1.5 ms
+// where BLOCK_N 32 runs at 10.9 ms.
+//
+// A narrow mode halves the operand width, which moves that cliff rather than
+// just shifting the curve: the head_dim 64 that wants 32x16 in Fp32 runs best
+// at 64x64 in Bf16 -- the shape that was *worst* in Fp32. So these are per
+// mode, not merely per head_dim.
+//
+// Measured on SM 8.6. On a part with working TMA the load cost changes and the
+// cliff will sit elsewhere; re-measure rather than trusting these.
+template <int HEAD_DIM, MathMode MODE> struct BlockCfg;
 
-template <int HEAD_DIM>
+template <> struct BlockCfg<8,  MathMode::Fp32> { static constexpr int M = 64; static constexpr int N = 64; };
+template <> struct BlockCfg<16, MathMode::Fp32> { static constexpr int M = 32; static constexpr int N = 16; };
+template <> struct BlockCfg<32, MathMode::Fp32> { static constexpr int M = 64; static constexpr int N = 16; };
+template <> struct BlockCfg<64, MathMode::Fp32> { static constexpr int M = 32; static constexpr int N = 16; };
+
+template <> struct BlockCfg<8,  MathMode::Bf16> { static constexpr int M = 64; static constexpr int N = 64; };
+template <> struct BlockCfg<16, MathMode::Bf16> { static constexpr int M = 64; static constexpr int N = 64; };
+template <> struct BlockCfg<32, MathMode::Bf16> { static constexpr int M = 64; static constexpr int N = 64; };
+template <> struct BlockCfg<64, MathMode::Bf16> { static constexpr int M = 64; static constexpr int N = 64; };
+
+#ifdef TILE_HAVE_TF32
+// tf32 occupies the same 32 bits as fp32, so it inherits the fp32 shapes until
+// someone measures it on hardware that actually has the type.
+template <int HEAD_DIM> struct BlockCfg<HEAD_DIM, MathMode::Tf32>
+    : BlockCfg<HEAD_DIM, MathMode::Fp32> {};
+#endif
+
+template <int HEAD_DIM, MathMode MATH>
 void launch_for_head_dim(const float* q, const float* k, const float* v,
                          const bool* mask, const long long* ms,
                          float* out, int B, int H, int S,
                          bool is_causal, float scale, cudaStream_t stream) {
-    constexpr int BLOCK_M = BlockCfg<HEAD_DIM>::M;
-    constexpr int BLOCK_N = BlockCfg<HEAD_DIM>::N;
+    constexpr int BLOCK_M = BlockCfg<HEAD_DIM, MATH>::M;
+    constexpr int BLOCK_N = BlockCfg<HEAD_DIM, MATH>::N;
 
     // One "thread" per block: a tile kernel's body runs once per block and the
     // compiler decides how many real threads carry it.
@@ -191,15 +256,15 @@ void launch_for_head_dim(const float* q, const float* k, const float* v,
     const dim3 block(1);
 
     if (is_causal) {
-        tile_attention_kernel<BLOCK_M, BLOCK_N, HEAD_DIM, MaskMode::Causal>
+        tile_attention_kernel<BLOCK_M, BLOCK_N, HEAD_DIM, MaskMode::Causal, MATH>
             <<<grid, block, 0, stream>>>(q, k, v, nullptr, 0, 0, 0, 0,
                                          out, B, H, S, scale);
     } else if (mask != nullptr) {
-        tile_attention_kernel<BLOCK_M, BLOCK_N, HEAD_DIM, MaskMode::Explicit>
+        tile_attention_kernel<BLOCK_M, BLOCK_N, HEAD_DIM, MaskMode::Explicit, MATH>
             <<<grid, block, 0, stream>>>(q, k, v, mask, ms[0], ms[1], ms[2], ms[3],
                                          out, B, H, S, scale);
     } else {
-        tile_attention_kernel<BLOCK_M, BLOCK_N, HEAD_DIM, MaskMode::None>
+        tile_attention_kernel<BLOCK_M, BLOCK_N, HEAD_DIM, MaskMode::None, MATH>
             <<<grid, block, 0, stream>>>(q, k, v, nullptr, 0, 0, 0, 0,
                                          out, B, H, S, scale);
     }
@@ -211,26 +276,65 @@ namespace tile_attn {
 
 bool available() { return true; }
 
+bool supports(MathMode mode) {
+    switch (mode) {
+        case MathMode::Fp32: return mode_compiled<MathMode::Fp32>;
+        case MathMode::Bf16: return mode_compiled<MathMode::Bf16>;
+        case MathMode::Tf32: return mode_compiled<MathMode::Tf32>;
+    }
+    return false;
+}
+
+namespace {
+
+// MATH is resolved before head_dim so a mode that was not compiled costs no
+// instantiations at all -- head_dim is a template parameter, so every
+// (head_dim, mode) pair that reaches here becomes its own compiled kernel.
+template <MathMode MATH>
+bool launch_mode(const float* q, const float* k, const float* v,
+                 const bool* mask, const long long* ms,
+                 float* out, int B, int H, int S, int head_dim,
+                 bool is_causal, float scale, cudaStream_t stream) {
+    if constexpr (!mode_compiled<MATH>) {
+        return false;
+    } else {
+        switch (head_dim) {
+            case 8:
+                launch_for_head_dim<8, MATH>(q, k, v, mask, ms, out, B, H, S, is_causal, scale, stream);
+                return true;
+            case 16:
+                launch_for_head_dim<16, MATH>(q, k, v, mask, ms, out, B, H, S, is_causal, scale, stream);
+                return true;
+            case 32:
+                launch_for_head_dim<32, MATH>(q, k, v, mask, ms, out, B, H, S, is_causal, scale, stream);
+                return true;
+            case 64:
+                launch_for_head_dim<64, MATH>(q, k, v, mask, ms, out, B, H, S, is_causal, scale, stream);
+                return true;
+            default:
+                return false;
+        }
+    }
+}
+
+}  // namespace
+
 bool launch(const float* q, const float* k, const float* v,
             const bool* mask, const long long* ms,
             float* out, int B, int H, int S, int head_dim,
-            bool is_causal, float scale, cudaStream_t stream) {
-    switch (head_dim) {
-        case 8:
-            launch_for_head_dim<8>(q, k, v, mask, ms, out, B, H, S, is_causal, scale, stream);
-            return true;
-        case 16:
-            launch_for_head_dim<16>(q, k, v, mask, ms, out, B, H, S, is_causal, scale, stream);
-            return true;
-        case 32:
-            launch_for_head_dim<32>(q, k, v, mask, ms, out, B, H, S, is_causal, scale, stream);
-            return true;
-        case 64:
-            launch_for_head_dim<64>(q, k, v, mask, ms, out, B, H, S, is_causal, scale, stream);
-            return true;
-        default:
-            return false;
+            bool is_causal, float scale, MathMode mode, cudaStream_t stream) {
+    switch (mode) {
+        case MathMode::Fp32:
+            return launch_mode<MathMode::Fp32>(q, k, v, mask, ms, out, B, H, S,
+                                               head_dim, is_causal, scale, stream);
+        case MathMode::Bf16:
+            return launch_mode<MathMode::Bf16>(q, k, v, mask, ms, out, B, H, S,
+                                               head_dim, is_causal, scale, stream);
+        case MathMode::Tf32:
+            return launch_mode<MathMode::Tf32>(q, k, v, mask, ms, out, B, H, S,
+                                               head_dim, is_causal, scale, stream);
     }
+    return false;
 }
 
 }  // namespace tile_attn
@@ -242,10 +346,11 @@ bool launch(const float* q, const float* k, const float* v,
 namespace tile_attn {
 
 bool available() { return false; }
+bool supports(MathMode) { return false; }
 
 bool launch(const float*, const float*, const float*,
             const bool*, const long long*,
-            float*, int, int, int, int, bool, float, cudaStream_t) {
+            float*, int, int, int, int, bool, float, MathMode, cudaStream_t) {
     return false;
 }
 

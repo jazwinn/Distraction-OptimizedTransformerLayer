@@ -38,6 +38,7 @@ BACKENDS = (
     ("custom scalar", ["--attn-backend", "custom", "--attn-impl", "scalar"]),
     ("custom wmma",   ["--attn-backend", "custom", "--attn-impl", "wmma"]),
     ("custom tile",   ["--attn-backend", "custom", "--attn-impl", "tile"]),
+    ("custom tile-bf16", ["--attn-backend", "custom", "--attn-impl", "tile-bf16"]),
 )
 
 

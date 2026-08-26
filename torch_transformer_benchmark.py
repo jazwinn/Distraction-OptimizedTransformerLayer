@@ -200,11 +200,16 @@ ATTENTION_BACKEND = "auto"
 #             tile programming model instead of per-thread. float32 and
 #             head_dim in {8,16,32,64} only, and needs a build that found
 #             CUDA 13.3+. Never picked by "auto" -- opt in deliberately.
+#   "tile-bf16"
+#             the same cuTile kernel with its two GEMMs narrowed to bfloat16,
+#             which is what puts them on the tensor cores. Faster than "tile"
+#             and far less accurate (~4e-3 vs ~1e-6); expect it to fail the
+#             accuracy gate on configs that "tile" passes.
 #
 # (--attn-impl overrides this for a single run.)
 ATTENTION_IMPL = "auto"
 
-_IMPL_CODE = {"auto": 0, "scalar": 1, "wmma": 2, "tile": 3}
+_IMPL_CODE = {"auto": 0, "scalar": 1, "wmma": 2, "tile": 3, "tile-bf16": 4}
 
 _fallback_warned = False
 
@@ -882,7 +887,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--attn-impl",
-        choices=("auto", "scalar", "wmma", "tile"),
+        choices=("auto", "scalar", "wmma", "tile", "tile-bf16"),
         default=None,
         help="override ATTENTION_IMPL for this run only: which kernel inside "
              "the custom extension runs attention",

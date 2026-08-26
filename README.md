@@ -25,7 +25,7 @@ and stays selectable for comparison.
 - [How it works](#how-it-works)
 - [Repository layout](#repository-layout)
 - [Notes and known limits](#notes-and-known-limits)
-- [OPTIMIZATION.md](OPTIMIZATION.md) — how the attention kernel was moved onto tensor cores, step by step, with what each step was worth
+- [REPORT.md](REPORT.md) — what was built and what broke: a plain-language account of every problem hit and what fixed it, then the step-by-step detail of moving the kernel onto tensor cores
 
 ---
 
@@ -282,14 +282,15 @@ attention:
 | `auto` | Tensor-core kernel where it applies, scalar kernel otherwise. |
 | `scalar` | Force the scalar kernel. No tensor cores, no TF32 rounding. |
 | `wmma` | Force the tensor-core kernel; raises on shapes it does not cover, so a silent fallback cannot be mistaken for a slow kernel. |
-| `tile` | Force the cuTile kernel — the same math written against the CUDA tile programming model instead of per-thread. float32 only, `head_dim` in {8,16,32,64}. Raises rather than falling back. |
+| `tile` | Force the cuTile kernel — the same math written against the CUDA tile programming model instead of per-thread. float32, `head_dim` in {8,16,32,64}. Raises rather than falling back. |
+| `tile-bf16` | The same cuTile kernel with its two GEMMs narrowed to bfloat16, which is what puts them on the tensor cores. 2–3× faster than `tile` and ~4 orders of magnitude less accurate; fails the harness gate on most configs. |
 
 The tensor-core kernel covers `head_dim` 8, 16, 32, 64 and 128 in float32, float16 and
 bfloat16, on compute capability 8.0 and up — every head_dim the harness can produce, since
 `d_model` is divisible by `num_heads`. Nothing falls through to ATen any more.
 
-`tile` is never chosen by `auto`: it is a separate programming model whose performance you
-should opt into deliberately. It needs a build that found CUDA 13.3+ (see
+Neither tile mode is ever chosen by `auto`: they are a separate programming model whose
+performance you should opt into deliberately. It needs a build that found CUDA 13.3+ (see
 [Building the CUDA extension](#2-build-the-cuda-extension-optional)); without one,
 `--attn-impl tile` raises instead of silently running something else. On an RTX 3070 it is
 the most accurate of the three (plain fp32 throughout, ~1e-6 against an exact reference,
@@ -447,8 +448,12 @@ its speed on an RTX 3070, and neither is the model's fault:
 
 - CUDA 13.3 forward-declares `__nv_tf32` but does not define it, so a tf32 tile cannot be
   instantiated and `ct::matmul` on float tiles runs on fp32 CUDA cores rather than the TF32
-  tensor cores `wmma` reaches. That is most of the gap — and also why the tile kernel is the
-  *most* accurate of the three, at ~1e-6 versus ~1e-3.
+  tensor cores `wmma` reaches. That is most of the gap — and also why `tile` is the *most*
+  accurate kernel here, at ~1e-6 versus ~1e-3. `--attn-impl tile-bf16` narrows the operands
+  to bfloat16 instead, which does reach the tensor cores and closes most of the speed gap
+  (2–3×, and faster than `wmma` on some shapes) at ~4e-3 — enough to fail the accuracy gate
+  on all but one measured config. bfloat16 is the only narrow type cuTile accumulates into
+  `float`; `__half` accumulates into `__half`, which attention cannot use.
 - The TMA hardware the tile model is designed around is Blackwell-only; on Ampere the
   loads fall back to software-managed async copies.
 

@@ -106,10 +106,13 @@ def timed(fn, iters=30):
 # The tile kernel does its matmuls in plain fp32 -- cuTile has no usable tf32
 # tile type in CUDA 13.3 -- so it holds the same budget as the scalar kernel
 # rather than the tensor-core one.
+# tile-bf16 narrows both GEMM operands to bfloat16 (8 significand bits), so
+# its budget is an order of magnitude looser than the tf32 path's, not tighter.
 IMPLS = (
     (1, "scalar", 5e-6),
     (2, "wmma", 3e-3),
     (3, "tile", 5e-6),
+    (4, "tile-bf16", 3e-2),
 )
 
 
@@ -156,7 +159,7 @@ def main() -> int:
                         q, k, v, attn_mask, is_causal, scale, impl
                     )
                 except RuntimeError as exc:
-                    if impl in (2, 3):
+                    if impl in (2, 3, 4):
                         # No tensor-core / tile specialization for this
                         # head_dim (or no tile support in this build). The
                         # scalar row above already covered the case.

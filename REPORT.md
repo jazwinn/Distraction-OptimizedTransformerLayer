@@ -1,9 +1,12 @@
-# Running Attention on Tensor Cores
+# Optimizing a Transformer's Attention Layer
 
-How the fused attention kernel in [`csrc/fused_attention.cu`](csrc/fused_attention.cu) was
-moved off scalar FMA and onto the GPU's tensor cores, what each step was worth, and where
-the win does and does not show up end to end.
+A record of the work done on the fused attention kernels in [`csrc/`](csrc/): what was
+built, what broke, and what each fix was actually worth.
 
+It opens with a plain-language account for readers who don't work with GPUs, then goes into
+the detail of how the kernel was moved onto the tensor cores.
+
+- [What happened, in plain language](#what-happened-in-plain-language)
 - [The starting point](#the-starting-point)
 - [The change](#the-change)
 - [What each step was worth](#what-each-step-was-worth)
@@ -12,6 +15,127 @@ the win does and does not show up end to end.
 - [Accuracy](#accuracy)
 - [Coverage and limits](#coverage-and-limits)
 - [Reproducing](#reproducing)
+
+---
+
+## What happened, in plain language
+
+### What this project is
+
+A transformer is the kind of model behind most modern AI. The slowest part of it is
+**attention** — the step where every word in a sentence compares itself against every other
+word. The goal is to rewrite that step so it runs faster on the graphics card without
+changing the answers it produces.
+
+The catch is the second half of that sentence. An automated grader checks the fast version
+against a known-correct version and rejects it if the numbers drift too far. Most of the
+problems below come from that tension: **faster usually means less precise, and less precise
+eventually means wrong.**
+
+### The problems, and what fixed them
+
+**1. The script wouldn't run a second time.**
+The first run worked; every run after it hung forever. To stop two builds colliding, the
+build tool drops a marker file meaning "busy" and deletes it when done — but a run killed
+hard (closing the terminal, Task Manager) dies before cleaning up. Later runs then wait on
+something already dead, with no timeout. Like a "do not disturb" sign left on a meeting room
+door after the meeting ended. A normal Ctrl+C is safe; only force-killing leaves the sign up.
+
+**2. You had to type a long wrapper command every time.**
+Building GPU code needs Microsoft's C++ compiler, which Windows only exposes inside a special
+developer terminal. The project now performs that lookup itself, so a plain
+`python torch_transformer_benchmark.py` works from any shell. A latent bug surfaced on the
+way: the compiler path was being quoted twice, so Windows couldn't find it.
+
+**3. Building takes 70 seconds.**
+Not a bug. GPU code is translated ahead of time, once per supported configuration, and that
+genuinely costs about a minute. It is cached afterwards; later runs start in about four
+seconds.
+
+**4. The new technique "couldn't run" on this card.**
+A published paper states that NVIDIA's new tile programming style requires a Blackwell GPU —
+far newer than an RTX 3070. Rather than take that on faith, we wrote the smallest possible
+test and ran it. **It works on this card.** Getting it to compile took four separate
+discoveries, each fatal alone: a newer toolkit than the default, a newer language version, a
+switch that is silently ignored when missing, and a compatibility flag for MSVC.
+
+**5. That new version was 30x slower.**
+Correct answers, 16.8 ms against 0.53 for the existing kernel. The card has a small pool of
+very fast scratch memory, and this kernel keeps five things in it at once; past a certain
+total the card starts shuffling data to slow memory. The surprise was that this is a **cliff,
+not a slope** — one setting ran in 1.5 ms and the very next size up took 10.9 ms, with no
+warning. Measuring every sensible size instead of guessing took it from **16.8 ms to 1.3 ms**,
+nearly 13x faster, without changing a line of the maths.
+
+**6. It still can't reach the card's fastest hardware.**
+Graphics cards have dedicated multiplication units — *tensor cores* — that are far faster but
+only accept reduced-precision numbers. The precision format that would suit this best has a
+name in the new toolkit but **no actual definition**; the feature is announced, not finished.
+Worth correcting a common assumption: **a newer graphics card would not fix this.** No tensor
+core on any card, Blackwell included, handles full precision. The data format decides, not
+the hardware. The upside is that this kernel became the **most accurate** of the three —
+about a thousand times closer to the true answer.
+
+**7. The fast kernel refused two shapes outright.**
+Two configurations were declined, for two unrelated reasons that produced the same symptom.
+One was **too small**: tensor cores only take work in fixed 16-wide blocks, and it was 8 wide
+— half a block. The other was **too big**: it needed 75.8 KB of scratch memory against a
+48 KB budget, where that budget is not the hardware limit but the point below which the card
+can run two jobs at once. Fixes: pad the small one to 16 with zeros (free — zeros add nothing
+to a sum, and the extra results are discarded), and give the large one a smaller working set
+(75.8 KB to 35.9 KB). The project's own documentation claimed the second needed a fundamental
+redesign; it didn't, and that note was written when the setting in question was assumed
+fixed. Both now run **faster**, not merely supported: the large case went from 0.142 ms to
+**0.041 ms**, turning a loss against the standard library into a win.
+
+**8. Tidying the code quietly broke it.**
+The logic choosing between kernels had grown tangled, so it was rewritten to read as four
+plain lines. But the tidy-up also made all three kernels behave consistently when asked for
+something unsupported — and one had always behaved differently. The test suite caught it
+immediately. Original behaviour was restored exactly, with a comment explaining the
+inconsistency rather than silently "fixing" it. A tidy-up that changes behaviour isn't one.
+
+**9. Reaching the tensor cores after all.**
+Since the fastest hardware needs reduced-precision numbers, we supplied them — using a format
+called *bfloat16*, the only compact format this toolkit accumulates safely. (The obvious
+alternative, fp16, keeps its running total at reduced precision too; since attention sums
+hundreds of values per result, that quietly destroys accuracy. It would compile and run, just
+produce bad numbers.) The result is **2-3x faster**, and on some shapes faster than the
+existing kernel. It costs about four orders of magnitude of accuracy, so it **fails the
+grader on four of five configurations** — and passes the fifth, where it is the fastest
+option available. It is opt-in only.
+
+### One diagnosis that was wrong
+
+A configuration with 12 layers fails the accuracy check. The explanation given at the time —
+that attention's precision was to blame — was **wrong**, and measuring properly disproved it.
+All four implementations land within 9% of each other there, including the two that never
+lose precision at all. The drift comes from the other two-thirds of the model. The failure is
+also one bad value in 2.6 million, close enough to the line that which implementation
+"passes" changes with the random seed. **No amount of work on the attention kernel will fix
+it.** It was the wrong target.
+
+### Where it ended up
+
+| Implementation | Speed | Accuracy | Best for |
+| --- | --- | --- | --- |
+| **wmma** (tensor cores) | Fastest overall | ~1 in 1,000 | Everyday use; the default |
+| **tile** (fp32) | Slowest | ~1 in 1,000,000 | When precision matters most |
+| **tile-bf16** | Near-fastest | ~1 in 250 | Opt-in; fails the grader on most configs |
+| **scalar** | Middle | ~1 in 1,000,000 | Older cards; a reference to check against |
+
+The headline is **3.48x on long masked sequences**, and that every configuration is now
+handled by a purpose-built kernel rather than falling back to a general one.
+
+### The pattern worth remembering
+
+Five of the nine problems had the same shape: **a stated limit turned out to be an assumption
+nobody had retested.** The paper said the technique needed newer hardware. The documentation
+said a configuration needed a redesign. The slow kernel looked like it needed better maths.
+
+In each case the fix was a setting, not a rewrite — found by measuring rather than reasoning.
+The two genuine limits that remain, the missing number format and the accuracy budget, are
+real, and were left alone rather than worked around.
 
 ---
 
