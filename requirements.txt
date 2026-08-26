@@ -1,0 +1,25 @@
+# Python dependencies for torch_transformer_benchmark.py
+#
+# Everything else the benchmark imports (argparse, copy, math, os, statistics,
+# time, dataclasses, typing) ships with the standard library.
+#
+# Install with:
+#     pip install -r requirements.txt
+#
+# NOTE: plain PyPI gives you the default PyTorch build, which on Windows is
+# CPU-only. For a CUDA build matching CUDA Toolkit 13.0 (what this project was
+# developed against), install torch from the CUDA index instead:
+#     pip install torch --index-url https://download.pytorch.org/whl/cu132
+# A mismatch between the wheel's CUDA version and the local toolkit is the
+# usual cause of extension build failures.
+
+# Required. 2.0 is the floor: the benchmark uses
+# F.scaled_dot_product_attention and torch.compile.
+# Developed and tested against 2.12.0+cu132.
+torch>=2.0
+
+# Optional. Only needed for the custom CUDA kernel backend, which
+# torch.utils.cpp_extension JIT-compiles with ninja on first use
+# (--attn-backend auto/custom). The SDPA backend (--attn-backend sdpa) runs
+# with torch alone; without ninja, "auto" just falls back to SDPA.
+ninja
