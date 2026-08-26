@@ -54,6 +54,14 @@ def get_kernels(verbose: bool = False):
                 "built. Run through scripts/devenv.bat to put it there."
             )
 
+        # Build for the card that is actually present rather than a hard-coded
+        # arch: the tensor-core path needs SM 8.0+ to exist at all, and an
+        # SM 8.6 cubin on an SM 8.9 card is compiled without knowing the
+        # register file it will land on. PTX for the same virtual arch is
+        # emitted alongside so the cached build still loads on another card of
+        # the same family.
+        major, minor = torch.cuda.get_device_capability()
+        arch = f"{major}{minor}"
         os.makedirs(_BUILD_DIR, exist_ok=True)
         _kernels = load(
             name="transformer_kernels",
@@ -62,7 +70,8 @@ def get_kernels(verbose: bool = False):
             extra_cuda_cflags=[
                 "-O3",
                 "--use_fast_math",
-                "-gencode=arch=compute_86,code=sm_86",  # RTX 3070 (SM 8.6)
+                f"-gencode=arch=compute_{arch},code=sm_{arch}",
+                f"-gencode=arch=compute_{arch},code=compute_{arch}",
             ],
             verbose=verbose,
         )

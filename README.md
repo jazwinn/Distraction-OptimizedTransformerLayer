@@ -9,6 +9,12 @@ The work is in `UserOptimizedTransformer` and the modules it builds on, all insi
 one of two interchangeable backends: PyTorch's `scaled_dot_product_attention`, or a
 hand-written fused CUDA kernel in [`csrc/fused_attention.cu`](csrc/fused_attention.cu).
 
+The custom backend has two kernels behind it. The default one runs both of attention's
+matrix multiplies — `Q @ K^T` and `P @ V` — on the GPU's tensor cores through
+`nvcuda::wmma`, with the softmax fused between them and the `[B, H, S, S]` score matrix
+never leaving shared memory. A scalar fallback covers the shapes tensor cores cannot take
+and stays selectable for comparison.
+
 ---
 
 ## Contents
@@ -19,39 +25,75 @@ hand-written fused CUDA kernel in [`csrc/fused_attention.cu`](csrc/fused_attenti
 - [How it works](#how-it-works)
 - [Repository layout](#repository-layout)
 - [Notes and known limits](#notes-and-known-limits)
+- [OPTIMIZATION.md](OPTIMIZATION.md) — how the attention kernel was moved onto tensor cores, step by step, with what each step was worth
 
 ---
 
 ## Results
 
-Measured on an RTX 3070 (see [Environment](#environment)). Speedup is the harness's own
-median-latency ratio against the baseline; every configuration passes the accuracy gate
-unless marked otherwise.
+Measured on a power-capped RTX 4050 Laptop (see [Environment](#environment)).
 
-| Configuration | SDPA backend | Custom CUDA kernel |
+### The attention op
+
+This is what the kernel work moves, so it is measured directly rather than inferred from
+the end-to-end number. fp32, timings interleaved and minimum-of-N so all three candidates
+see the same clock state:
+
+| Shape | wmma vs. scalar | wmma vs. SDPA |
 | --- | --- | --- |
-| default (B8 S128 D512 H8 L6) | **1.110x** | 1.029x |
-| causal | **1.262x** | 1.183x |
-| padded (30%) | **1.090x** | 1.034x |
-| causal + padded | **1.178x** | 1.126x |
-| seq_len 512 | **1.379x** | 1.258x |
-| seq_len 2048 | **1.720x** | 1.667x |
-| seq_len 2048, causal | **2.889x** | 2.472x |
-| small (B1 S32) | **1.417x** | 1.277x |
-| wide (d_model 1024) | **1.095x** | 1.027x |
-| deep (12 layers) | FAIL | **1.028x** |
+| default (B8 H8 S128 D64) | 2.50x | 1.63x |
+| default causal | 2.60x | 1.54x |
+| default padded | 1.70x | 1.44x |
+| seq 512 | 1.99x | 1.72x |
+| seq 2048 | 1.85x | 1.79x |
+| seq 2048 causal | 2.19x | 1.78x |
+| head_dim 32 | 2.43x | 2.30x |
+| head_dim 16 | 1.74x | 3.64x |
+| wide (d_model 1024, 16 heads) | 2.40x | 1.57x |
+| **total** | **2.00x** | **1.81x** |
 
-Two things worth reading off this table:
+Every shape improves, and the tensor-core kernel is faster than SDPA on all of them.
+`scripts/bench_attention.py` reproduces this table.
 
-**Speedup scales with sequence length.** The baseline materializes a `[B, H, S, S]` score
-matrix and round-trips it through global memory several times. That cost grows as `S²`,
-so eliminating it matters most exactly where it hurts most — 2.89x at `seq_len=2048` with
-causal masking, versus 1.11x at the default `seq_len=128`.
+### The whole transformer
 
-**The custom kernel is the only backend that passes `deep 12L`.** It accumulates in exact
-fp32, while SDPA rounds through TF32 tensor cores. Over 12 layers that rounding drifts far
-enough to fail a single element out of 2.6M. The same choice that buys the accuracy costs
-5–15% of the speed everywhere else — the kernel gives up tensor cores to get it.
+Harness speedup against `BaselineTransformer`, one column per backend. Attention is only
+part of a Transformer layer, so these numbers are diluted by everything else in it — at
+`seq_len=128` the FFN alone does about 8x the work of the attention core, which is why the
+first four rows barely move whatever the kernel does. The rows that separate the backends
+are the long ones, where the score matrix grows as `S²` while the FFN grows as `S`:
+
+| Configuration | SDPA | custom scalar | custom wmma |
+| --- | --- | --- | --- |
+| default (B8 S128 D512 H8 L6) | 0.999x | 0.900x | **1.007x** |
+| causal | **1.055x** | 0.998x | FAIL |
+| padded (30%) | 0.992x | 0.846x | **1.001x** |
+| causal + padded | **1.177x** | 1.089x | FAIL |
+| seq_len 512 | 1.365x | 1.268x | **1.398x** |
+| seq_len 2048 | 1.816x | 1.678x | **2.270x** |
+| seq_len 2048, causal | 3.124x | 2.915x | **3.785x** |
+| small (B1 S32) | **1.529x** | 1.268x | 1.497x |
+| wide (d_model 1024) | **1.033x** | 0.961x | 0.988x |
+| deep (12 layers) | FAIL | **PASS** | FAIL |
+
+Read this table with its error bars in mind. The GPU is thermally and power capped, and a
+single harness run gives one median with no interleaving against the other backends — the
+same configuration was measured at 1.401x and 0.958x on two runs of `deep 12L`. Differences
+under about 10% here are not evidence of anything; `seq_len 2048` and `seq_len 2048 causal`
+are outside that band and agree with the attention-op table above.
+
+**Where the tensor cores show up.** At `seq_len=2048` the custom backend goes from 1.678x
+with the scalar kernel to 2.270x with the tensor-core one, overtaking SDPA's 1.816x; with
+causal masking, 2.915x to 3.785x against SDPA's 3.124x. Those are the configurations where
+attention is most of the runtime, and they are the ones the kernel was written for.
+
+**The PASS/FAIL columns are not a precision ranking.** Three configurations sit on the
+accuracy gate on this machine — `causal`, `causal + padded` and `deep 12L` — and which
+backend passes is close to a coin flip. On `deep 12L` over 8 trials, SDPA failed on 1
+element of 4.19M, wmma on 2, and the scalar kernel passed *with the largest `max_abs` of the
+three* (1.187e-3, against wmma's 1.140e-3). The gate is `abs <= atol OR rel <= rtol`, so
+which elements fail depends on where the reference happens to be near zero, not on which
+kernel rounds more. See [Notes and known limits](#notes-and-known-limits).
 
 ---
 
@@ -61,12 +103,17 @@ enough to fail a single element out of 2.6M. The same choice that buys the accur
 
 | | |
 | --- | --- |
-| GPU | NVIDIA, compute capability 8.6 (see note below for other cards) |
+| GPU | NVIDIA. Compute capability 8.0+ for the tensor-core kernel; anything CUDA-capable runs the scalar one |
 | CUDA Toolkit | 13.0 (`nvcc` on `PATH`) |
 | PyTorch | 2.12.0+cu132 |
-| Python | 3.10 |
-| Compiler | MSVC — Visual Studio 2022 with the C++ desktop workload |
+| Python | 3.10+ |
+| Compiler | MSVC — Visual Studio with the "Desktop development with C++" workload |
 | Build tool | `ninja` |
+
+The build targets whatever card is present: [`kernel_ext.py`](kernel_ext.py) reads the
+compute capability from `torch.cuda.get_device_capability()` and passes it to `nvcc`, with
+PTX for the same virtual arch alongside so the cached build still loads on a different card
+of the same family.
 
 Only the CUDA-kernel backend needs MSVC and `nvcc`. **The SDPA backend needs neither** — if
 you just want to run the benchmark, skip to [Running](#running) and everything works with
@@ -88,9 +135,10 @@ of extension build failures.
 
 ### 2. Build the CUDA extension (optional)
 
-The extension is JIT-compiled by `torch.utils.cpp_extension` on first use and cached in
-`build/`. It needs `cl.exe` on `PATH`, which a plain shell does not have — so every build
-goes through `scripts/devenv.bat`, which calls `vcvarsall.bat` first.
+The extension is compiled by `torch.utils.cpp_extension` and cached in `build/`.
+Compiling needs `cl.exe` on `PATH`, which a plain shell does not have — MSVC is not on the
+global `PATH` even when Visual Studio is fully installed, only inside a developer command
+prompt. So the build goes through `scripts/devenv.bat`, which sets that up:
 
 ```bash
 cmd.exe /c scripts\build_ext.bat
@@ -102,10 +150,14 @@ Expected output:
 [build_ext] OK -> ...\build\transformer_kernels.pyd
 ```
 
-Rebuilds after the first are near-instant (`ninja: no work to do` when nothing changed).
+Rebuilds after the first are near-instant (`ninja: no work to do` when nothing changed),
+and editing anything in `csrc/` makes the next run recompile automatically — there is no
+separate build step to remember, only the `devenv.bat` prefix.
 
-If `vcvarsall.bat` is somewhere else on your machine, edit the path at the top of
-[`scripts/devenv.bat`](scripts/devenv.bat).
+`scripts/devenv.bat` locates Visual Studio with `vswhere`, so there is no path to edit if
+yours is installed somewhere unexpected. See [Toolset selection](#toolset-selection) if the
+build fails on the compiler version.
+
 
 ### 3. Verify
 
@@ -118,15 +170,21 @@ per-shape timings. It should end with `all cases match the reference`.
 
 ### Troubleshooting
 
-**`custom CUDA kernel unavailable, using SDPA instead`** — not an error. The extension could
-not be built, so attention fell back to SDPA; results are still correct and the benchmark
-still reports a real speedup. It happens whenever the harness is run from a plain shell,
-because `cl.exe` is only on `PATH` inside a Visual Studio developer environment. To use the
-kernel, go through `devenv.bat`:
+**`custom CUDA kernel unavailable, using SDPA instead`** — not an error, and not a claim
+that MSVC is missing. It means `cl.exe` was not on `PATH`, so the extension could not be
+built and attention fell back to SDPA; results are still correct and the benchmark still
+reports a real speedup.
+
+`cl.exe` is not on `PATH` in a normal shell even with Visual Studio fully installed — only
+inside a developer command prompt. Prefix the command with `devenv.bat`:
 
 ```bash
 cmd.exe /c scripts\devenv.bat python torch_transformer_benchmark.py
 ```
+
+Every run needs the prefix, because `torch.utils.cpp_extension.load()` probes for the host
+compiler before it will even check whether a rebuild is needed. To make a missing kernel a
+hard error rather than a silent fallback, use `--attn-backend custom`.
 
 To use SDPA deliberately and silence the message, set `ATTENTION_BACKEND = "sdpa"` at the
 top of the file. To make a missing kernel a hard error instead of a fallback, set it to
@@ -139,16 +197,23 @@ build succeeds regardless.
 actually ran. With `"auto"`, a silent fallback means you may be timing SDPA rather than the
 kernel; `"custom"` raises instead of falling back.
 
-### Targeting a different GPU
+### Toolset selection
 
-The build hard-codes SM 8.6. For another card, change the `-gencode` flag in
-[`kernel_ext.py`](kernel_ext.py):
+`nvcc` accepts only a window of MSVC versions, and Visual Studio defaults to the newest
+toolset it has. With CUDA 13.0 and a 14.5x toolset that shows up either as
+`unsupported Microsoft Visual Studio version` or — worse, because it looks like a compiler
+bug rather than a configuration problem — as `cudafe++ died with status 0xC0000005`.
 
-```python
-"-gencode=arch=compute_86,code=sm_86",   # RTX 3070
+[`scripts/devenv.bat`](scripts/devenv.bat) therefore locates Visual Studio with `vswhere`
+(rather than hard-coding a path) and pins the toolset with `-vcvars_ver`. The default is
+`14.44`; override it if your CUDA version wants a different one:
+
+```bash
+set VCVARS_VER=14.43
+cmd.exe /c scriptsuild_ext.bat
 ```
 
-The kernel itself is architecture-agnostic — it uses no SM-specific intrinsics.
+If the pinned toolset is not installed, the script lists the ones that are.
 
 ---
 
@@ -199,13 +264,28 @@ For a single run without editing the file, `--attn-backend` overrides it:
 python torch_transformer_benchmark.py --attn-backend sdpa
 ```
 
+### Choosing the kernel inside the custom backend
+
+`ATTENTION_IMPL` (or `--attn-impl` for one run) picks which of the two custom kernels
+handles attention:
+
+| Value | Behavior |
+| --- | --- |
+| `auto` | Tensor-core kernel where it applies, scalar kernel otherwise. |
+| `scalar` | Force the scalar kernel. No tensor cores, no TF32 rounding. |
+| `wmma` | Force the tensor-core kernel; raises on shapes it does not cover, so a silent fallback cannot be mistaken for a slow kernel. |
+
+The tensor-core kernel covers `head_dim` 16, 32 and 64 in float32, float16 and bfloat16, on
+compute capability 8.0 and up. `head_dim=8` uses the scalar kernel and `head_dim=128` falls
+through to ATen, in both cases without any action from the caller.
+
 ### Helper scripts
 
 | Script | Purpose |
 | --- | --- |
 | `scripts/verify_kernel.py` | Kernel vs. reference vs. SDPA across 12 shapes. Fails fast and names the shape that broke. |
-| `scripts/bench_attention.py` | Times the attention op alone, with accuracy alongside, so a speed win bought with precision is visible. |
-| `scripts/compare_backends.py` | Runs the full harness once per backend and prints the comparison table above. |
+| `scripts/bench_attention.py` | Times the attention op alone — scalar vs. tensor-core vs. SDPA — with accuracy alongside, so a speed win bought with precision is visible. |
+| `scripts/compare_backends.py` | Runs the full harness once per backend and prints the comparison table above. Set `COMPARE_FULL=1` for the harness's own accuracy-trial count instead of the trimmed one. |
 
 All three want `devenv.bat` in front of them:
 
@@ -241,13 +321,48 @@ makes several baseline details load-bearing rather than incidental:
 
 **Fused attention.** Both backends collapse `matmul → mask → softmax → matmul` into one
 operation and never write the `[B, H, S, S]` score matrix to global memory. The custom
-kernel does this FlashAttention-style: one thread per query row, K/V streamed through
-shared memory a tile at a time, with a running max and running sum so the softmax is
-computed incrementally.
+kernel does this FlashAttention-style: K/V are streamed through shared memory a tile at a
+time, with a running max and running sum so the softmax is computed incrementally.
 
-**Causal tile skipping.** Under causal masking, no thread in a block looks past that
-block's last query row, so whole key tiles beyond it are never loaded or computed — not
-computed and discarded. This is where the 2.89x on `seq2048 causal` comes from.
+**Both matmuls on tensor cores.** The default custom kernel runs `Q @ K^T` and `P @ V`
+through `nvcuda::wmma` fragments rather than scalar FMA. A block owns 64 query rows split
+across 4 warps, one 16-row stripe each — 16 being the `M` of a wmma tile — and walks the
+keys in tiles of 32. Per tile a warp computes its `16×32` score block, softmaxes it, and
+multiplies straight into its `16×head_dim` output block. fp32 inputs use TF32 fragments with
+fp32 accumulate, which is the same arithmetic cuBLAS gives the baseline when
+`torch.backends.cuda.matmul.allow_tf32` is on (the harness default); half and bfloat16 use
+native `16×16×16` fragments.
+
+Three details are what make it a win rather than a wash — each was worth measuring on its
+own, and the first two were regressions until fixed:
+
+- **Padded shared-memory leading dimensions.** A fragment load walks a *column* of a tile,
+  so a row stride of 16, 32 or 64 floats puts every row of the fragment in one shared-memory
+  bank and serialises the load. Padding each tile's leading dimension by the smallest amount
+  wmma permits (4 floats, or 8 halves) rotates successive rows off each other.
+
+- **Q and O held in registers.** Q is read into fragments once per block and never re-read.
+  O accumulates in accumulator fragments for the whole key loop instead of being written
+  back to shared memory each tile. That second one needs the per-row softmax rescale to be
+  applied to fragment *elements*, and the element-to-row mapping is architecture-defined —
+  CUDA deliberately does not document it. Rather than hard-code a layout, the kernel probes
+  it: it stores one fragment whose elements are tagged with `(lane, slot)`, reads back where
+  each tag landed, and inverts the mapping. One 16×16 tile per warp, once per block, exact
+  by construction on any device the kernel compiles for.
+
+- **One softmax lane per query row, not per key column.** The obvious mapping — lane ==
+  key column — needs a 5-step butterfly per row, 16 rows deep, and that cost does not
+  shrink with `head_dim`, so at `head_dim=16` it swamped both GEMMs. Giving each lane a
+  whole row segment leaves one shuffle: between the two lanes that share a row.
+
+**Causal tile skipping.** Under causal masking, no query in a block looks past that block's
+last query row, so whole key tiles beyond it are never loaded or computed — not computed
+and discarded.
+
+**A scalar kernel as the fallback.** One thread per query row, plain fp32 FMA, no tensor
+cores and so no TF32 rounding at all. It covers what wmma cannot (`head_dim` 8, pre-Ampere
+cards) and stays selectable through `--attn-impl scalar` so the tensor-core win can be
+measured rather than assumed.
 
 **Cached causal mask.** The mask depends only on `seq_len`, which is fixed for a model
 instance, so it is built once and reused instead of being rebuilt on all 6 layers of every
@@ -276,7 +391,7 @@ about 1 GB *per layer*.
 
 ```
 torch_transformer_benchmark.py   harness + baseline + the optimized implementation
-csrc/fused_attention.cu          custom fused attention CUDA kernel
+csrc/fused_attention.cu          custom fused attention CUDA kernels (tensor-core + scalar)
 kernel_ext.py                    JIT loader; returns None instead of raising if unavailable
 scripts/devenv.bat               runs a command with MSVC on PATH
 scripts/build_ext.bat            one-shot build + load check
@@ -304,15 +419,49 @@ push `max_abs` from 9.9e-4 to 1.12e-3.
 implementation*. No restructured attention can pass at those dtypes; the limit is the
 harness's tolerance versus the baseline's own noise, not the kernel.
 
-**`head_dim=128` falls back to ATen.** Keeping 128 accumulators plus 128 query values in
-registers exceeds what is addressable without spilling, so those shapes take the reference
-path inside the extension. This is why `wide d1024` is the weakest custom result.
+**`head_dim=128` falls back to ATen.** Neither custom kernel covers it. The scalar kernel
+would need 128 accumulators plus 128 query values per thread, which does not fit without
+spilling; the tensor-core kernel would need a `64×132` fp32 output tile plus two `32×132`
+K/V tiles in shared memory, which is over the 48 KB that keeps two blocks resident per SM.
+Covering it means a different tiling — splitting `head_dim` across warps rather than giving
+each warp the full width — not a parameter change.
 
-**SDPA is still faster overall.** The custom kernel loses 5–15% on most shapes because
-SDPA's backends use tensor cores for both matmuls while this kernel uses plain FMA. It wins
-2–3x on tiny and odd shapes, where launch overhead dominates and simplicity pays. Closing
-the rest of the gap means WMMA/tensor-core tiles — at the cost of the fp32 precision that
-makes `deep 12L` pass.
+**Tensor cores did not cost precision the way the old note here predicted.** The worry was
+that TF32 fragments would push the kernel away from the baseline. On the attention op the
+opposite holds: because the harness runs the baseline with TF32 on, the tensor-core kernel
+lands about 2x *closer* to it than the scalar kernel does (6.4e-5 vs 2.1e-4 at `seq2048`,
+3.7e-4 vs 7.1e-4 at the default shape). End to end that does not translate — over 12
+accuracy trials the scalar kernel peaked at `max_abs` 7.7e-4 and the tensor-core kernel at
+8.7e-4 — but it does not reverse either.
+
+**Three configurations sit on the accuracy gate, and which backend passes is close to
+chance.** `causal`, `causal + padded` and `deep 12L` all fail intermittently, by one or two
+elements out of hundreds of thousands to millions, at `max_abs` ≈ 1.0–1.2e-3 against
+`atol=1e-3`. This is not specific to the custom kernels: plain `--attn-backend sdpa` fails
+`causal` and `deep 12L` too.
+
+The clearest evidence that it is chance rather than a precision ranking comes from
+`deep 12L` over 8 trials per backend:
+
+| | verdict | `max_abs` | failed elements |
+| --- | --- | --- | --- |
+| SDPA | FAIL | 1.101e-3 | 1 / 4,194,304 |
+| custom scalar | PASS | 1.187e-3 | 0 |
+| custom wmma | FAIL | 1.140e-3 | 2 / 4,194,304 |
+
+The backend that passed has the *largest* `max_abs` of the three. The criterion is
+`abs <= atol OR abs <= rtol * abs(ref)`, so a large absolute error is forgiven wherever the
+reference is large, and what decides the verdict is whether the few elements with a
+near-zero reference happen to land inside `atol`. Trials routinely report `max_rel` in the
+hundreds, which is the signature of exactly that. Halving the systematic error, as the
+tensor-core kernel does, barely moves it.
+
+The baseline's own causal attention is that far from any reordered implementation of the
+same math, so the outcome depends on the GPU and on cuBLAS/SDPA kernel selection — the
+Results table was measured on the RTX 4050 in [Environment](#environment), and the same
+configurations were reported as passing on an RTX 3070. Running with
+`--no-allow-tf32 --matmul-precision highest` removes the TF32 rounding from both sides and
+the margin returns.
 
 ---
 
@@ -320,13 +469,20 @@ makes `deep 12L` pass.
 
 | | |
 | --- | --- |
-| GPU | NVIDIA GeForce RTX 3070, 8 GB, SM 8.6 |
-| Driver | 610.47 |
+| GPU | NVIDIA GeForce RTX 4050 Laptop, 6 GB, SM 8.9 |
+| Driver | 595.79 |
 | CUDA Toolkit | 13.0 (V13.0.48) |
 | PyTorch | 2.12.0+cu132 |
-| Python | 3.10 |
-| Compiler | MSVC 14.44 (Visual Studio 2022) |
+| Python | 3.11 |
+| Compiler | MSVC 14.44, pinned via `-vcvars_ver` |
 | OS | Windows 11 |
+
+The GPU is a power- and thermally-capped laptop part: `nvidia-smi` reports
+`SW Power Cap` and `SW Thermal Slowdown` active under load, and absolute latencies drift by
+2–3x across a long session. Every ratio quoted here therefore comes from timings taken
+*interleaved* — candidates measured round-robin, minimum of N — so the clock state is
+shared between them. Absolute milliseconds from different runs are not comparable; ratios
+within one run are.
 
 `torch.compile` and Triton are unavailable in this environment (Triton has no working
 Windows build here), which is why the custom-kernel path is C++/CUDA via

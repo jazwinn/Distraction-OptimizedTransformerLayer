@@ -190,6 +190,18 @@ class BaselineTransformer(nn.Module):
 # ---------------------------------------------------------------------------
 ATTENTION_BACKEND = "auto"
 
+# Which kernel inside the extension handles attention. Only meaningful when the
+# custom backend is in play.
+#
+#   "auto"    tensor-core kernel where it applies, scalar kernel otherwise
+#   "scalar"  force the scalar kernel (no tensor cores, no TF32 rounding)
+#   "wmma"    force the tensor-core kernel; raises on shapes it does not cover
+#
+# (--attn-impl overrides this for a single run.)
+ATTENTION_IMPL = "auto"
+
+_IMPL_CODE = {"auto": 0, "scalar": 1, "wmma": 2}
+
 _fallback_warned = False
 
 
@@ -210,7 +222,7 @@ def _attention_dispatch(
         kernels = kernel_ext.get_kernels()
         if kernels is not None:
             return kernels.fused_attention_forward(
-                q, k, v, attn_mask, is_causal, scale
+                q, k, v, attn_mask, is_causal, scale, _IMPL_CODE[ATTENTION_IMPL]
             )
         if ATTENTION_BACKEND == "custom":
             raise RuntimeError(
@@ -864,6 +876,13 @@ def parse_args() -> argparse.Namespace:
         help="override ATTENTION_BACKEND for this run only (default: use the "
              "value set at the top of this file)",
     )
+    parser.add_argument(
+        "--attn-impl",
+        choices=("auto", "scalar", "wmma"),
+        default=None,
+        help="override ATTENTION_IMPL for this run only: which kernel inside "
+             "the custom extension runs attention",
+    )
     return parser.parse_args()
 
 
@@ -885,11 +904,13 @@ def validate_args(args: argparse.Namespace, device: torch.device, dtype: torch.d
 
 
 def main() -> int:
-    global ATTENTION_BACKEND
+    global ATTENTION_BACKEND, ATTENTION_IMPL
 
     args = parse_args()
     if args.attn_backend is not None:
         ATTENTION_BACKEND = args.attn_backend
+    if args.attn_impl is not None:
+        ATTENTION_IMPL = args.attn_impl
 
     device = resolve_device(args.device)
     dtype = resolve_dtype(args.dtype)

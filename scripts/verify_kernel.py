@@ -1,10 +1,20 @@
 """
-Check the custom fused attention kernel against SDPA and against the baseline's
+Check the custom fused attention kernels against SDPA and against the baseline's
 own attention math, on the attention op alone -- no transformer stack, no
 weight loading, no benchmark harness in the way.
 
-Use this while writing the kernel. It fails fast and points at the exact
-(config, tensor) that broke, which the full harness can't do.
+Both kernels are checked on every case, each against its own tolerance. They are
+not trying to hit the same number: the scalar kernel does everything in fp32 and
+should land within a few ULP of an exact reference, while the tensor-core kernel
+rounds its operands to TF32 on purpose, which is worth about 1e-3 on these
+magnitudes. Holding both to one loose threshold would mean a scalar-kernel
+regression of three orders of magnitude still passed.
+
+The reference is computed with TF32 explicitly off, so it does not move with the
+ambient torch settings.
+
+Use this while writing the kernels. It fails fast and points at the exact
+(config, impl) that broke, which the full harness can't do.
 
     cmd.exe /c scripts\\devenv.bat python scripts\\verify_kernel.py
 """
@@ -87,6 +97,18 @@ def timed(fn, iters=30):
     return statistics.median(s.elapsed_time(e) for s, e in zip(starts, ends))
 
 
+# (impl code, label, tolerance against an exact-fp32 reference).
+#
+# The scalar kernel accumulates entirely in fp32, so anything past a few ULP of
+# the reference is a bug rather than rounding. The tensor-core kernel rounds Q,
+# K, P and V to TF32 (10 mantissa bits) before every multiply, exactly as cuBLAS
+# does for the baseline; on unit-scale inputs that is worth ~1e-3.
+IMPLS = (
+    (1, "scalar", 5e-6),
+    (2, "wmma", 3e-3),
+)
+
+
 def main() -> int:
     if not torch.cuda.is_available():
         print("CUDA unavailable")
@@ -98,11 +120,16 @@ def main() -> int:
         print("run through scripts/devenv.bat so cl.exe is on PATH")
         return 1
 
+    # Pin the reference: left at the ambient setting, the thing every kernel is
+    # measured against would move between runs.
+    torch.backends.cuda.matmul.allow_tf32 = False
+
     device = torch.device("cuda")
     dtype = torch.float32
-    row = "{:<18} {:>12} {:>12} {:>10} {:>10} {:>8}"
-    print(row.format("case", "vs_ref", "vs_sdpa", "custom_ms", "sdpa_ms", "speedup"))
-    print("-" * 76)
+    row = "{:<18} {:>8} {:>11} {:>11} {:>9} {:>9} {:>8}"
+    print(row.format("case", "impl", "vs_ref", "vs_sdpa",
+                     "custom_ms", "sdpa_ms", "speedup"))
+    print("-" * 80)
 
     failures = []
     for label, b, h, s, d, causal, padded in CASES:
@@ -116,45 +143,54 @@ def main() -> int:
             sdpa = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=attn_mask, is_causal=is_causal, scale=scale
             )
-            try:
-                custom = kernels.fused_attention_forward(
-                    q, k, v, attn_mask, is_causal, scale
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(row.format(label, "RAISED", str(exc)[:12], "-", "-", "-"))
-                failures.append(label)
-                continue
-
-            if custom.shape != ref.shape:
-                print(row.format(label, f"SHAPE{tuple(custom.shape)}", "-", "-", "-", "-"))
-                failures.append(label)
-                continue
-
-            d_ref = (custom.float() - ref.float()).abs().max().item()
-            d_sdpa = (custom.float() - sdpa.float()).abs().max().item()
-
-            t_custom = timed(lambda: kernels.fused_attention_forward(
-                q, k, v, attn_mask, is_causal, scale))
             t_sdpa = timed(lambda: F.scaled_dot_product_attention(
                 q, k, v, attn_mask=attn_mask, is_causal=is_causal, scale=scale))
 
-        bad = d_ref > 2e-3 or not torch.isfinite(custom).all()
-        if bad:
-            failures.append(label)
-        print(row.format(
-            label,
-            f"{d_ref:.2e}" + ("!" if bad else ""),
-            f"{d_sdpa:.2e}",
-            f"{t_custom:.3f}",
-            f"{t_sdpa:.3f}",
-            f"{t_sdpa / t_custom:.2f}x",
-        ))
+            for impl, name, tol in IMPLS:
+                try:
+                    custom = kernels.fused_attention_forward(
+                        q, k, v, attn_mask, is_causal, scale, impl
+                    )
+                except RuntimeError as exc:
+                    if impl == 2:
+                        # No tensor-core specialization for this head_dim. The
+                        # scalar row above already covered the case.
+                        print(row.format(label, name, "n/a", "-", "-", "-", "-"))
+                        continue
+                    print(row.format(label, name, "RAISED", str(exc)[:11],
+                                     "-", "-", "-"))
+                    failures.append(f"{label}/{name}")
+                    continue
 
-    print("-" * 76)
+                if custom.shape != ref.shape:
+                    print(row.format(label, name, f"SHAPE{tuple(custom.shape)}",
+                                     "-", "-", "-", "-"))
+                    failures.append(f"{label}/{name}")
+                    continue
+
+                d_ref = (custom.float() - ref.float()).abs().max().item()
+                d_sdpa = (custom.float() - sdpa.float()).abs().max().item()
+                t_custom = timed(lambda: kernels.fused_attention_forward(
+                    q, k, v, attn_mask, is_causal, scale, impl))
+
+                bad = d_ref > tol or not torch.isfinite(custom).all()
+                if bad:
+                    failures.append(f"{label}/{name}")
+                print(row.format(
+                    label,
+                    name,
+                    f"{d_ref:.2e}" + ("!" if bad else ""),
+                    f"{d_sdpa:.2e}",
+                    f"{t_custom:.3f}",
+                    f"{t_sdpa:.3f}",
+                    f"{t_sdpa / t_custom:.2f}x",
+                ))
+
+    print("-" * 80)
     if failures:
         print(f"FAILED: {', '.join(failures)}")
         return 1
-    print("all cases match the reference")
+    print("both kernels match the reference on every case")
     return 0
 
 

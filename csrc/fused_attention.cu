@@ -1,10 +1,25 @@
 // Custom fused attention extension.
 //
-// FlashAttention-style scalar kernel: one thread per query row, K/V streamed
-// through shared memory a tile at a time, softmax accumulated online, so the
-// [B,H,S,S] score matrix is never written to global memory. Plain fp32 FMA,
-// which makes it more precise than the baseline -- it never rounds through
-// TF32 the way cuBLAS does.
+// FlashAttention-style: the [B,H,S,S] score matrix is never written to global
+// memory. K/V are streamed through shared memory a tile at a time and the
+// softmax is accumulated online (running max + running sum).
+//
+// Two implementations of the same math:
+//
+//   wmma   -- tensor-core path. Both GEMMs (Q@K^T and P@V) run on the MMA
+//             units via nvcuda::wmma, 64 queries x 32 keys per block, 4 warps.
+//             fp32 inputs go through TF32 fragments with fp32 accumulate,
+//             which is exactly what cuBLAS does for the baseline's matmuls
+//             when torch.backends.cuda.matmul.allow_tf32 is on (the harness
+//             default), so this path is *closer* to the reference than the
+//             scalar one, not further. half/bfloat16 use native 16x16x16
+//             fragments. Needs SM 8.0+ and head_dim divisible by the fragment
+//             K (8 for TF32, 16 for half/bf16) with head_dim >= 16.
+//
+//   scalar  -- one thread per query row, plain fp32 FMA. No tensor cores, so
+//             no TF32 rounding at all. Covers what wmma cannot (head_dim 8,
+//             half/bf16 at head_dim 8, pre-Ampere) and stays available via
+//             impl=1 for A/B comparison.
 //
 // Coverage: head_dim in {8,16,32,64}, float/half/bfloat16. Anything else
 // (e.g. head_dim 128) falls back to the ATen implementation at the bottom,
@@ -14,6 +29,11 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <mma.h>
+
+#include <type_traits>
 
 namespace {
 
@@ -197,6 +217,509 @@ bool dispatch_head_dim(const torch::Tensor& q, const torch::Tensor& k,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tensor-core kernel.
+//
+// Block owns BLOCK_M=64 query rows; 4 warps, one 16-row stripe each. Keys are
+// walked in BLOCK_N=32 tiles. Per tile a warp does:
+//
+//   1. S = Q @ K^T           16x32 via wmma, accumulate fp32   -> smem
+//   2. online softmax on those 16 rows                          -> P in smem
+//   3. O = O * corr + P @ V  16xD  via wmma, straight into the O fragments
+//
+// Q and O both stay in registers for the whole key loop, so the only traffic
+// in the inner loop is the K/V tile, the score tile, and the fragment reads
+// that feed the MMA units.
+//
+// Every 2-D tile in shared memory is stored with a padded leading dimension.
+// A fragment load walks a column of the tile, so an unpadded row stride of 16,
+// 32 or 64 floats puts every row of the fragment in the same shared-memory
+// bank and serializes the load. The pad is the smallest one wmma allows (ldm
+// must be a multiple of 4 floats, or 8 halves), which is enough to rotate
+// successive rows off each other.
+// ---------------------------------------------------------------------------
+
+namespace wm = nvcuda::wmma;
+
+// c10 half types are layout-compatible with the CUDA ones, but only the CUDA
+// ones have wmma fragment overloads.
+template <typename T> struct DevType      { using type = T; };
+template <> struct DevType<c10::Half>     { using type = __half; };
+template <> struct DevType<c10::BFloat16> { using type = __nv_bfloat16; };
+
+// Fragment element type and K extent. TF32 only comes in 16x16x8.
+//
+// The primary template is a valid-but-unsupported placeholder rather than a
+// declaration: AT_DISPATCH_FLOATING_TYPES_AND2 also instantiates the double
+// branch, which has no fragment type at all, and `supported` is what keeps
+// that branch from ever reaching a wmma call. K stays nonzero so the
+// divisibility tests below do not divide by zero while being compiled away.
+template <typename T> struct FragTraits {
+    using elem = float;
+    static constexpr int K = 8;
+    static constexpr int LD_PAD = 4;
+    static constexpr bool supported = false;
+};
+template <> struct FragTraits<float> {
+    using elem = wm::precision::tf32;
+    static constexpr int K = 8;
+    static constexpr int LD_PAD = 4;   // wmma wants ldm % 4 == 0 for float
+    static constexpr bool supported = true;
+};
+template <> struct FragTraits<__half> {
+    using elem = __half;
+    static constexpr int K = 16;
+    static constexpr int LD_PAD = 8;   // ... and ldm % 8 == 0 for 16-bit
+    static constexpr bool supported = true;
+};
+template <> struct FragTraits<__nv_bfloat16> {
+    using elem = __nv_bfloat16;
+    static constexpr int K = 16;
+    static constexpr int LD_PAD = 8;
+    static constexpr bool supported = true;
+};
+
+__device__ __forceinline__ void dev_from_float(float& d, float s)         { d = s; }
+__device__ __forceinline__ void dev_from_float(__half& d, float s)        { d = __float2half(s); }
+__device__ __forceinline__ void dev_from_float(__nv_bfloat16& d, float s) { d = __float2bfloat16(s); }
+
+// Shared-memory plan. Q is staged into the same bytes that later hold the O
+// spill area: Q is read into registers once, up front, and is dead after that,
+// and O is fp32 so the region is sized for whichever is larger.
+template <typename scalar_t, int HEAD_DIM>
+struct WmmaCfg {
+    static constexpr int BLOCK_M = 64;
+    static constexpr int BLOCK_N = 32;
+    static constexpr int WARPS = 4;
+    static constexpr int NTHREADS = WARPS * 32;
+    static constexpr int ROWS_PER_WARP = BLOCK_M / WARPS;  // 16 == wmma M
+
+    static constexpr int WK = FragTraits<scalar_t>::K;
+    static constexpr int PAD = FragTraits<scalar_t>::LD_PAD;
+    static constexpr bool P_ALIASES_S = std::is_same<scalar_t, float>::value;
+
+    static constexpr int KV_LD = HEAD_DIM + PAD;   // k_s, v_s, and Q staging
+    static constexpr int O_LD  = HEAD_DIM + 4;     // o_s is always fp32
+    static constexpr int S_LD  = BLOCK_N + PAD;    // s_s and p_s
+
+    static constexpr size_t Q_BYTES   = sizeof(scalar_t) * BLOCK_M * KV_LD;
+    static constexpr size_t O_BYTES   = sizeof(float) * BLOCK_M * O_LD;
+    static constexpr size_t QO_BYTES  = (Q_BYTES > O_BYTES) ? Q_BYTES : O_BYTES;
+    static constexpr size_t KV_BYTES  = sizeof(scalar_t) * BLOCK_N * KV_LD;
+    static constexpr size_t S_BYTES   = sizeof(float) * BLOCK_M * S_LD;
+    static constexpr size_t P_BYTES   = P_ALIASES_S ? 0 : sizeof(scalar_t) * BLOCK_M * S_LD;
+    static constexpr size_t ROW_BYTES = sizeof(float) * BLOCK_M;
+
+    static constexpr size_t O_OFF = 0;
+    static constexpr size_t K_OFF = O_OFF + QO_BYTES;
+    static constexpr size_t V_OFF = K_OFF + KV_BYTES;
+    static constexpr size_t S_OFF = V_OFF + KV_BYTES;
+    static constexpr size_t P_OFF = S_OFF + S_BYTES;
+    static constexpr size_t M_OFF = P_OFF + P_BYTES;
+    static constexpr size_t L_OFF = M_OFF + ROW_BYTES;
+    static constexpr size_t C_OFF = L_OFF + ROW_BYTES;
+    static constexpr size_t SMEM  = C_OFF + ROW_BYTES;
+
+    // GEMM1 contracts over head_dim, GEMM2 over the key tile; both must be a
+    // whole number of fragments, and GEMM2 N is head_dim so it needs 16.
+    // Staying under 48 KB keeps two blocks resident per SM without having to
+    // opt in to the larger dynamic shared-memory carveout.
+    static constexpr bool SUPPORTED =
+        FragTraits<scalar_t>::supported &&
+        (HEAD_DIM >= 16) && (HEAD_DIM % WK == 0) && (HEAD_DIM % 16 == 0) &&
+        (BLOCK_N % WK == 0) && (SMEM <= 48 * 1024);
+};
+
+template <typename scalar_t, int HEAD_DIM>
+__global__ __launch_bounds__(WmmaCfg<scalar_t, HEAD_DIM>::NTHREADS)
+void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
+                                 const scalar_t* __restrict__ k,
+                                 const scalar_t* __restrict__ v,
+                                 const bool* __restrict__ mask,
+                                 int64_t ms0, int64_t ms1,
+                                 int64_t ms2, int64_t ms3,
+                                 scalar_t* __restrict__ out,
+                                 int B, int H, int S,
+                                 bool is_causal, float scale) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    using Cfg = WmmaCfg<scalar_t, HEAD_DIM>;
+    using frag_elem = typename FragTraits<scalar_t>::elem;
+    using acc_frag_t = wm::fragment<wm::accumulator, 16, 16, Cfg::WK, float>;
+    constexpr int BLOCK_M = Cfg::BLOCK_M;
+    constexpr int BLOCK_N = Cfg::BLOCK_N;
+    constexpr int WK      = Cfg::WK;
+    constexpr int RPW     = Cfg::ROWS_PER_WARP;
+    constexpr int KV_LD   = Cfg::KV_LD;
+    constexpr int O_LD    = Cfg::O_LD;
+    constexpr int S_LD    = Cfg::S_LD;
+    constexpr int N_TILES = HEAD_DIM / 16;
+    // Softmax lane mapping: RPW lanes cover the rows, the rest split each
+    // row into COLS_PER_LANE-wide segments.
+    constexpr int LANES_PER_ROW = 32 / RPW;
+    constexpr int COLS_PER_LANE = BLOCK_N / LANES_PER_ROW;
+    static_assert(RPW <= 32 && 32 % RPW == 0, "warp must split evenly over rows");
+    static_assert(BLOCK_N % LANES_PER_ROW == 0, "key tile must split evenly over lanes");
+    constexpr bool IS_TF32 = std::is_same<scalar_t, float>::value;
+
+    extern __shared__ __align__(16) char smem_raw[];
+    float*    o_s = reinterpret_cast<float*>(smem_raw + Cfg::O_OFF);
+    scalar_t* k_s = reinterpret_cast<scalar_t*>(smem_raw + Cfg::K_OFF);
+    scalar_t* v_s = reinterpret_cast<scalar_t*>(smem_raw + Cfg::V_OFF);
+    float*    s_s = reinterpret_cast<float*>(smem_raw + Cfg::S_OFF);
+    float*    m_s = reinterpret_cast<float*>(smem_raw + Cfg::M_OFF);
+    float*    l_s = reinterpret_cast<float*>(smem_raw + Cfg::L_OFF);
+    float*    c_s = reinterpret_cast<float*>(smem_raw + Cfg::C_OFF);
+    // P feeds the second GEMM as a matrix_a fragment, so it has to be in the
+    // operand type. For fp32 that is the same type the scores were stored in,
+    // so the softmax can overwrite the score tile in place.
+    scalar_t* p_s = Cfg::P_ALIASES_S ? reinterpret_cast<scalar_t*>(s_s)
+                                     : reinterpret_cast<scalar_t*>(smem_raw + Cfg::P_OFF);
+
+    const int tid    = threadIdx.x;
+    const int warp   = tid >> 5;
+    const int lane   = tid & 31;
+    const int m_tile = blockIdx.x;
+    const int h      = blockIdx.y;
+    const int b      = blockIdx.z;
+
+    const int64_t bh_off = static_cast<int64_t>(b * H + h) * S * HEAD_DIM;
+    const int row_base = warp * RPW;                  // this warp stripe in the block
+    const int q_base   = m_tile * BLOCK_M + row_base; // ... and in the sequence
+
+    scalar_t zero_v;
+    dev_from_float(zero_v, 0.0f);
+
+    // --- stage Q, then hoist it into registers for the whole key loop -------
+    {
+        scalar_t* q_s = reinterpret_cast<scalar_t*>(smem_raw + Cfg::O_OFF);
+        for (int idx = tid; idx < BLOCK_M * HEAD_DIM; idx += Cfg::NTHREADS) {
+            const int r = idx / HEAD_DIM;
+            const int c = idx - r * HEAD_DIM;
+            const int gr = m_tile * BLOCK_M + r;
+            q_s[r * KV_LD + c] =
+                (gr < S) ? q[bh_off + static_cast<int64_t>(gr) * HEAD_DIM + c] : zero_v;
+        }
+        __syncthreads();
+    }
+
+    wm::fragment<wm::matrix_a, 16, 16, WK, frag_elem, wm::row_major> q_frag[HEAD_DIM / WK];
+    {
+        const scalar_t* q_s = reinterpret_cast<const scalar_t*>(smem_raw + Cfg::O_OFF);
+        #pragma unroll
+        for (int kk = 0; kk < HEAD_DIM / WK; ++kk) {
+            wm::load_matrix_sync(q_frag[kk],
+                                 q_s + static_cast<size_t>(row_base) * KV_LD + kk * WK,
+                                 KV_LD);
+            if constexpr (IS_TF32) {
+                #pragma unroll
+                for (int t = 0; t < q_frag[kk].num_elements; ++t) {
+                    q_frag[kk].x[t] = wm::__float_to_tf32(q_frag[kk].x[t]);
+                }
+            }
+        }
+    }
+    __syncthreads();  // Q is in registers; s_s and the O region are free again
+
+    // --- which row of the 16x16 tile does each accumulator element hold? ----
+    //
+    // Keeping O in accumulator registers means applying the per-row softmax
+    // rescale directly to fragment elements, and the element-to-row mapping is
+    // architecture-defined -- CUDA deliberately does not document it. So probe
+    // it: store a fragment whose elements are tagged with (lane, slot), read
+    // back which position each tag landed in, and invert. One 16x16 tile per
+    // warp, once per block, and it is exact by construction on any device the
+    // kernel compiles for.
+    constexpr int ACC_ELEMS = 16 * 16 / 32;
+    static_assert(Cfg::BLOCK_M * Cfg::S_LD >= Cfg::WARPS * 512,
+                  "s_s is too small to host the per-warp accumulator probe");
+    int acc_row[ACC_ELEMS];
+    {
+        float* probe_out = s_s + warp * 512;
+        int*   tag_to_row = reinterpret_cast<int*>(s_s + warp * 512 + 256);
+        acc_frag_t probe;
+        #pragma unroll
+        for (int t = 0; t < ACC_ELEMS; ++t) {
+            probe.x[t] = static_cast<float>(lane * ACC_ELEMS + t);
+        }
+        wm::store_matrix_sync(probe_out, probe, 16, wm::mem_row_major);
+        __syncwarp();
+        #pragma unroll
+        for (int t = 0; t < ACC_ELEMS; ++t) {
+            const int pos = lane * ACC_ELEMS + t;      // 32 lanes x 8 == 256 slots
+            tag_to_row[static_cast<int>(probe_out[pos])] = pos / 16;
+        }
+        __syncwarp();
+        #pragma unroll
+        for (int t = 0; t < ACC_ELEMS; ++t) {
+            acc_row[t] = tag_to_row[lane * ACC_ELEMS + t];
+        }
+        __syncwarp();
+    }
+
+    acc_frag_t o_frag[N_TILES];
+    #pragma unroll
+    for (int n = 0; n < N_TILES; ++n) {
+        wm::fill_fragment(o_frag[n], 0.0f);
+    }
+    for (int r = tid; r < BLOCK_M; r += Cfg::NTHREADS) {
+        m_s[r] = -INFINITY;
+        l_s[r] = 0.0f;
+    }
+
+    const int64_t mask_bh =
+        (mask != nullptr) ? (static_cast<int64_t>(b) * ms0 + static_cast<int64_t>(h) * ms1) : 0;
+
+    // Under causal masking no query in this block looks past the block own
+    // last row, so whole key tiles beyond it are skipped rather than computed
+    // and thrown away.
+    const int key_limit = is_causal ? min(S, m_tile * BLOCK_M + BLOCK_M) : S;
+
+    for (int kt = 0; kt < key_limit; kt += BLOCK_N) {
+        __syncthreads();  // everyone is done reading the previous k_s/v_s
+
+        // [B,H,S,head_dim] means a run of keys is one flat span, so the global
+        // reads stay coalesced. Rows past S are zeroed: they are masked out of
+        // the scores anyway, but a NaN in v_s would survive `0 * v` in GEMM2.
+        const scalar_t* k_base = k + bh_off + static_cast<int64_t>(kt) * HEAD_DIM;
+        const scalar_t* v_base = v + bh_off + static_cast<int64_t>(kt) * HEAD_DIM;
+        for (int idx = tid; idx < BLOCK_N * HEAD_DIM; idx += Cfg::NTHREADS) {
+            const int r = idx / HEAD_DIM;
+            const int c = idx - r * HEAD_DIM;
+            const bool inb = (kt + r) < S;
+            k_s[r * KV_LD + c] = inb ? k_base[idx] : zero_v;
+            v_s[r * KV_LD + c] = inb ? v_base[idx] : zero_v;
+        }
+        __syncthreads();
+
+        // --- 1. S = Q @ K^T ------------------------------------------------
+        // k_s is [BLOCK_N, head_dim] row-major, which is K^T column-major with
+        // ldm = KV_LD -- no transpose pass needed.
+        #pragma unroll
+        for (int n = 0; n < BLOCK_N / 16; ++n) {
+            acc_frag_t acc;
+            wm::fill_fragment(acc, 0.0f);
+            #pragma unroll
+            for (int kk = 0; kk < HEAD_DIM / WK; ++kk) {
+                wm::fragment<wm::matrix_b, 16, 16, WK, frag_elem, wm::col_major> kb;
+                wm::load_matrix_sync(kb,
+                                     k_s + static_cast<size_t>(n) * 16 * KV_LD + kk * WK,
+                                     KV_LD);
+                if constexpr (IS_TF32) {
+                    #pragma unroll
+                    for (int t = 0; t < kb.num_elements; ++t) {
+                        kb.x[t] = wm::__float_to_tf32(kb.x[t]);
+                    }
+                }
+                wm::mma_sync(acc, q_frag[kk], kb, acc);
+            }
+            wm::store_matrix_sync(s_s + static_cast<size_t>(row_base) * S_LD + n * 16,
+                                  acc, S_LD, wm::mem_row_major);
+        }
+        __syncwarp();
+
+        // --- 2. online softmax over this warp 16 rows -----------------------
+        //
+        // One lane per query row, not per key column. The obvious mapping --
+        // lane == key column -- needs a full 5-step butterfly per row to
+        // reduce, 16 rows deep, and that reduction cost does not shrink with
+        // head_dim, so at head_dim 16 it swamped both GEMMs. Giving each lane
+        // a whole row segment instead turns the 5 steps into one: the only
+        // cross-lane traffic left is between the two lanes that share a row.
+        {
+            const int sr = lane % RPW;              // row within the warp stripe
+            const int sh = lane / RPW;              // which segment of the key tile
+            const int r  = row_base + sr;
+            const int i  = q_base + sr;
+            const int c0 = sh * COLS_PER_LANE;
+            const float* s_row = s_s + r * S_LD;
+
+            float sv[COLS_PER_LANE];
+            float local_max = -INFINITY;
+            #pragma unroll
+            for (int t = 0; t < COLS_PER_LANE; ++t) {
+                const int col = c0 + t;
+                const int gj = kt + col;
+                bool ok = (i < S) && (gj < S);
+                if (ok && is_causal && gj > i) ok = false;
+                if (ok && mask != nullptr &&
+                    !mask[mask_bh + static_cast<int64_t>(i) * ms2 +
+                          static_cast<int64_t>(gj) * ms3]) {
+                    ok = false;
+                }
+                sv[t] = ok ? (s_row[col] * scale) : -INFINITY;
+                local_max = fmaxf(local_max, sv[t]);
+            }
+
+            float mx = local_max;
+            #pragma unroll
+            for (int off = RPW; off < 32; off <<= 1) {
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+            }
+
+            const float m_old = m_s[r];
+            const float m_new = fmaxf(m_old, mx);
+            float corr = 1.0f;
+            float lsum = 0.0f;
+            if (m_new == -INFINITY) {
+                // Nothing admissible yet -- every key in every tile so far was
+                // masked. Leave the running state alone.
+                #pragma unroll
+                for (int t = 0; t < COLS_PER_LANE; ++t) {
+                    dev_from_float(p_s[r * S_LD + c0 + t], 0.0f);
+                }
+            } else {
+                corr = (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
+                #pragma unroll
+                for (int t = 0; t < COLS_PER_LANE; ++t) {
+                    const float p = (sv[t] == -INFINITY) ? 0.0f : __expf(sv[t] - m_new);
+                    lsum += p;
+                    dev_from_float(p_s[r * S_LD + c0 + t], p);
+                }
+            }
+
+            float tot = lsum;
+            #pragma unroll
+            for (int off = RPW; off < 32; off <<= 1) {
+                tot += __shfl_xor_sync(0xffffffffu, tot, off);
+            }
+
+            if (sh == 0) {
+                m_s[r] = m_new;
+                l_s[r] = l_s[r] * corr + tot;
+                c_s[r] = corr;
+            }
+        }
+        __syncwarp();
+
+        // --- 3. O = O * corr + P @ V ---------------------------------------
+        // P does not depend on the output tile, so it is read once here rather
+        // than once per tile; only V is re-read as n walks head_dim. Likewise
+        // the per-row correction is pulled into registers rather than hitting
+        // shared memory once per accumulator element per tile.
+        wm::fragment<wm::matrix_a, 16, 16, WK, frag_elem, wm::row_major> p_frag[BLOCK_N / WK];
+        #pragma unroll
+        for (int kk = 0; kk < BLOCK_N / WK; ++kk) {
+            wm::load_matrix_sync(p_frag[kk],
+                                 p_s + static_cast<size_t>(row_base) * S_LD + kk * WK,
+                                 S_LD);
+            if constexpr (IS_TF32) {
+                #pragma unroll
+                for (int t = 0; t < p_frag[kk].num_elements; ++t) {
+                    p_frag[kk].x[t] = wm::__float_to_tf32(p_frag[kk].x[t]);
+                }
+            }
+        }
+
+        float corr_of[ACC_ELEMS];
+        #pragma unroll
+        for (int t = 0; t < ACC_ELEMS; ++t) {
+            corr_of[t] = c_s[row_base + acc_row[t]];
+        }
+
+        #pragma unroll
+        for (int n = 0; n < N_TILES; ++n) {
+            #pragma unroll
+            for (int t = 0; t < ACC_ELEMS; ++t) {
+                o_frag[n].x[t] *= corr_of[t];
+            }
+            #pragma unroll
+            for (int kk = 0; kk < BLOCK_N / WK; ++kk) {
+                wm::fragment<wm::matrix_b, 16, 16, WK, frag_elem, wm::row_major> vb;
+                wm::load_matrix_sync(vb,
+                                     v_s + static_cast<size_t>(kk) * WK * KV_LD + n * 16,
+                                     KV_LD);
+                if constexpr (IS_TF32) {
+                    #pragma unroll
+                    for (int t = 0; t < vb.num_elements; ++t) {
+                        vb.x[t] = wm::__float_to_tf32(vb.x[t]);
+                    }
+                }
+                wm::mma_sync(o_frag[n], p_frag[kk], vb, o_frag[n]);
+            }
+        }
+    }
+
+    // --- normalize and write out --------------------------------------------
+    // l == 0 means every key was masked. The reference produces NaN there;
+    // emit 0 instead, since such rows are zero-filled downstream anyway.
+    #pragma unroll
+    for (int n = 0; n < N_TILES; ++n) {
+        #pragma unroll
+        for (int t = 0; t < ACC_ELEMS; ++t) {
+            const float lr = l_s[row_base + acc_row[t]];
+            o_frag[n].x[t] *= (lr > 0.0f) ? (1.0f / lr) : 0.0f;
+        }
+        wm::store_matrix_sync(o_s + static_cast<size_t>(row_base) * O_LD + n * 16,
+                              o_frag[n], O_LD, wm::mem_row_major);
+    }
+    __syncwarp();
+
+    for (int rr = 0; rr < RPW; ++rr) {
+        const int i = q_base + rr;
+        if (i >= S) break;
+        const int r = row_base + rr;
+        scalar_t* out_row = out + bh_off + static_cast<int64_t>(i) * HEAD_DIM;
+        for (int c = lane; c < HEAD_DIM; c += 32) {
+            dev_from_float(out_row[c], o_s[r * O_LD + c]);
+        }
+    }
+#endif
+}
+
+template <typename scalar_t, int HEAD_DIM>
+void launch_wmma_kernel(const torch::Tensor& q, const torch::Tensor& k,
+                        const torch::Tensor& v, const bool* mask_ptr,
+                        const int64_t* ms, torch::Tensor& out,
+                        int B, int H, int S, bool is_causal, double scale) {
+    using Cfg = WmmaCfg<scalar_t, HEAD_DIM>;
+    const dim3 block(Cfg::NTHREADS);
+    const dim3 grid((S + Cfg::BLOCK_M - 1) / Cfg::BLOCK_M, H, B);
+
+    fused_attention_wmma_kernel<scalar_t, HEAD_DIM>
+        <<<grid, block, Cfg::SMEM, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const scalar_t*>(q.const_data_ptr()),
+            reinterpret_cast<const scalar_t*>(k.const_data_ptr()),
+            reinterpret_cast<const scalar_t*>(v.const_data_ptr()),
+            mask_ptr, ms[0], ms[1], ms[2], ms[3],
+            reinterpret_cast<scalar_t*>(out.data_ptr()),
+            B, H, S, is_causal, static_cast<float>(scale));
+}
+
+// Returns false when this (dtype, head_dim) pair has no tensor-core
+// specialization, so the caller can fall back to the scalar kernel.
+template <typename scalar_t, int HEAD_DIM>
+bool maybe_launch_wmma(const torch::Tensor& q, const torch::Tensor& k,
+                       const torch::Tensor& v, const bool* mask_ptr,
+                       const int64_t* ms, torch::Tensor& out,
+                       int B, int H, int S, bool is_causal, double scale) {
+    if constexpr (WmmaCfg<scalar_t, HEAD_DIM>::SUPPORTED) {
+        launch_wmma_kernel<scalar_t, HEAD_DIM>(q, k, v, mask_ptr, ms, out,
+                                               B, H, S, is_causal, scale);
+        return true;
+    } else {
+        return false;
+    }
+}
+
+template <typename c10_t>
+bool dispatch_wmma(const torch::Tensor& q, const torch::Tensor& k,
+                   const torch::Tensor& v, const bool* mask_ptr,
+                   const int64_t* ms, torch::Tensor& out,
+                   int B, int H, int S, int head_dim,
+                   bool is_causal, double scale) {
+    using scalar_t = typename DevType<c10_t>::type;
+    switch (head_dim) {
+        case 16:
+            return maybe_launch_wmma<scalar_t, 16>(q, k, v, mask_ptr, ms, out, B, H, S, is_causal, scale);
+        case 32:
+            return maybe_launch_wmma<scalar_t, 32>(q, k, v, mask_ptr, ms, out, B, H, S, is_causal, scale);
+        case 64:
+            return maybe_launch_wmma<scalar_t, 64>(q, k, v, mask_ptr, ms, out, B, H, S, is_causal, scale);
+        default:
+            return false;
+    }
+}
+
 // Mirrors BaselineSelfAttention.forward exactly. Used for shapes/dtypes no
 // kernel specializes.
 torch::Tensor attention_aten(const torch::Tensor& q, const torch::Tensor& k,
@@ -261,7 +784,10 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
                                       torch::Tensor v,
                                       c10::optional<torch::Tensor> attn_mask,
                                       bool is_causal,
-                                      double scale) {
+                                      double scale,
+                                      int64_t impl) {
+    TORCH_CHECK(impl >= 0 && impl <= 2,
+                "fused_attention_forward: impl must be 0 (auto), 1 (scalar) or 2 (wmma)");
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(),
                 "fused_attention_forward: q/k/v must be CUDA tensors");
     TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
@@ -300,15 +826,34 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
 
     auto out = torch::empty_like(qc);
 
+    // wmma fragments need SM 8.0+; the kernel body is compiled away below that
+    // and would silently return zeros, so gate on the actual device.
+    const bool tensor_cores_ok =
+        at::cuda::getCurrentDeviceProperties()->major >= 8 && impl != 1;
+
     bool handled = false;
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
         qc.scalar_type(), "fused_attention_forward", [&] {
-            handled = dispatch_head_dim<scalar_t>(
-                qc, kc, vc, mask_ptr, ms, out, B, H, S, head_dim, is_causal, scale);
+            if (tensor_cores_ok) {
+                handled = dispatch_wmma<scalar_t>(
+                    qc, kc, vc, mask_ptr, ms, out, B, H, S, head_dim, is_causal, scale);
+            }
+            if (!handled && impl != 2) {
+                handled = dispatch_head_dim<scalar_t>(
+                    qc, kc, vc, mask_ptr, ms, out, B, H, S, head_dim, is_causal, scale);
+            }
         });
 
     if (!handled) {
+        TORCH_CHECK(impl != 2,
+                    "fused_attention_forward: impl=2 requested but the tensor-core "
+                    "kernel does not cover this case (dtype=", qc.scalar_type(),
+                    ", head_dim=", head_dim, ", compute capability ",
+                    at::cuda::getCurrentDeviceProperties()->major, ".",
+                    at::cuda::getCurrentDeviceProperties()->minor,
+                    "). It needs SM 8.0+, head_dim in {16,32,64}, and head_dim "
+                    "divisible by 16 for half/bfloat16.");
         return attention_aten(qc, kc, vc, attn_mask, is_causal, scale);
     }
 
@@ -329,5 +874,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("v"),
           pybind11::arg("attn_mask") = c10::nullopt,
           pybind11::arg("is_causal") = false,
-          pybind11::arg("scale"));
+          pybind11::arg("scale"),
+          pybind11::arg("impl") = 0);
 }
