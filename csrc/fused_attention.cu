@@ -13,17 +13,32 @@
 //             when torch.backends.cuda.matmul.allow_tf32 is on (the harness
 //             default), so this path is *closer* to the reference than the
 //             scalar one, not further. half/bfloat16 use native 16x16x16
-//             fragments. Needs SM 8.0+ and head_dim divisible by the fragment
-//             K (8 for TF32, 16 for half/bf16) with head_dim >= 16.
+//             fragments. Needs SM 8.0+ and head_dim in {8,16,32,64,128}.
+//             head_dim 8 is narrower than the 16-wide fragment, so it is
+//             widened to 16 with zeros inside the kernel; head_dim 128 uses a
+//             32x16 block to stay inside the 48 KB shared-memory budget.
 //
 //   scalar  -- one thread per query row, plain fp32 FMA. No tensor cores, so
-//             no TF32 rounding at all. Covers what wmma cannot (head_dim 8,
-//             half/bf16 at head_dim 8, pre-Ampere) and stays available via
-//             impl=1 for A/B comparison.
+//             no TF32 rounding at all. It is the pre-Ampere path and the
+//             exact-arithmetic reference for A/B comparison (impl=1); wmma now
+//             covers every head_dim the scalar kernel does.
 //
-// Coverage: head_dim in {8,16,32,64}, float/half/bfloat16. Anything else
-// (e.g. head_dim 128) falls back to the ATen implementation at the bottom,
-// which mirrors BaselineSelfAttention.forward exactly.
+//   tile    -- the same FlashAttention math written against the CUDA tile
+//             programming model (cuTile) instead of per-thread. Lives in
+//             tile_attention.cu, which is a separate translation unit because
+//             it needs -std=c++20 and -enable-tile. float32 and head_dim in
+//             {8,16,32,64} only; selected with impl=3. Present only when the
+//             build found CUDA 13.3+, otherwise it declines and the caller
+//             falls back.
+//
+// Coverage: head_dim in {8,16,32,64,128} for wmma and {8,16,32,64} for the
+// scalar and tile kernels, in float/half/bfloat16 (tile is float32 only). A
+// head_dim outside those sets -- 24 or 48, say -- falls back to the ATen
+// implementation at the bottom, which mirrors BaselineSelfAttention.forward
+// exactly. head_dim is a template parameter, so each supported value is a
+// separately compiled kernel and the set cannot be open-ended.
+
+#include "tile_attention.h"
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -286,20 +301,45 @@ __device__ __forceinline__ void dev_from_float(__nv_bfloat16& d, float s) { d = 
 // Shared-memory plan. Q is staged into the same bytes that later hold the O
 // spill area: Q is read into registers once, up front, and is dead after that,
 // and O is fp32 so the region is sized for whichever is larger.
+// Block shape per head_dim. Every warp owns exactly one 16-row wmma tile, so
+// WARPS follows from BLOCK_M rather than being chosen separately.
+//
+// 64x32 is the general case. head_dim 128 needs a smaller block: the shared
+// footprint grows with head_dim, and at 64x32 it would want 75.8 KB, over the
+// 48 KB that keeps two blocks resident per SM. 32x16 brings the same head_dim
+// down to 35.9 KB, which fits with room to spare -- so head_dim 128 is a block
+// shape away from working, not a retiling.
+template <int HEAD_DIM> struct WmmaShape {
+    static constexpr int M = 64;
+    static constexpr int N = 32;
+};
+template <> struct WmmaShape<128> {
+    static constexpr int M = 32;
+    static constexpr int N = 16;
+};
+
 template <typename scalar_t, int HEAD_DIM>
 struct WmmaCfg {
-    static constexpr int BLOCK_M = 64;
-    static constexpr int BLOCK_N = 32;
-    static constexpr int WARPS = 4;
+    // Fragments are 16 wide in N, so a head_dim below that cannot fill one.
+    // Narrow heads are widened to 16 with zeros: GEMM1 contracts over head_dim
+    // and zeros add nothing, GEMM2 produces columns past head_dim that are
+    // simply not stored. Only the shared tiles and fragments see the padded
+    // width; global loads and stores keep using the real head_dim.
+    static constexpr int DIM  = HEAD_DIM;                        // as it is in memory
+    static constexpr int PDIM = (HEAD_DIM < 16) ? 16 : HEAD_DIM; // as the MMA sees it
+
+    static constexpr int BLOCK_M = WmmaShape<HEAD_DIM>::M;
+    static constexpr int BLOCK_N = WmmaShape<HEAD_DIM>::N;
+    static constexpr int ROWS_PER_WARP = 16;                     // == wmma M
+    static constexpr int WARPS = BLOCK_M / ROWS_PER_WARP;
     static constexpr int NTHREADS = WARPS * 32;
-    static constexpr int ROWS_PER_WARP = BLOCK_M / WARPS;  // 16 == wmma M
 
     static constexpr int WK = FragTraits<scalar_t>::K;
     static constexpr int PAD = FragTraits<scalar_t>::LD_PAD;
     static constexpr bool P_ALIASES_S = std::is_same<scalar_t, float>::value;
 
-    static constexpr int KV_LD = HEAD_DIM + PAD;   // k_s, v_s, and Q staging
-    static constexpr int O_LD  = HEAD_DIM + 4;     // o_s is always fp32
+    static constexpr int KV_LD = PDIM + PAD;       // k_s, v_s, and Q staging
+    static constexpr int O_LD  = PDIM + 4;         // o_s is always fp32
     static constexpr int S_LD  = BLOCK_N + PAD;    // s_s and p_s
 
     static constexpr size_t Q_BYTES   = sizeof(scalar_t) * BLOCK_M * KV_LD;
@@ -320,14 +360,22 @@ struct WmmaCfg {
     static constexpr size_t C_OFF = L_OFF + ROW_BYTES;
     static constexpr size_t SMEM  = C_OFF + ROW_BYTES;
 
-    // GEMM1 contracts over head_dim, GEMM2 over the key tile; both must be a
-    // whole number of fragments, and GEMM2 N is head_dim so it needs 16.
-    // Staying under 48 KB keeps two blocks resident per SM without having to
-    // opt in to the larger dynamic shared-memory carveout.
+    // The accumulator probe below needs 512 floats of scratch per warp. It runs
+    // after Q has been hoisted into registers and before the first K/V tile is
+    // staged, so the whole O/K/V/S span is dead and can host it -- but that
+    // span has to actually be big enough.
+    static constexpr size_t PROBE_BYTES = sizeof(float) * WARPS * 512;
+    static constexpr size_t SCRATCH_BYTES = QO_BYTES + 2 * KV_BYTES + S_BYTES;
+
+    // GEMM1 contracts over the padded head_dim, GEMM2 over the key tile; both
+    // must be a whole number of fragments. Staying under 48 KB keeps two blocks
+    // resident per SM without having to opt in to the larger dynamic
+    // shared-memory carveout.
     static constexpr bool SUPPORTED =
         FragTraits<scalar_t>::supported &&
-        (HEAD_DIM >= 16) && (HEAD_DIM % WK == 0) && (HEAD_DIM % 16 == 0) &&
-        (BLOCK_N % WK == 0) && (SMEM <= 48 * 1024);
+        (PDIM % WK == 0) && (PDIM % 16 == 0) &&
+        (BLOCK_N % WK == 0) && (BLOCK_M % 16 == 0) &&
+        (SCRATCH_BYTES >= PROBE_BYTES) && (SMEM <= 48 * 1024);
 };
 
 template <typename scalar_t, int HEAD_DIM>
@@ -352,7 +400,12 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
     constexpr int KV_LD   = Cfg::KV_LD;
     constexpr int O_LD    = Cfg::O_LD;
     constexpr int S_LD    = Cfg::S_LD;
-    constexpr int N_TILES = HEAD_DIM / 16;
+    // DIM is the head_dim as it sits in global memory; PDIM is what the MMA
+    // sees, which is DIM widened to a whole 16-wide fragment. They differ only
+    // for head_dim 8.
+    constexpr int DIM     = Cfg::DIM;
+    constexpr int PDIM    = Cfg::PDIM;
+    constexpr int N_TILES = PDIM / 16;
     // Softmax lane mapping: RPW lanes cover the rows, the rest split each
     // row into COLS_PER_LANE-wide segments.
     constexpr int LANES_PER_ROW = 32 / RPW;
@@ -392,21 +445,24 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
     // --- stage Q, then hoist it into registers for the whole key loop -------
     {
         scalar_t* q_s = reinterpret_cast<scalar_t*>(smem_raw + Cfg::O_OFF);
-        for (int idx = tid; idx < BLOCK_M * HEAD_DIM; idx += Cfg::NTHREADS) {
-            const int r = idx / HEAD_DIM;
-            const int c = idx - r * HEAD_DIM;
+        // Walk the padded width so columns past DIM are explicitly zeroed:
+        // they feed GEMM1's contraction, where a stale value would corrupt the
+        // score rather than contribute nothing.
+        for (int idx = tid; idx < BLOCK_M * PDIM; idx += Cfg::NTHREADS) {
+            const int r = idx / PDIM;
+            const int c = idx - r * PDIM;
             const int gr = m_tile * BLOCK_M + r;
             q_s[r * KV_LD + c] =
-                (gr < S) ? q[bh_off + static_cast<int64_t>(gr) * HEAD_DIM + c] : zero_v;
+                (gr < S && c < DIM) ? q[bh_off + static_cast<int64_t>(gr) * DIM + c] : zero_v;
         }
         __syncthreads();
     }
 
-    wm::fragment<wm::matrix_a, 16, 16, WK, frag_elem, wm::row_major> q_frag[HEAD_DIM / WK];
+    wm::fragment<wm::matrix_a, 16, 16, WK, frag_elem, wm::row_major> q_frag[PDIM / WK];
     {
         const scalar_t* q_s = reinterpret_cast<const scalar_t*>(smem_raw + Cfg::O_OFF);
         #pragma unroll
-        for (int kk = 0; kk < HEAD_DIM / WK; ++kk) {
+        for (int kk = 0; kk < PDIM / WK; ++kk) {
             wm::load_matrix_sync(q_frag[kk],
                                  q_s + static_cast<size_t>(row_base) * KV_LD + kk * WK,
                                  KV_LD);
@@ -430,12 +486,17 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
     // warp, once per block, and it is exact by construction on any device the
     // kernel compiles for.
     constexpr int ACC_ELEMS = 16 * 16 / 32;
-    static_assert(Cfg::BLOCK_M * Cfg::S_LD >= Cfg::WARPS * 512,
-                  "s_s is too small to host the per-warp accumulator probe");
+    // Q is already in registers and the first K/V tile has not been staged, so
+    // the O/K/V/S span is dead and hosts the probe. s_s alone is not always big
+    // enough -- at head_dim 128 the block is 32x16 and s_s holds 640 floats
+    // against the 1024 two warps need.
+    static_assert(Cfg::SCRATCH_BYTES >= Cfg::PROBE_BYTES,
+                  "shared scratch is too small to host the per-warp accumulator probe");
     int acc_row[ACC_ELEMS];
     {
-        float* probe_out = s_s + warp * 512;
-        int*   tag_to_row = reinterpret_cast<int*>(s_s + warp * 512 + 256);
+        float* probe_base = reinterpret_cast<float*>(smem_raw + Cfg::O_OFF);
+        float* probe_out = probe_base + warp * 512;
+        int*   tag_to_row = reinterpret_cast<int*>(probe_base + warp * 512 + 256);
         acc_frag_t probe;
         #pragma unroll
         for (int t = 0; t < ACC_ELEMS; ++t) {
@@ -480,14 +541,15 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
         // [B,H,S,head_dim] means a run of keys is one flat span, so the global
         // reads stay coalesced. Rows past S are zeroed: they are masked out of
         // the scores anyway, but a NaN in v_s would survive `0 * v` in GEMM2.
-        const scalar_t* k_base = k + bh_off + static_cast<int64_t>(kt) * HEAD_DIM;
-        const scalar_t* v_base = v + bh_off + static_cast<int64_t>(kt) * HEAD_DIM;
-        for (int idx = tid; idx < BLOCK_N * HEAD_DIM; idx += Cfg::NTHREADS) {
-            const int r = idx / HEAD_DIM;
-            const int c = idx - r * HEAD_DIM;
-            const bool inb = (kt + r) < S;
-            k_s[r * KV_LD + c] = inb ? k_base[idx] : zero_v;
-            v_s[r * KV_LD + c] = inb ? v_base[idx] : zero_v;
+        const scalar_t* k_base = k + bh_off + static_cast<int64_t>(kt) * DIM;
+        const scalar_t* v_base = v + bh_off + static_cast<int64_t>(kt) * DIM;
+        for (int idx = tid; idx < BLOCK_N * PDIM; idx += Cfg::NTHREADS) {
+            const int r = idx / PDIM;
+            const int c = idx - r * PDIM;
+            const bool inb = ((kt + r) < S) && (c < DIM);
+            const int64_t g = static_cast<int64_t>(r) * DIM + c;
+            k_s[r * KV_LD + c] = inb ? k_base[g] : zero_v;
+            v_s[r * KV_LD + c] = inb ? v_base[g] : zero_v;
         }
         __syncthreads();
 
@@ -499,7 +561,7 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
             acc_frag_t acc;
             wm::fill_fragment(acc, 0.0f);
             #pragma unroll
-            for (int kk = 0; kk < HEAD_DIM / WK; ++kk) {
+            for (int kk = 0; kk < PDIM / WK; ++kk) {
                 wm::fragment<wm::matrix_b, 16, 16, WK, frag_elem, wm::col_major> kb;
                 wm::load_matrix_sync(kb,
                                      k_s + static_cast<size_t>(n) * 16 * KV_LD + kk * WK,
@@ -658,8 +720,9 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
         const int i = q_base + rr;
         if (i >= S) break;
         const int r = row_base + rr;
-        scalar_t* out_row = out + bh_off + static_cast<int64_t>(i) * HEAD_DIM;
-        for (int c = lane; c < HEAD_DIM; c += 32) {
+        // Columns past DIM exist only to fill the fragment; they are dropped.
+        scalar_t* out_row = out + bh_off + static_cast<int64_t>(i) * DIM;
+        for (int c = lane; c < DIM; c += 32) {
             dev_from_float(out_row[c], o_s[r * O_LD + c]);
         }
     }
@@ -709,15 +772,125 @@ bool dispatch_wmma(const torch::Tensor& q, const torch::Tensor& k,
                    bool is_causal, double scale) {
     using scalar_t = typename DevType<c10_t>::type;
     switch (head_dim) {
+        case 8:
+            return maybe_launch_wmma<scalar_t, 8>(q, k, v, mask_ptr, ms, out, B, H, S, is_causal, scale);
         case 16:
             return maybe_launch_wmma<scalar_t, 16>(q, k, v, mask_ptr, ms, out, B, H, S, is_causal, scale);
         case 32:
             return maybe_launch_wmma<scalar_t, 32>(q, k, v, mask_ptr, ms, out, B, H, S, is_causal, scale);
         case 64:
             return maybe_launch_wmma<scalar_t, 64>(q, k, v, mask_ptr, ms, out, B, H, S, is_causal, scale);
+        case 128:
+            return maybe_launch_wmma<scalar_t, 128>(q, k, v, mask_ptr, ms, out, B, H, S, is_causal, scale);
         default:
             return false;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel selection.
+//
+// Every launcher below answers one question: "can you handle this case?" It
+// returns true having launched, or false having done nothing. That keeps the
+// choice of kernel (here) separate from the coverage rules of each kernel
+// (inside it), so the caller is a plain list of preferences.
+// ---------------------------------------------------------------------------
+
+enum class Impl : int64_t {
+    Auto   = 0,
+    Scalar = 1,
+    Wmma   = 2,
+    Tile   = 3,
+};
+
+const char* impl_name(Impl impl) {
+    switch (impl) {
+        case Impl::Auto:   return "auto";
+        case Impl::Scalar: return "scalar";
+        case Impl::Wmma:   return "wmma";
+        case Impl::Tile:   return "tile";
+    }
+    return "?";
+}
+
+// One bundle so the launchers do not each take a dozen positional arguments.
+struct AttnArgs {
+    const torch::Tensor& q;
+    const torch::Tensor& k;
+    const torch::Tensor& v;
+    const bool* mask_ptr;
+    const int64_t* ms;
+    torch::Tensor& out;
+    int B;
+    int H;
+    int S;
+    int head_dim;
+    bool is_causal;
+    double scale;
+};
+
+bool launch_scalar(const AttnArgs& a) {
+    bool launched = false;
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        a.q.scalar_type(), "launch_scalar", [&] {
+            launched = dispatch_head_dim<scalar_t>(
+                a.q, a.k, a.v, a.mask_ptr, a.ms, a.out,
+                a.B, a.H, a.S, a.head_dim, a.is_causal, a.scale);
+        });
+    return launched;
+}
+
+bool launch_wmma(const AttnArgs& a) {
+    // wmma fragments need SM 8.0+; below that the kernel body is compiled away
+    // and would silently write zeros, so gate on the actual device.
+    if (at::cuda::getCurrentDeviceProperties()->major < 8) {
+        return false;
+    }
+    bool launched = false;
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        a.q.scalar_type(), "launch_wmma", [&] {
+            launched = dispatch_wmma<scalar_t>(
+                a.q, a.k, a.v, a.mask_ptr, a.ms, a.out,
+                a.B, a.H, a.S, a.head_dim, a.is_causal, a.scale);
+        });
+    return launched;
+}
+
+bool launch_tile(const AttnArgs& a) {
+    // Unlike the other two, these are hard requirements rather than coverage
+    // gaps: a caller asking for the tile kernel on a build or dtype that cannot
+    // have it wants to hear so, not to be quietly given a different kernel.
+    TORCH_CHECK(tile_attn::available(),
+                "fused_attention_forward: impl=3 (tile) requested but this build "
+                "has no tile support. It needs CUDA 13.3+ with -std=c++20 "
+                "-enable-tile; see kernel_ext.py.");
+    TORCH_CHECK(a.q.scalar_type() == torch::kFloat32,
+                "fused_attention_forward: impl=3 (tile) is float32 only, got ",
+                a.q.scalar_type());
+    return tile_attn::launch(
+        a.q.const_data_ptr<float>(), a.k.const_data_ptr<float>(),
+        a.v.const_data_ptr<float>(), a.mask_ptr, a.ms,
+        a.out.data_ptr<float>(), a.B, a.H, a.S, a.head_dim, a.is_causal,
+        static_cast<float>(a.scale), at::cuda::getCurrentCUDAStream());
+}
+
+// Runs the first kernel that covers this case, honouring what the caller asked
+// for. Auto is the only mode that tries a second kernel; forcing an impl means
+// that kernel or nothing. What happens when nothing covers the case is decided
+// by the caller, not here.
+bool run_kernel(Impl impl, const AttnArgs& a) {
+    switch (impl) {
+        case Impl::Scalar: return launch_scalar(a);
+        case Impl::Wmma:   return launch_wmma(a);
+        case Impl::Tile:   return launch_tile(a);
+        // Tile is deliberately absent here: it covers only float32 and is a
+        // separate programming model whose performance the caller should opt
+        // into deliberately rather than inherit.
+        case Impl::Auto:   return launch_wmma(a) || launch_scalar(a);
+    }
+    return false;
 }
 
 // Mirrors BaselineSelfAttention.forward exactly. Used for shapes/dtypes no
@@ -786,8 +959,9 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
                                       bool is_causal,
                                       double scale,
                                       int64_t impl) {
-    TORCH_CHECK(impl >= 0 && impl <= 2,
-                "fused_attention_forward: impl must be 0 (auto), 1 (scalar) or 2 (wmma)");
+    TORCH_CHECK(impl >= 0 && impl <= 3,
+                "fused_attention_forward: impl must be 0 (auto), 1 (scalar), "
+                "2 (wmma) or 3 (tile)");
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(),
                 "fused_attention_forward: q/k/v must be CUDA tensors");
     TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
@@ -826,34 +1000,27 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
 
     auto out = torch::empty_like(qc);
 
-    // wmma fragments need SM 8.0+; the kernel body is compiled away below that
-    // and would silently return zeros, so gate on the actual device.
-    const bool tensor_cores_ok =
-        at::cuda::getCurrentDeviceProperties()->major >= 8 && impl != 1;
+    const AttnArgs args{qc, kc, vc, mask_ptr, ms, out,
+                        B, H, S, head_dim, is_causal, scale};
+    const Impl mode = static_cast<Impl>(impl);
 
-    bool handled = false;
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
-        qc.scalar_type(), "fused_attention_forward", [&] {
-            if (tensor_cores_ok) {
-                handled = dispatch_wmma<scalar_t>(
-                    qc, kc, vc, mask_ptr, ms, out, B, H, S, head_dim, is_causal, scale);
-            }
-            if (!handled && impl != 2) {
-                handled = dispatch_head_dim<scalar_t>(
-                    qc, kc, vc, mask_ptr, ms, out, B, H, S, head_dim, is_causal, scale);
-            }
-        });
-
-    if (!handled) {
-        TORCH_CHECK(impl != 2,
-                    "fused_attention_forward: impl=2 requested but the tensor-core "
-                    "kernel does not cover this case (dtype=", qc.scalar_type(),
-                    ", head_dim=", head_dim, ", compute capability ",
+    if (!run_kernel(mode, args)) {
+        // Nothing covered this case, so ATen finishes the job -- it takes any
+        // head_dim. wmma and tile decline loudly instead: asking for one of
+        // them specifically and quietly getting ATen would let a benchmark
+        // time one kernel and report it as another.
+        //
+        // scalar does *not* raise here, only because it never has. That is an
+        // inconsistency rather than a decision -- it can time ATen and label it
+        // "scalar" -- but changing it is a behaviour change, not a cleanup.
+        TORCH_CHECK(mode != Impl::Wmma && mode != Impl::Tile,
+                    "fused_attention_forward: impl=", impl, " (", impl_name(mode),
+                    ") does not cover dtype=", qc.scalar_type(),
+                    ", head_dim=", head_dim, " on compute capability ",
                     at::cuda::getCurrentDeviceProperties()->major, ".",
                     at::cuda::getCurrentDeviceProperties()->minor,
-                    "). It needs SM 8.0+, head_dim in {16,32,64}, and head_dim "
-                    "divisible by 16 for half/bfloat16.");
+                    ". wmma needs SM 8.0+ and head_dim in {8,16,32,64,128}; "
+                    "tile needs float32 and head_dim in {8,16,32,64}.");
         return attention_aten(qc, kc, vc, attn_mask, is_causal, scale);
     }
 

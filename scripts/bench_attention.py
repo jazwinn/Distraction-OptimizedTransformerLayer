@@ -67,8 +67,8 @@ def main() -> int:
     # kernels have to match.
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    head = (f"{'case':<18}{'sdpa':>8}{'scalar':>8}{'wmma':>8}"
-            f"{'wmma/sc':>9}{'wmma/sdpa':>11}{'sc err':>9}{'wmma err':>10}")
+    head = (f"{'case':<18}{'sdpa':>8}{'scalar':>8}{'wmma':>8}{'tile':>8}"
+            f"{'wmma/sdpa':>11}{'tile/sdpa':>11}{'wmma err':>10}{'tile err':>10}")
     print(head)
     print("-" * len(head))
 
@@ -84,23 +84,42 @@ def main() -> int:
             err_wmma = (kernels.fused_attention_forward(
                 q, k, v, am, ic, scale, 0).float() - ref).abs().max().item()
 
-            t = bench({
+            # impl=3 raises rather than falling back, so a shape it does not
+            # cover has to be caught instead of silently timed as something
+            # else. head_dim 128 is the case in this table.
+            try:
+                err_tile = (kernels.fused_attention_forward(
+                    q, k, v, am, ic, scale, 3).float() - ref).abs().max().item()
+            except RuntimeError:
+                err_tile = None
+
+            timed = {
                 "sdpa": lambda: F.scaled_dot_product_attention(
                     q, k, v, attn_mask=am, is_causal=ic, scale=scale),
                 "scalar": lambda: kernels.fused_attention_forward(
                     q, k, v, am, ic, scale, 1),
                 "wmma": lambda: kernels.fused_attention_forward(
                     q, k, v, am, ic, scale, 0),
-            })
+            }
+            if err_tile is not None:
+                timed["tile"] = lambda: kernels.fused_attention_forward(
+                    q, k, v, am, ic, scale, 3)
+            t = bench(timed)
 
+        tile_ms = f"{t['tile']:>8.3f}" if err_tile is not None else f"{'n/a':>8}"
+        tile_ratio = (f"{t['sdpa'] / t['tile']:>10.2f}x" if err_tile is not None
+                      else f"{'-':>11}")
+        tile_err = f"{err_tile:>10.1e}" if err_tile is not None else f"{'-':>10}"
         print(f"{label:<18}{t['sdpa']:>8.3f}{t['scalar']:>8.3f}{t['wmma']:>8.3f}"
-              f"{t['scalar'] / t['wmma']:>8.2f}x{t['sdpa'] / t['wmma']:>10.2f}x"
-              f"{err_scalar:>9.1e}{err_wmma:>10.1e}")
+              f"{tile_ms}{t['sdpa'] / t['wmma']:>10.2f}x{tile_ratio}"
+              f"{err_wmma:>10.1e}{tile_err}")
 
     print("-" * len(head))
-    print("ratios >1 mean the tensor-core kernel is faster; the wmma column "
-          "falls back to")
-    print("the scalar kernel on shapes it does not cover (head_dim 8 and 128).")
+    print("ratios >1 mean the custom kernel is faster than sdpa. wmma now "
+          "covers every")
+    print("head_dim in the table; the tile column reports n/a at head_dim 128, "
+          "which it")
+    print("does not specialize.")
     return 0
 
 

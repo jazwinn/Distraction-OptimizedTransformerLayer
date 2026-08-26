@@ -37,6 +37,7 @@ BACKENDS = (
     ("sdpa",          ["--attn-backend", "sdpa"]),
     ("custom scalar", ["--attn-backend", "custom", "--attn-impl", "scalar"]),
     ("custom wmma",   ["--attn-backend", "custom", "--attn-impl", "wmma"]),
+    ("custom tile",   ["--attn-backend", "custom", "--attn-impl", "tile"]),
 )
 
 

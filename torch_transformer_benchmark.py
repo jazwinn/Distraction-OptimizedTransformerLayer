@@ -196,11 +196,15 @@ ATTENTION_BACKEND = "auto"
 #   "auto"    tensor-core kernel where it applies, scalar kernel otherwise
 #   "scalar"  force the scalar kernel (no tensor cores, no TF32 rounding)
 #   "wmma"    force the tensor-core kernel; raises on shapes it does not cover
+#   "tile"    force the cuTile kernel: the same math written against the CUDA
+#             tile programming model instead of per-thread. float32 and
+#             head_dim in {8,16,32,64} only, and needs a build that found
+#             CUDA 13.3+. Never picked by "auto" -- opt in deliberately.
 #
 # (--attn-impl overrides this for a single run.)
 ATTENTION_IMPL = "auto"
 
-_IMPL_CODE = {"auto": 0, "scalar": 1, "wmma": 2}
+_IMPL_CODE = {"auto": 0, "scalar": 1, "wmma": 2, "tile": 3}
 
 _fallback_warned = False
 
@@ -878,7 +882,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--attn-impl",
-        choices=("auto", "scalar", "wmma"),
+        choices=("auto", "scalar", "wmma", "tile"),
         default=None,
         help="override ATTENTION_IMPL for this run only: which kernel inside "
              "the custom extension runs attention",

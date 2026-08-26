@@ -251,26 +251,46 @@ whether a few near-zero-reference elements happen to land inside `atol`.
 
 | dtype | head_dim 8 | 16 | 32 | 64 | 128 |
 | --- | --- | --- | --- | --- | --- |
-| float32 | scalar | wmma | wmma | wmma | ATen |
-| float16 | scalar | wmma | wmma | wmma | ATen |
-| bfloat16 | scalar | wmma | wmma | wmma | ATen |
+| float32 | wmma | wmma | wmma | wmma | wmma |
+| float16 | wmma | wmma | wmma | wmma | wmma |
+| bfloat16 | wmma | wmma | wmma | wmma | wmma |
 
 Tensor cores need compute capability **8.0+**; below that the scalar kernel runs. Selection
 is automatic — `--attn-impl` only exists to force a path for measurement.
 
-**`head_dim=128` is the notable gap.** The tensor-core kernel would need a `64x132` fp32
-output tile plus two `32x132` K/V tiles in shared memory, over the 48 KB that keeps two
-blocks resident per SM. Covering it means a different tiling — splitting `head_dim` across
-warps instead of giving each warp the full width — not a parameter change.
+**The two former gaps are closed, and both were block-shape problems.**
+
+`head_dim=8` is narrower than the 16-wide wmma fragment, so GEMM2's N dimension could not
+be filled. The kernel now widens it to 16 with zeros in shared memory: GEMM1 contracts over
+head_dim, where zeros add nothing, and GEMM2 produces columns past 8 that are simply not
+stored. Nothing extra is read from or written to global memory.
+
+`head_dim=128` at the default `64x32` block wanted 75.8 KB of shared memory, over the 48 KB
+that keeps two blocks resident per SM. It did *not* need a different tiling: a `32x16` block
+brings the same head_dim down to 35.9 KB. `WmmaShape` now picks the block per head_dim, and
+`WARPS` follows from `BLOCK_M` so the warp/lane mapping stays consistent.
+
+Both were worth real speed, not just coverage — at `head_dim=128` the tensor-core kernel
+runs 0.041 ms against the scalar fallback's 0.142 ms, turning a 0.40x loss to SDPA into a
+1.40x win.
 
 ## Reproducing
 
 ```bash
-cmd.exe /c scripts\build_ext.bat                                  # build once
-cmd.exe /c scripts\devenv.bat python scripts\verify_kernel.py     # both kernels, 12 shapes
-cmd.exe /c scripts\devenv.bat python scripts\bench_attention.py   # attention-op table
-cmd.exe /c scripts\devenv.bat python scripts\compare_backends.py  # full harness sweep
+cmd.exe /c scripts\build_ext.bat     # build once (optional; a plain run builds too)
+python scripts\verify_kernel.py      # every kernel, 12 shapes
+python scripts\bench_attention.py    # attention-op table
+python scripts\compare_backends.py   # full harness sweep
 ```
+
+`kernel_ext.py` puts MSVC on `PATH` itself, so none of these need the `devenv.bat`
+prefix any more.
+
+A third kernel now sits alongside the two this document describes:
+[`csrc/tile_attention.cu`](csrc/tile_attention.cu) is the same FlashAttention math
+written against the CUDA tile programming model rather than per-thread. It is selected
+with `--attn-impl tile`, needs CUDA 13.3+, and is documented in the README under
+[Notes and known limits](README.md#notes-and-known-limits).
 
 To see the kernel rather than the FFN, benchmark where attention dominates:
 

@@ -104,7 +104,7 @@ kernel rounds more. See [Notes and known limits](#notes-and-known-limits).
 | | |
 | --- | --- |
 | GPU | NVIDIA. Compute capability 8.0+ for the tensor-core kernel; anything CUDA-capable runs the scalar one |
-| CUDA Toolkit | 13.0 (`nvcc` on `PATH`) |
+| CUDA Toolkit | 13.0+. 13.3+ additionally enables the cuTile kernel (`--attn-impl tile`), which needs `<cuda_tile.h>`; it is picked up automatically when installed alongside an older toolkit |
 | PyTorch | 2.12.0+cu132 |
 | Python | 3.10+ |
 | Compiler | MSVC — Visual Studio with the "Desktop development with C++" workload |
@@ -113,7 +113,10 @@ kernel rounds more. See [Notes and known limits](#notes-and-known-limits).
 The build targets whatever card is present: [`kernel_ext.py`](kernel_ext.py) reads the
 compute capability from `torch.cuda.get_device_capability()` and passes it to `nvcc`, with
 PTX for the same virtual arch alongside so the cached build still loads on a different card
-of the same family.
+of the same family. It also finds MSVC itself (via `vswhere` + `vcvarsall.bat`) and, when a
+CUDA 13.3+ toolkit is installed, builds the tile kernel against it — several toolkits can
+sit side by side and the tile-capable one is found by looking for the header rather than by
+trusting `PATH`. Set `CUDA_TILE_HOME` to override that search.
 
 Only the CUDA-kernel backend needs MSVC and `nvcc`. **The SDPA backend needs neither** — if
 you just want to run the benchmark, skip to [Running](#running) and everything works with
@@ -152,11 +155,16 @@ Expected output:
 
 Rebuilds after the first are near-instant (`ninja: no work to do` when nothing changed),
 and editing anything in `csrc/` makes the next run recompile automatically — there is no
-separate build step to remember, only the `devenv.bat` prefix.
+separate build step to remember. A first build takes roughly 70 s, nearly all of it the
+tensor-core kernel's template instantiations.
 
-`scripts/devenv.bat` locates Visual Studio with `vswhere`, so there is no path to edit if
-yours is installed somewhere unexpected. See [Toolset selection](#toolset-selection) if the
-build fails on the compiler version.
+`scripts/devenv.bat` remains for cases that need `cl.exe` on `PATH` before Python starts.
+It locates Visual Studio with `vswhere`, so there is no path to edit if yours is installed
+somewhere unexpected. See [Toolset selection](#toolset-selection) if the build fails on the
+compiler version.
+
+If the tile kernel fails to build, the loader retries without it rather than losing the
+other two; `kernel_ext.tile_enabled()` reports whether it made it in.
 
 
 ### 3. Verify
@@ -266,18 +274,27 @@ python torch_transformer_benchmark.py --attn-backend sdpa
 
 ### Choosing the kernel inside the custom backend
 
-`ATTENTION_IMPL` (or `--attn-impl` for one run) picks which of the two custom kernels
-handles attention:
+`ATTENTION_IMPL` (or `--attn-impl` for one run) picks which of the custom kernels handles
+attention:
 
 | Value | Behavior |
 | --- | --- |
 | `auto` | Tensor-core kernel where it applies, scalar kernel otherwise. |
 | `scalar` | Force the scalar kernel. No tensor cores, no TF32 rounding. |
 | `wmma` | Force the tensor-core kernel; raises on shapes it does not cover, so a silent fallback cannot be mistaken for a slow kernel. |
+| `tile` | Force the cuTile kernel — the same math written against the CUDA tile programming model instead of per-thread. float32 only, `head_dim` in {8,16,32,64}. Raises rather than falling back. |
 
-The tensor-core kernel covers `head_dim` 16, 32 and 64 in float32, float16 and bfloat16, on
-compute capability 8.0 and up. `head_dim=8` uses the scalar kernel and `head_dim=128` falls
-through to ATen, in both cases without any action from the caller.
+The tensor-core kernel covers `head_dim` 8, 16, 32, 64 and 128 in float32, float16 and
+bfloat16, on compute capability 8.0 and up — every head_dim the harness can produce, since
+`d_model` is divisible by `num_heads`. Nothing falls through to ATen any more.
+
+`tile` is never chosen by `auto`: it is a separate programming model whose performance you
+should opt into deliberately. It needs a build that found CUDA 13.3+ (see
+[Building the CUDA extension](#2-build-the-cuda-extension-optional)); without one,
+`--attn-impl tile` raises instead of silently running something else. On an RTX 3070 it is
+the most accurate of the three (plain fp32 throughout, ~1e-6 against an exact reference,
+versus ~1e-3 for the TF32 tensor-core path) and roughly 1.3-2.5x slower than `wmma` — see
+[Notes and known limits](#notes-and-known-limits) for why.
 
 ### Helper scripts
 
@@ -392,6 +409,8 @@ about 1 GB *per layer*.
 ```
 torch_transformer_benchmark.py   harness + baseline + the optimized implementation
 csrc/fused_attention.cu          custom fused attention CUDA kernels (tensor-core + scalar)
+csrc/tile_attention.cu           the same attention on the CUDA tile programming model
+csrc/tile_attention.h            plain-pointer boundary between the two translation units
 kernel_ext.py                    JIT loader; returns None instead of raising if unavailable
 scripts/devenv.bat               runs a command with MSVC on PATH
 scripts/build_ext.bat            one-shot build + load check
@@ -419,12 +438,38 @@ push `max_abs` from 9.9e-4 to 1.12e-3.
 implementation*. No restructured attention can pass at those dtypes; the limit is the
 harness's tolerance versus the baseline's own noise, not the kernel.
 
-**`head_dim=128` falls back to ATen.** Neither custom kernel covers it. The scalar kernel
-would need 128 accumulators plus 128 query values per thread, which does not fit without
-spilling; the tensor-core kernel would need a `64×132` fp32 output tile plus two `32×132`
-K/V tiles in shared memory, which is over the 48 KB that keeps two blocks resident per SM.
-Covering it means a different tiling — splitting `head_dim` across warps rather than giving
-each warp the full width — not a parameter change.
+**The tile kernel is accuracy-first, not speed-first, on Ampere.** `csrc/tile_attention.cu`
+is the same FlashAttention math expressed per *block* rather than per *thread*: tiles are
+fixed-size arrays the whole block owns, `ct::matmul` is a matrix multiply of two of them,
+and register allocation, the load schedule, bank-conflict avoidance and intra-block
+synchronisation are the compiler's job. There is no `threadIdx` in the file. Two things cap
+its speed on an RTX 3070, and neither is the model's fault:
+
+- CUDA 13.3 forward-declares `__nv_tf32` but does not define it, so a tf32 tile cannot be
+  instantiated and `ct::matmul` on float tiles runs on fp32 CUDA cores rather than the TF32
+  tensor cores `wmma` reaches. That is most of the gap — and also why the tile kernel is the
+  *most* accurate of the three, at ~1e-6 versus ~1e-3.
+- The TMA hardware the tile model is designed around is Blackwell-only; on Ampere the
+  loads fall back to software-managed async copies.
+
+Block shape matters far more here than in the hand-written kernels, and not smoothly: the
+kernel keeps Q, O, K, V and the score tile live at once, and past a footprint threshold the
+compiler spills and the cost jumps an order of magnitude. At `head_dim=64`, `BLOCK_N=16`
+runs at 1.5 ms where `BLOCK_N=32` runs at 10.9 ms. The per-`head_dim` shapes in `BlockCfg`
+were measured on SM 8.6 and are worth re-measuring on another architecture.
+
+**The tensor-core kernel now covers every head_dim, and both former gaps were block-shape
+problems rather than design ones.** `head_dim=8` is narrower than the 16-wide wmma
+fragment, so GEMM2's N dimension could not be filled; the kernel widens it to 16 with zeros
+in shared memory, which costs no extra global traffic because GEMM1 contracts over head_dim
+(zeros add nothing) and the padded output columns are simply not stored. `head_dim=128` at
+the default `64×32` block wanted 75.8 KB of shared memory, over the 48 KB that keeps two
+blocks resident per SM — but a `32×16` block brings it to 35.9 KB, so `WmmaShape` picks the
+block per head_dim instead. Both changes bought speed, not just coverage: at `head_dim=128`
+wmma runs 0.041 ms where the old scalar fallback took 0.142 ms.
+
+The scalar kernel still exists for pre-Ampere cards and for A/B measurement; ATen is no
+longer reached for any head_dim the harness produces.
 
 **Tensor cores did not cost precision the way the old note here predicted.** The worry was
 that TF32 fragments would push the kernel away from the baseline. On the attention op the
