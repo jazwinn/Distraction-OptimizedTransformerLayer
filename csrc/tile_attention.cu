@@ -100,6 +100,8 @@ template <int BLOCK_M, int BLOCK_N, int HEAD_DIM, MaskMode MODE, MathMode MATH,
 __tile_global__ void tile_attention_kernel(const float* __restrict__ q,
                                            const float* __restrict__ k,
                                            const float* __restrict__ v,
+                                           long long qs0, long long qs1,
+                                           long long qs2,
                                            const bool* __restrict__ mask,
                                            long long ms0, long long ms1,
                                            long long ms2, long long ms3,
@@ -147,9 +149,12 @@ __tile_global__ void tile_attention_kernel(const float* __restrict__ q,
     }
     const int m_tile = (MODE == MaskMode::Causal) ? (n_m - 1 - lane) : lane;
 
-    // [B,H,S,head_dim] is contiguous, so one (b,h) slice is a flat [S,head_dim]
-    // matrix and the views below need no stride gymnastics.
-    const long long bh_off = static_cast<long long>(b * H + h) * S * HEAD_DIM;
+    // q/k/v are addressed through the caller's strides; `out` is always a
+    // freshly allocated packed [B,H,S,head_dim], so it keeps the flat formula.
+    // The two coincide only when the caller handed us contiguous inputs.
+    const long long qkv_off =
+        static_cast<long long>(b) * qs0 + static_cast<long long>(h) * qs1;
+    const long long out_off = static_cast<long long>(b * H + h) * S * HEAD_DIM;
 
     // ct::extents deduces a static extent from a ct::integral_constant and a
     // dynamic one from a plain int, so passing HEAD_DIM as an int put the row
@@ -157,18 +162,31 @@ __tile_global__ void tile_attention_kernel(const float* __restrict__ q,
     // way -- the tile compiler was already recovering it), kept because it is
     // the honest description of the tensor and costs nothing.
     constexpr ct::integral_constant<HEAD_DIM> HD{};
-    auto q_view = ct::partition_view{ct::tensor_span{q + bh_off, ct::extents{S, HD}},
-                                     ct::shape<BLOCK_M, HEAD_DIM>{}};
+    // The row pitch is qs2 rather than HEAD_DIM. layout_right_padded is exactly
+    // "row-major, last axis contiguous, rows spaced by an arbitrary stride",
+    // which is the layout MySelfAttention's fused QKV projection produces -- so
+    // the kernel reads those views directly instead of being handed clones.
+    // A contiguous caller passes qs2 == HEAD_DIM and gets the old mapping back.
+    const int pitch = static_cast<int>(qs2);
+    auto q_view = ct::partition_view{
+        ct::tensor_span{q + qkv_off,
+                        ct::layout_right_padded_mapping{ct::extents{S, HD}, pitch}},
+        ct::shape<BLOCK_M, HEAD_DIM>{}};
     // K is read only as K^T. Rather than load a [BLOCK_N, HEAD_DIM] tile and
     // ct::transpose it -- a real shuffle through shared memory, once per key
     // tile -- describe the same bytes as a column-major [HEAD_DIM, S] matrix:
     // layout_left makes element (d, j) be k[j * HEAD_DIM + d], exactly K^T for
     // free. The tile-level equivalent of wmma's col_major matrix_b fragment.
-    auto kt_view = ct::partition_view{ct::tensor_span{k + bh_off, ct::extents{HD, S},
-                                                      ct::layout_left{}},
-                                      ct::shape<HEAD_DIM, BLOCK_N>{}};
-    auto v_view = ct::partition_view{ct::tensor_span{v + bh_off, ct::extents{S, HD}},
-                                     ct::shape<BLOCK_N, HEAD_DIM>{}};
+    // layout_left_padded pads the *first* extent, so element (d, j) lands at
+    // k[j * pitch + d] -- still K^T for free, now with the strided pitch.
+    auto kt_view = ct::partition_view{
+        ct::tensor_span{k + qkv_off,
+                        ct::layout_left_padded_mapping{ct::extents{HD, S}, pitch}},
+        ct::shape<HEAD_DIM, BLOCK_N>{}};
+    auto v_view = ct::partition_view{
+        ct::tensor_span{v + qkv_off,
+                        ct::layout_right_padded_mapping{ct::extents{S, HD}, pitch}},
+        ct::shape<BLOCK_N, HEAD_DIM>{}};
     // The output view is built in the epilogue instead of here: under SPLIT this
     // block writes partials rather than `out`, and `out` is null on that path.
 
@@ -296,7 +314,7 @@ __tile_global__ void tile_attention_kernel(const float* __restrict__ q,
         pl_view.store_masked(l_run, m_tile, 0);
     } else {
         auto o_view = ct::partition_view{
-            ct::tensor_span{out + bh_off, ct::extents{S, HD}},
+            ct::tensor_span{out + out_off, ct::extents{S, HD}},
             ct::shape<BLOCK_M, HEAD_DIM>{}};
         auto inv = ct::select(m_run > NEG_THRESH,
                               ct::full<RowTile>(1.0f) / l_run,
@@ -442,20 +460,105 @@ __global__ void split_combine_kernel(const float* __restrict__ part_o,
 #define TF32_SN_64 32
 #endif
 
+// fp32 and bf16, dense. Overridable on the same terms as TF32_M_*: these were
+// measured, but by an earlier pass that scored one shape across both mask
+// modes. The causal macros below default to the dense value, so leaving them
+// alone reproduces exactly what was measured.
+#ifndef FP32_M_8
+#define FP32_M_8  64
+#define FP32_N_8  64
+#endif
+#ifndef FP32_M_16
+#define FP32_M_16 32
+#define FP32_N_16 16
+#endif
+#ifndef FP32_M_32
+#define FP32_M_32 64
+#define FP32_N_32 16
+#endif
+#ifndef FP32_M_64
+#define FP32_M_64 32
+#define FP32_N_64 16
+#endif
+
+#ifndef BF16_M_8
+#define BF16_M_8  64
+#define BF16_N_8  64
+#endif
+#ifndef BF16_M_16
+#define BF16_M_16 64
+#define BF16_N_16 64
+#endif
+#ifndef BF16_M_32
+#define BF16_M_32 64
+#define BF16_N_32 64
+#endif
+#ifndef BF16_M_64
+#define BF16_M_64 64
+#define BF16_N_64 64
+#endif
+
+// fp32 and bf16, causal. Defaulting to the dense shape keeps today's behaviour;
+// the causal grid is triangular (see the TF32_CM_* note) and tf32 lost 12-25%
+// at head_dim 64 to sharing one shape across both modes, so these exist to let
+// the same question be asked of the other two math modes.
+#ifndef FP32_CM_8
+#define FP32_CM_8  FP32_M_8
+#define FP32_CN_8  FP32_N_8
+#endif
+#ifndef FP32_CM_16
+#define FP32_CM_16 FP32_M_16
+#define FP32_CN_16 FP32_N_16
+#endif
+#ifndef FP32_CM_32
+#define FP32_CM_32 FP32_M_32
+#define FP32_CN_32 FP32_N_32
+#endif
+#ifndef FP32_CM_64
+#define FP32_CM_64 FP32_M_64
+#define FP32_CN_64 FP32_N_64
+#endif
+
+#ifndef BF16_CM_8
+#define BF16_CM_8  BF16_M_8
+#define BF16_CN_8  BF16_N_8
+#endif
+#ifndef BF16_CM_16
+#define BF16_CM_16 BF16_M_16
+#define BF16_CN_16 BF16_N_16
+#endif
+#ifndef BF16_CM_32
+#define BF16_CM_32 BF16_M_32
+#define BF16_CN_32 BF16_N_32
+#endif
+#ifndef BF16_CM_64
+#define BF16_CM_64 BF16_M_64
+#define BF16_CN_64 BF16_N_64
+#endif
+
 // CAUSAL is a separate axis because the causal grid is triangular; see the
-// TF32_CM_* note. Only tf32 was swept both ways -- fp32 and bf16 use one shape
-// for both, which is what they were measured at.
+// TF32_CM_* note. Splitting fp32 and bf16 on it costs no extra instantiation --
+// MaskMode is already a parameter of the kernel template, so dense and causal
+// were always separate kernels; only the shape they read was shared.
 template <int HEAD_DIM, MathMode MODE, bool CAUSAL = false> struct BlockCfg;
 
-template <bool C> struct BlockCfg<8,  MathMode::Fp32, C> { static constexpr int M = 64; static constexpr int N = 64; };
-template <bool C> struct BlockCfg<16, MathMode::Fp32, C> { static constexpr int M = 32; static constexpr int N = 16; };
-template <bool C> struct BlockCfg<32, MathMode::Fp32, C> { static constexpr int M = 64; static constexpr int N = 16; };
-template <bool C> struct BlockCfg<64, MathMode::Fp32, C> { static constexpr int M = 32; static constexpr int N = 16; };
+template <> struct BlockCfg<8,  MathMode::Fp32, false> { static constexpr int M = FP32_M_8;   static constexpr int N = FP32_N_8;   };
+template <> struct BlockCfg<8,  MathMode::Fp32, true>  { static constexpr int M = FP32_CM_8;  static constexpr int N = FP32_CN_8;  };
+template <> struct BlockCfg<16, MathMode::Fp32, false> { static constexpr int M = FP32_M_16;  static constexpr int N = FP32_N_16;  };
+template <> struct BlockCfg<16, MathMode::Fp32, true>  { static constexpr int M = FP32_CM_16; static constexpr int N = FP32_CN_16; };
+template <> struct BlockCfg<32, MathMode::Fp32, false> { static constexpr int M = FP32_M_32;  static constexpr int N = FP32_N_32;  };
+template <> struct BlockCfg<32, MathMode::Fp32, true>  { static constexpr int M = FP32_CM_32; static constexpr int N = FP32_CN_32; };
+template <> struct BlockCfg<64, MathMode::Fp32, false> { static constexpr int M = FP32_M_64;  static constexpr int N = FP32_N_64;  };
+template <> struct BlockCfg<64, MathMode::Fp32, true>  { static constexpr int M = FP32_CM_64; static constexpr int N = FP32_CN_64; };
 
-template <bool C> struct BlockCfg<8,  MathMode::Bf16, C> { static constexpr int M = 64; static constexpr int N = 64; };
-template <bool C> struct BlockCfg<16, MathMode::Bf16, C> { static constexpr int M = 64; static constexpr int N = 64; };
-template <bool C> struct BlockCfg<32, MathMode::Bf16, C> { static constexpr int M = 64; static constexpr int N = 64; };
-template <bool C> struct BlockCfg<64, MathMode::Bf16, C> { static constexpr int M = 64; static constexpr int N = 64; };
+template <> struct BlockCfg<8,  MathMode::Bf16, false> { static constexpr int M = BF16_M_8;   static constexpr int N = BF16_N_8;   };
+template <> struct BlockCfg<8,  MathMode::Bf16, true>  { static constexpr int M = BF16_CM_8;  static constexpr int N = BF16_CN_8;  };
+template <> struct BlockCfg<16, MathMode::Bf16, false> { static constexpr int M = BF16_M_16;  static constexpr int N = BF16_N_16;  };
+template <> struct BlockCfg<16, MathMode::Bf16, true>  { static constexpr int M = BF16_CM_16; static constexpr int N = BF16_CN_16; };
+template <> struct BlockCfg<32, MathMode::Bf16, false> { static constexpr int M = BF16_M_32;  static constexpr int N = BF16_N_32;  };
+template <> struct BlockCfg<32, MathMode::Bf16, true>  { static constexpr int M = BF16_CM_32; static constexpr int N = BF16_CN_32; };
+template <> struct BlockCfg<64, MathMode::Bf16, false> { static constexpr int M = BF16_M_64;  static constexpr int N = BF16_N_64;  };
+template <> struct BlockCfg<64, MathMode::Bf16, true>  { static constexpr int M = BF16_CM_64; static constexpr int N = BF16_CN_64; };
 
 #ifdef TILE_HAVE_TF32
 // tf32 is the one mode where the two pressures pull apart: it occupies fp32's
@@ -632,7 +735,7 @@ int splits_for_head_dim(int B, int H, int S, int head_dim, bool is_causal) {
 // only place that talks to the kernels.
 template <int BLOCK_M, int BLOCK_N, int HEAD_DIM, MaskMode MODE, MathMode MATH>
 void launch_one(const float* q, const float* k, const float* v,
-                const bool* mask, const long long* ms,
+                const bool* mask, const long long* ms, const long long* qs,
                 float* out, void* ws, int splits,
                 int B, int H, int S, float scale, cudaStream_t stream) {
     const int n_m = (S + BLOCK_M - 1) / BLOCK_M;
@@ -648,7 +751,7 @@ void launch_one(const float* q, const float* k, const float* v,
     if (splits < 2) {
         tile_attention_kernel<BLOCK_M, BLOCK_N, HEAD_DIM, MODE, MATH, false>
             <<<dim3(n_m, H, B), block, 0, stream>>>(
-                q, k, v, mask, s0, s1, s2, s3,
+                q, k, v, qs[0], qs[1], qs[2], mask, s0, s1, s2, s3,
                 out, nullptr, nullptr, nullptr, B, H, S, scale, 1);
         return;
     }
@@ -665,7 +768,7 @@ void launch_one(const float* q, const float* k, const float* v,
 
     tile_attention_kernel<BLOCK_M, BLOCK_N, HEAD_DIM, MODE, MATH, true>
         <<<dim3(n_m * splits, H, B), block, 0, stream>>>(
-            q, k, v, mask, s0, s1, s2, s3,
+            q, k, v, qs[0], qs[1], qs[2], mask, s0, s1, s2, s3,
             nullptr, part_o, part_m, part_l, B, H, S, scale, splits);
 
     // 256 threads, laid out head_dim-major so a warp never straddles two
@@ -682,21 +785,21 @@ void launch_one(const float* q, const float* k, const float* v,
 // shape is a run-time choice, so this pair is needed twice.
 template <int BLOCK_M, int BLOCK_N, int HEAD_DIM, MathMode MATH>
 void launch_dense(const float* q, const float* k, const float* v,
-                  const bool* mask, const long long* ms,
+                  const bool* mask, const long long* ms, const long long* qs,
                   float* out, void* ws, int splits,
                   int B, int H, int S, float scale, cudaStream_t stream) {
     if (mask != nullptr) {
         launch_one<BLOCK_M, BLOCK_N, HEAD_DIM, MaskMode::Explicit, MATH>(
-            q, k, v, mask, ms, out, ws, splits, B, H, S, scale, stream);
+            q, k, v, mask, ms, qs, out, ws, splits, B, H, S, scale, stream);
     } else {
         launch_one<BLOCK_M, BLOCK_N, HEAD_DIM, MaskMode::None, MATH>(
-            q, k, v, nullptr, ms, out, ws, splits, B, H, S, scale, stream);
+            q, k, v, nullptr, ms, qs, out, ws, splits, B, H, S, scale, stream);
     }
 }
 
 template <int HEAD_DIM, MathMode MATH>
 void launch_for_head_dim(const float* q, const float* k, const float* v,
-                         const bool* mask, const long long* ms,
+                         const bool* mask, const long long* ms, const long long* qs,
                          float* out, void* ws, int splits,
                          int B, int H, int S,
                          bool is_causal, float scale, cudaStream_t stream) {
@@ -707,7 +810,7 @@ void launch_for_head_dim(const float* q, const float* k, const float* v,
         // own causal range and so stays balanced across splits.
         using Cfg = BlockCfg<HEAD_DIM, MATH, true>;
         launch_one<Cfg::M, Cfg::N, HEAD_DIM, MaskMode::Causal, MATH>(
-            q, k, v, nullptr, ms, out, ws, splits, B, H, S, scale, stream);
+            q, k, v, nullptr, ms, qs, out, ws, splits, B, H, S, scale, stream);
         return;
     }
 
@@ -723,7 +826,7 @@ void launch_for_head_dim(const float* q, const float* k, const float* v,
     // where there is too little key work to split.
     if (splits >= 2) {
         launch_dense<Long::M, Long::N, HEAD_DIM, MATH>(
-            q, k, v, mask, ms, out, ws, splits, B, H, S, scale, stream);
+            q, k, v, mask, ms, qs, out, ws, splits, B, H, S, scale, stream);
         return;
     }
 
@@ -735,12 +838,12 @@ void launch_for_head_dim(const float* q, const float* k, const float* v,
             static_cast<long long>((S + Long::M - 1) / Long::M) * H * B;
         if (blocks < 2LL * sm_count()) {
             launch_dense<Short::M, Short::N, HEAD_DIM, MATH>(
-                q, k, v, mask, ms, out, nullptr, 1, B, H, S, scale, stream);
+                q, k, v, mask, ms, qs, out, nullptr, 1, B, H, S, scale, stream);
             return;
         }
     }
     launch_dense<Long::M, Long::N, HEAD_DIM, MATH>(
-        q, k, v, mask, ms, out, nullptr, 1, B, H, S, scale, stream);
+        q, k, v, mask, ms, qs, out, nullptr, 1, B, H, S, scale, stream);
 }
 
 }  // namespace
@@ -764,7 +867,7 @@ namespace {
 // instantiations: every (head_dim, mode) pair reaching here is its own kernel.
 template <MathMode MATH>
 bool launch_mode(const float* q, const float* k, const float* v,
-                 const bool* mask, const long long* ms,
+                 const bool* mask, const long long* ms, const long long* qs,
                  float* out, void* ws, size_t ws_bytes,
                  int B, int H, int S, int head_dim,
                  bool is_causal, float scale, cudaStream_t stream) {
@@ -781,16 +884,16 @@ bool launch_mode(const float* q, const float* k, const float* v,
                 : 1;
         switch (head_dim) {
             case 8:
-                launch_for_head_dim<8, MATH>(q, k, v, mask, ms, out, ws, splits, B, H, S, is_causal, scale, stream);
+                launch_for_head_dim<8, MATH>(q, k, v, mask, ms, qs, out, ws, splits, B, H, S, is_causal, scale, stream);
                 return true;
             case 16:
-                launch_for_head_dim<16, MATH>(q, k, v, mask, ms, out, ws, splits, B, H, S, is_causal, scale, stream);
+                launch_for_head_dim<16, MATH>(q, k, v, mask, ms, qs, out, ws, splits, B, H, S, is_causal, scale, stream);
                 return true;
             case 32:
-                launch_for_head_dim<32, MATH>(q, k, v, mask, ms, out, ws, splits, B, H, S, is_causal, scale, stream);
+                launch_for_head_dim<32, MATH>(q, k, v, mask, ms, qs, out, ws, splits, B, H, S, is_causal, scale, stream);
                 return true;
             case 64:
-                launch_for_head_dim<64, MATH>(q, k, v, mask, ms, out, ws, splits, B, H, S, is_causal, scale, stream);
+                launch_for_head_dim<64, MATH>(q, k, v, mask, ms, qs, out, ws, splits, B, H, S, is_causal, scale, stream);
                 return true;
             default:
                 return false;
@@ -822,19 +925,19 @@ size_t workspace_bytes(int B, int H, int S, int head_dim,
 }
 
 bool launch(const float* q, const float* k, const float* v,
-            const bool* mask, const long long* ms,
+            const bool* mask, const long long* ms, const long long* qs,
             float* out, void* ws, size_t ws_bytes,
             int B, int H, int S, int head_dim,
             bool is_causal, float scale, MathMode mode, cudaStream_t stream) {
     switch (mode) {
         case MathMode::Fp32:
-            return launch_mode<MathMode::Fp32>(q, k, v, mask, ms, out, ws, ws_bytes,
+            return launch_mode<MathMode::Fp32>(q, k, v, mask, ms, qs, out, ws, ws_bytes,
                                                B, H, S, head_dim, is_causal, scale, stream);
         case MathMode::Bf16:
-            return launch_mode<MathMode::Bf16>(q, k, v, mask, ms, out, ws, ws_bytes,
+            return launch_mode<MathMode::Bf16>(q, k, v, mask, ms, qs, out, ws, ws_bytes,
                                                B, H, S, head_dim, is_causal, scale, stream);
         case MathMode::Tf32:
-            return launch_mode<MathMode::Tf32>(q, k, v, mask, ms, out, ws, ws_bytes,
+            return launch_mode<MathMode::Tf32>(q, k, v, mask, ms, qs, out, ws, ws_bytes,
                                                B, H, S, head_dim, is_causal, scale, stream);
     }
     return false;

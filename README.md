@@ -411,6 +411,7 @@ scripts/verify_graph.py                   correctness: graph replay is bit-ident
 scripts/bench_attention.py                timings: the attention op alone
 scripts/compare_backends.py               timings: the full harness, once per backend
 scripts/ab_split_kv.py                    timings: split-KV against single-pass, interleaved
+scripts/ab_layout.py                      timings: strided q/k/v against contiguous, interleaved
 scripts/ab_graph.py                       timings: replay against eager, interleaved;
                                           --recommend tunes _GRAPH_MAX_ACTIVATION
 scripts/tune_tile_tf32.py                 block-shape sweep for the tile kernel

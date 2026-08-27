@@ -83,6 +83,28 @@ def build_case(b, h, s, d, causal, padded, device, dtype, seed=0):
     return q, k, v, attn_mask, is_causal
 
 
+def as_packed_views(q, k, v):
+    """Rebuild q/k/v the way MySelfAttention produces them.
+
+    The fused QKV projection emits one [B, S, 3*d_model] tensor and splits it
+    with a view and a permute, so the three results are non-contiguous views
+    over shared storage: head_dim is still stride-1, but consecutive rows sit
+    3*d_model apart instead of head_dim apart.
+
+    Same values in the same order, at different addresses -- so a kernel that
+    reads its strides honestly must return exactly the bits it returned for the
+    contiguous inputs, not merely something within tolerance.
+    """
+    b, h, s, d = q.shape
+    packed = torch.empty(b, s, 3, h, d, device=q.device, dtype=q.dtype)
+    for i, t in enumerate((q, k, v)):
+        packed[:, :, i] = t.permute(0, 2, 1, 3)
+    views = packed.permute(2, 0, 3, 1, 4).unbind(0)
+    for t in views:
+        assert not t.is_contiguous() and t.stride(3) == 1, t.stride()
+    return views
+
+
 def timed(fn, iters=30):
     for _ in range(8):
         fn()
@@ -140,10 +162,10 @@ def main() -> int:
 
     device = torch.device("cuda")
     dtype = torch.float32
-    row = "{:<18} {:>8} {:>11} {:>11} {:>9} {:>9} {:>8}"
+    row = "{:<18} {:>8} {:>11} {:>11} {:>9} {:>9} {:>8} {:>8}"
     print(row.format("case", "impl", "vs_ref", "vs_sdpa",
-                     "custom_ms", "sdpa_ms", "speedup"))
-    print("-" * 80)
+                     "custom_ms", "sdpa_ms", "speedup", "packed"))
+    print("-" * 89)
 
     failures = []
     for label, b, h, s, d, causal, padded in CASES:
@@ -151,6 +173,7 @@ def main() -> int:
             b, h, s, d, causal, padded, device, dtype
         )
         scale = d ** -0.5
+        qp, kp, vp = as_packed_views(q, k, v)
 
         with torch.inference_mode():
             ref = reference_attention(q, k, v, attn_mask, is_causal, scale)
@@ -170,18 +193,29 @@ def main() -> int:
                         # No tensor-core / tile specialization for this
                         # head_dim (or no tile support in this build). The
                         # scalar row above already covered the case.
-                        print(row.format(label, name, "n/a", "-", "-", "-", "-"))
+                        print(row.format(label, name, "n/a", "-", "-", "-", "-", "-"))
                         continue
                     print(row.format(label, name, "RAISED", str(exc)[:11],
-                                     "-", "-", "-"))
+                                     "-", "-", "-", "-"))
                     failures.append(f"{label}/{name}")
                     continue
 
                 if custom.shape != ref.shape:
                     print(row.format(label, name, f"SHAPE{tuple(custom.shape)}",
-                                     "-", "-", "-", "-"))
+                                     "-", "-", "-", "-", "-"))
                     failures.append(f"{label}/{name}")
                     continue
+
+                # The same call on the layout the model actually produces.
+                packed = kernels.fused_attention_forward(
+                    qp, kp, vp, attn_mask, is_causal, scale, impl
+                )
+                if torch.equal(packed, custom):
+                    packed_cell = "exact"
+                else:
+                    delta = (packed.float() - custom.float()).abs().max().item()
+                    packed_cell = f"{delta:.1e}!"
+                    failures.append(f"{label}/{name} packed")
 
                 d_ref = (custom.float() - ref.float()).abs().max().item()
                 d_sdpa = (custom.float() - sdpa.float()).abs().max().item()
@@ -199,9 +233,10 @@ def main() -> int:
                     f"{t_custom:.3f}",
                     f"{t_sdpa:.3f}",
                     f"{t_sdpa / t_custom:.2f}x",
+                    packed_cell,
                 ))
 
-    print("-" * 80)
+    print("-" * 89)
     if failures:
         print(f"FAILED: {', '.join(failures)}")
         return 1

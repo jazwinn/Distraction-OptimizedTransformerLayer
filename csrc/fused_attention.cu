@@ -78,6 +78,7 @@ template <typename scalar_t, int HEAD_DIM>
 __global__ void fused_attention_kernel(const scalar_t* __restrict__ q,
                                        const scalar_t* __restrict__ k,
                                        const scalar_t* __restrict__ v,
+                                       int64_t qs0, int64_t qs1, int64_t qs2,
                                        const bool* __restrict__ mask,
                                        int64_t ms0, int64_t ms1,
                                        int64_t ms2, int64_t ms3,
@@ -100,12 +101,13 @@ __global__ void fused_attention_kernel(const scalar_t* __restrict__ q,
     const int i = m_tile * BLOCK_M + tid;
     const bool active = (i < S);
 
-    const int64_t bh_off = static_cast<int64_t>(b * H + h) * S * HEAD_DIM;
+    const int64_t bh_off =
+        static_cast<int64_t>(b) * qs0 + static_cast<int64_t>(h) * qs1;
 
     // q is read once and reused against every key, so it earns registers.
     float q_reg[HEAD_DIM];
     if (active) {
-        const scalar_t* q_row = q + bh_off + static_cast<int64_t>(i) * HEAD_DIM;
+        const scalar_t* q_row = q + bh_off + static_cast<int64_t>(i) * qs2;
         #pragma unroll
         for (int d = 0; d < HEAD_DIM; ++d) {
             q_reg[d] = static_cast<float>(q_row[d]);
@@ -133,13 +135,24 @@ __global__ void fused_attention_kernel(const scalar_t* __restrict__ q,
     for (int kt = 0; kt < key_limit; kt += BLOCK_N) {
         const int n_keys = min(BLOCK_N, S - kt);
 
-        // Contiguous copy: [B,H,S,head_dim] means a run of keys is one flat
-        // span, so this stays coalesced without any index gymnastics.
-        const scalar_t* k_base = k + bh_off + static_cast<int64_t>(kt) * HEAD_DIM;
-        const scalar_t* v_base = v + bh_off + static_cast<int64_t>(kt) * HEAD_DIM;
-        for (int idx = tid; idx < n_keys * HEAD_DIM; idx += BLOCK_M) {
-            k_s[idx] = k_base[idx];
-            v_s[idx] = v_base[idx];
+        // head_dim is stride-1 in every layout the caller can pass, so one key
+        // row is still a flat span and the loads stay coalesced; only the
+        // spacing between rows is a runtime value. Shared memory stays packed,
+        // hence the flat destination index.
+        //
+        // Rows are the outer loop so the 64-bit row offset is computed once per
+        // row rather than once per element. Flattening the two into a single
+        // strided loop costs a divide, a modulo and a 64-bit multiply per
+        // element, which at head_dim 128 -- where q_reg and acc alone are 256
+        // registers and the kernel is already spilling -- measured 1.5x slower.
+        const scalar_t* k_base = k + bh_off + static_cast<int64_t>(kt) * qs2;
+        const scalar_t* v_base = v + bh_off + static_cast<int64_t>(kt) * qs2;
+        for (int r = 0; r < n_keys; ++r) {
+            const int64_t g = static_cast<int64_t>(r) * qs2;
+            for (int c = tid; c < HEAD_DIM; c += BLOCK_M) {
+                k_s[r * HEAD_DIM + c] = k_base[g + c];
+                v_s[r * HEAD_DIM + c] = v_base[g + c];
+            }
         }
         __syncthreads();
 
@@ -201,7 +214,7 @@ __global__ void fused_attention_kernel(const scalar_t* __restrict__ q,
 template <typename scalar_t, int HEAD_DIM>
 void launch_kernel(const torch::Tensor& q, const torch::Tensor& k,
                    const torch::Tensor& v, const bool* mask_ptr,
-                   const int64_t* ms, torch::Tensor& out,
+                   const int64_t* ms, const int64_t* qs, torch::Tensor& out,
                    int B, int H, int S, bool is_causal, double scale) {
     constexpr int BLOCK_M = 64;
     constexpr int BLOCK_N = (HEAD_DIM >= 64) ? 64 : 128;
@@ -218,6 +231,7 @@ void launch_kernel(const torch::Tensor& q, const torch::Tensor& k,
     fused_attention_kernel<scalar_t, HEAD_DIM>
         <<<grid, block, smem, at::cuda::getCurrentCUDAStream()>>>(
             q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
+            qs[0], qs[1], qs[2],
             mask_ptr, ms[0], ms[1], ms[2], ms[3],
             out.data_ptr<scalar_t>(), B, H, S, is_causal,
             static_cast<float>(scale), out_bshd);
@@ -227,21 +241,21 @@ void launch_kernel(const torch::Tensor& q, const torch::Tensor& k,
 template <typename scalar_t>
 bool dispatch_head_dim(const torch::Tensor& q, const torch::Tensor& k,
                        const torch::Tensor& v, const bool* mask_ptr,
-                       const int64_t* ms, torch::Tensor& out,
+                       const int64_t* ms, const int64_t* qs, torch::Tensor& out,
                        int B, int H, int S, int head_dim,
                        bool is_causal, double scale) {
     switch (head_dim) {
         case 8:
-            launch_kernel<scalar_t, 8>(q, k, v, mask_ptr, ms, out, B, H, S, is_causal, scale);
+            launch_kernel<scalar_t, 8>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
             return true;
         case 16:
-            launch_kernel<scalar_t, 16>(q, k, v, mask_ptr, ms, out, B, H, S, is_causal, scale);
+            launch_kernel<scalar_t, 16>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
             return true;
         case 32:
-            launch_kernel<scalar_t, 32>(q, k, v, mask_ptr, ms, out, B, H, S, is_causal, scale);
+            launch_kernel<scalar_t, 32>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
             return true;
         case 64:
-            launch_kernel<scalar_t, 64>(q, k, v, mask_ptr, ms, out, B, H, S, is_causal, scale);
+            launch_kernel<scalar_t, 64>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
             return true;
         default:
             return false;
@@ -325,14 +339,49 @@ __device__ __forceinline__ void dev_from_float(__nv_bfloat16& d, float s) { d = 
 // 48 KB that keeps two blocks resident per SM. 32x16 brings the same head_dim
 // down to 35.9 KB, which fits with room to spare -- so head_dim 128 is a block
 // shape away from working, not a retiling.
+//
+// Overridable from the build line so scripts/tune_block_shapes.py can search
+// shapes without editing this file, the same way TF32_M_* work in
+// tile_attention.cu. Unlike cuTile's extents these need not be powers of two:
+// BLOCK_M only has to be a multiple of 16 (it *is* the warp count times 16) and
+// BLOCK_N a multiple of FragTraits<scalar_t>::K, so 48/80/96/112 are reachable
+// here and FlashAttention-2's kBlockN=112 is expressible for the 16-bit types.
+//
+// One shape serves all three dtypes: WmmaShape is not parameterised on
+// scalar_t, so a sweep that finds different winners per dtype is evidence for
+// adding that parameter, not something these macros can express.
+#ifndef WMMA_M_8
+#define WMMA_M_8   64
+#define WMMA_N_8   32
+#endif
+#ifndef WMMA_M_16
+#define WMMA_M_16  64
+#define WMMA_N_16  32
+#endif
+#ifndef WMMA_M_32
+#define WMMA_M_32  64
+#define WMMA_N_32  32
+#endif
+#ifndef WMMA_M_64
+#define WMMA_M_64  64
+#define WMMA_N_64  32
+#endif
+#ifndef WMMA_M_128
+#define WMMA_M_128 32
+#define WMMA_N_128 16
+#endif
+
+// The primary template keeps the 64x32 general case for any head_dim the
+// dispatcher does not switch on; the five it does switch on read the macros.
 template <int HEAD_DIM> struct WmmaShape {
     static constexpr int M = 64;
     static constexpr int N = 32;
 };
-template <> struct WmmaShape<128> {
-    static constexpr int M = 32;
-    static constexpr int N = 16;
-};
+template <> struct WmmaShape<8>   { static constexpr int M = WMMA_M_8;   static constexpr int N = WMMA_N_8;   };
+template <> struct WmmaShape<16>  { static constexpr int M = WMMA_M_16;  static constexpr int N = WMMA_N_16;  };
+template <> struct WmmaShape<32>  { static constexpr int M = WMMA_M_32;  static constexpr int N = WMMA_N_32;  };
+template <> struct WmmaShape<64>  { static constexpr int M = WMMA_M_64;  static constexpr int N = WMMA_N_64;  };
+template <> struct WmmaShape<128> { static constexpr int M = WMMA_M_128; static constexpr int N = WMMA_N_128; };
 
 template <typename scalar_t, int HEAD_DIM>
 struct WmmaCfg {
@@ -399,6 +448,7 @@ __global__ __launch_bounds__(WmmaCfg<scalar_t, HEAD_DIM>::NTHREADS)
 void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
                                  const scalar_t* __restrict__ k,
                                  const scalar_t* __restrict__ v,
+                                 int64_t qs0, int64_t qs1, int64_t qs2,
                                  const bool* __restrict__ mask,
                                  int64_t ms0, int64_t ms1,
                                  int64_t ms2, int64_t ms3,
@@ -452,7 +502,8 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
     const int h      = blockIdx.y;
     const int b      = blockIdx.z;
 
-    const int64_t bh_off = static_cast<int64_t>(b * H + h) * S * HEAD_DIM;
+    const int64_t bh_off =
+        static_cast<int64_t>(b) * qs0 + static_cast<int64_t>(h) * qs1;
     const int row_base = warp * RPW;                  // this warp stripe in the block
     const int q_base   = m_tile * BLOCK_M + row_base; // ... and in the sequence
 
@@ -470,7 +521,9 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
             const int c = idx - r * PDIM;
             const int gr = m_tile * BLOCK_M + r;
             q_s[r * KV_LD + c] =
-                (gr < S && c < DIM) ? q[bh_off + static_cast<int64_t>(gr) * DIM + c] : zero_v;
+                (gr < S && c < DIM)
+                    ? q[bh_off + static_cast<int64_t>(gr) * qs2 + c]
+                    : zero_v;
         }
         __syncthreads();
     }
@@ -554,16 +607,17 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
     for (int kt = 0; kt < key_limit; kt += BLOCK_N) {
         __syncthreads();  // everyone is done reading the previous k_s/v_s
 
-        // [B,H,S,head_dim] means a run of keys is one flat span, so the global
-        // reads stay coalesced. Rows past S are zeroed: they are masked out of
+        // head_dim is stride-1 whatever the caller's layout, so a key row is
+        // one flat span and the global reads stay coalesced; qs2 is only the
+        // spacing between rows. Rows past S are zeroed: they are masked out of
         // the scores anyway, but a NaN in v_s would survive `0 * v` in GEMM2.
-        const scalar_t* k_base = k + bh_off + static_cast<int64_t>(kt) * DIM;
-        const scalar_t* v_base = v + bh_off + static_cast<int64_t>(kt) * DIM;
+        const scalar_t* k_base = k + bh_off + static_cast<int64_t>(kt) * qs2;
+        const scalar_t* v_base = v + bh_off + static_cast<int64_t>(kt) * qs2;
         for (int idx = tid; idx < BLOCK_N * PDIM; idx += Cfg::NTHREADS) {
             const int r = idx / PDIM;
             const int c = idx - r * PDIM;
             const bool inb = ((kt + r) < S) && (c < DIM);
-            const int64_t g = static_cast<int64_t>(r) * DIM + c;
+            const int64_t g = static_cast<int64_t>(r) * qs2 + c;
             k_s[r * KV_LD + c] = inb ? k_base[g] : zero_v;
             v_s[r * KV_LD + c] = inb ? v_base[g] : zero_v;
         }
@@ -748,7 +802,7 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
 template <typename scalar_t, int HEAD_DIM>
 void launch_wmma_kernel(const torch::Tensor& q, const torch::Tensor& k,
                         const torch::Tensor& v, const bool* mask_ptr,
-                        const int64_t* ms, torch::Tensor& out,
+                        const int64_t* ms, const int64_t* qs, torch::Tensor& out,
                         int B, int H, int S, bool is_causal, double scale) {
     using Cfg = WmmaCfg<scalar_t, HEAD_DIM>;
     const dim3 block(Cfg::NTHREADS);
@@ -761,6 +815,7 @@ void launch_wmma_kernel(const torch::Tensor& q, const torch::Tensor& k,
             reinterpret_cast<const scalar_t*>(q.const_data_ptr()),
             reinterpret_cast<const scalar_t*>(k.const_data_ptr()),
             reinterpret_cast<const scalar_t*>(v.const_data_ptr()),
+            qs[0], qs[1], qs[2],
             mask_ptr, ms[0], ms[1], ms[2], ms[3],
             reinterpret_cast<scalar_t*>(out.data_ptr()),
             B, H, S, is_causal, static_cast<float>(scale), out_bshd);
@@ -771,10 +826,10 @@ void launch_wmma_kernel(const torch::Tensor& q, const torch::Tensor& k,
 template <typename scalar_t, int HEAD_DIM>
 bool maybe_launch_wmma(const torch::Tensor& q, const torch::Tensor& k,
                        const torch::Tensor& v, const bool* mask_ptr,
-                       const int64_t* ms, torch::Tensor& out,
+                       const int64_t* ms, const int64_t* qs, torch::Tensor& out,
                        int B, int H, int S, bool is_causal, double scale) {
     if constexpr (WmmaCfg<scalar_t, HEAD_DIM>::SUPPORTED) {
-        launch_wmma_kernel<scalar_t, HEAD_DIM>(q, k, v, mask_ptr, ms, out,
+        launch_wmma_kernel<scalar_t, HEAD_DIM>(q, k, v, mask_ptr, ms, qs, out,
                                                B, H, S, is_causal, scale);
         return true;
     } else {
@@ -785,21 +840,21 @@ bool maybe_launch_wmma(const torch::Tensor& q, const torch::Tensor& k,
 template <typename c10_t>
 bool dispatch_wmma(const torch::Tensor& q, const torch::Tensor& k,
                    const torch::Tensor& v, const bool* mask_ptr,
-                   const int64_t* ms, torch::Tensor& out,
+                   const int64_t* ms, const int64_t* qs, torch::Tensor& out,
                    int B, int H, int S, int head_dim,
                    bool is_causal, double scale) {
     using scalar_t = typename DevType<c10_t>::type;
     switch (head_dim) {
         case 8:
-            return maybe_launch_wmma<scalar_t, 8>(q, k, v, mask_ptr, ms, out, B, H, S, is_causal, scale);
+            return maybe_launch_wmma<scalar_t, 8>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
         case 16:
-            return maybe_launch_wmma<scalar_t, 16>(q, k, v, mask_ptr, ms, out, B, H, S, is_causal, scale);
+            return maybe_launch_wmma<scalar_t, 16>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
         case 32:
-            return maybe_launch_wmma<scalar_t, 32>(q, k, v, mask_ptr, ms, out, B, H, S, is_causal, scale);
+            return maybe_launch_wmma<scalar_t, 32>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
         case 64:
-            return maybe_launch_wmma<scalar_t, 64>(q, k, v, mask_ptr, ms, out, B, H, S, is_causal, scale);
+            return maybe_launch_wmma<scalar_t, 64>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
         case 128:
-            return maybe_launch_wmma<scalar_t, 128>(q, k, v, mask_ptr, ms, out, B, H, S, is_causal, scale);
+            return maybe_launch_wmma<scalar_t, 128>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
         default:
             return false;
     }
@@ -842,6 +897,12 @@ struct AttnArgs {
     const torch::Tensor& v;
     const bool* mask_ptr;
     const int64_t* ms;
+    // Batch, head and sequence strides of q/k/v, in elements. The head_dim
+    // stride is not carried: it is always 1, because fused_attention_forward
+    // makes a contiguous copy rather than pass a layout where it is not.
+    // Contiguous inputs give {H*S*head_dim, S*head_dim, head_dim}, so a kernel
+    // reading these needs no separate contiguous path.
+    const int64_t* qs;
     torch::Tensor& out;
     int B;
     int H;
@@ -857,7 +918,7 @@ bool launch_scalar(const AttnArgs& a) {
         at::ScalarType::Half, at::ScalarType::BFloat16,
         a.q.scalar_type(), "launch_scalar", [&] {
             launched = dispatch_head_dim<scalar_t>(
-                a.q, a.k, a.v, a.mask_ptr, a.ms, a.out,
+                a.q, a.k, a.v, a.mask_ptr, a.ms, a.qs, a.out,
                 a.B, a.H, a.S, a.head_dim, a.is_causal, a.scale);
         });
     return launched;
@@ -874,7 +935,7 @@ bool launch_wmma(const AttnArgs& a) {
         at::ScalarType::Half, at::ScalarType::BFloat16,
         a.q.scalar_type(), "launch_wmma", [&] {
             launched = dispatch_wmma<scalar_t>(
-                a.q, a.k, a.v, a.mask_ptr, a.ms, a.out,
+                a.q, a.k, a.v, a.mask_ptr, a.ms, a.qs, a.out,
                 a.B, a.H, a.S, a.head_dim, a.is_causal, a.scale);
         });
     return launched;
@@ -911,7 +972,7 @@ bool launch_tile(const AttnArgs& a, tile_attn::MathMode math) {
     }
     return tile_attn::launch(
         a.q.const_data_ptr<float>(), a.k.const_data_ptr<float>(),
-        a.v.const_data_ptr<float>(), a.mask_ptr, a.ms,
+        a.v.const_data_ptr<float>(), a.mask_ptr, a.ms, a.qs,
         a.out.data_ptr<float>(), ws_ptr, ws_bytes,
         a.B, a.H, a.S, a.head_dim, a.is_causal,
         static_cast<float>(a.scale), math, at::cuda::getCurrentCUDAStream());
@@ -1535,9 +1596,30 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
     TORCH_CHECK(!(is_causal && attn_mask.has_value()),
                 "fused_attention_forward: pass either is_causal or attn_mask, not both");
 
-    auto qc = q.contiguous();
-    auto kc = k.contiguous();
-    auto vc = v.contiguous();
+    const Impl mode = static_cast<Impl>(impl);
+    const bool tile_mode =
+        (mode == Impl::Tile || mode == Impl::TileBf16 || mode == Impl::TileTf32);
+
+    // Every kernel addresses q/k/v through explicit (batch, head, sequence)
+    // strides and assumes only that head_dim is stride-1. That is exactly what
+    // MySelfAttention's fused QKV projection produces: one [B, S, 3*d_model]
+    // tensor viewed and permuted into three [B,H,S,head_dim] views whose last
+    // axis is still contiguous, with rows spaced 3*d_model apart instead of
+    // head_dim. Taking those views as they are removes three clone kernels per
+    // layer -- the copy was only ever paying for a row pitch.
+    //
+    // What still copies is a layout this ABI cannot describe: head_dim not
+    // stride-1, or q/k/v that are not three slices of one tensor. Those fall
+    // back rather than widening the ABI -- a clone costs microseconds, a wrong
+    // address costs a wrong answer.
+    const bool pass_strided =
+        q.stride(3) == 1 && k.stride(3) == 1 && v.stride(3) == 1 &&
+        q.strides().equals(k.strides()) && q.strides().equals(v.strides());
+
+    auto qc = pass_strided ? q : q.contiguous();
+    auto kc = pass_strided ? k : k.contiguous();
+    auto vc = pass_strided ? v : v.contiguous();
+    const int64_t qs[3] = {qc.stride(0), qc.stride(1), qc.stride(2)};
 
     const int B = static_cast<int>(qc.size(0));
     const int H = static_cast<int>(qc.size(1));
@@ -1560,24 +1642,28 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
         }
     }
 
-    const Impl mode = static_cast<Impl>(impl);
-
     // The tile kernels index their output as [B,H,S,head_dim] internally and
     // have no layout switch, so they always get a 4-D buffer and are converted
     // afterwards. Everything else writes the requested layout directly, and the
     // launchers read which one off out.dim().
     const bool want_bshd = (out_layout == 1);
-    const bool tile_mode =
-        (mode == Impl::Tile || mode == Impl::TileBf16 || mode == Impl::TileTf32);
     const bool kernel_writes_bshd = want_bshd && !tile_mode;
 
+    // Spelled out rather than empty_like(qc): qc is now often a non-contiguous
+    // view, and empty_like preserves its strides. Every kernel writes its
+    // output as a packed [B,H,S,head_dim] -- out_base() and the tile epilogue
+    // both derive the row pitch from head_dim, not from a stride argument -- so
+    // inheriting q's pitch here would scatter the result into the wrong rows.
     auto out = kernel_writes_bshd
                    ? torch::empty({static_cast<int64_t>(B), static_cast<int64_t>(S),
                                    static_cast<int64_t>(H) * head_dim},
                                   qc.options())
-                   : torch::empty_like(qc);
+                   : torch::empty({static_cast<int64_t>(B), static_cast<int64_t>(H),
+                                   static_cast<int64_t>(S),
+                                   static_cast<int64_t>(head_dim)},
+                                  qc.options());
 
-    const AttnArgs args{qc, kc, vc, mask_ptr, ms, out,
+    const AttnArgs args{qc, kc, vc, mask_ptr, ms, qs, out,
                         B, H, S, head_dim, is_causal, scale};
 
     if (!run_kernel(mode, args)) {

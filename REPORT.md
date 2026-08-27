@@ -781,6 +781,123 @@ reproduces with `--cuda-graph off`, and `scripts/verify_split_kv.py` already exi
 `scripts/verify_graph.py` therefore checks `scalar` and `wmma` by default, with `--include-tile`
 opting in; the tile kernels are bit-exact under capture, it is their teardown that is broken.
 
+## Reading q/k/v in place
+
+Candidate 1 from the section below is now implemented, so this records what it was actually
+worth rather than what it looked like it would be worth.
+
+`MySelfAttention` runs one fused QKV projection and splits the result with a view and a
+permute, which leaves q, k and v as three non-contiguous views over one packed tensor. Every
+kernel used to call `.contiguous()` on all three: 18 clone kernels per forward pass, six
+layers times three tensors. They now read the strides instead.
+
+### Why it is nearly free
+
+Work out what those strides actually are, which is the whole argument:
+
+```
+qkv                       [B, S, 3D]        (S*3D,  3D,   1)
+.view(B, S, 3, H, Dh)     [B,S,3,H,Dh]      (S*3D,  3D,  H*Dh, Dh, 1)
+.permute(2, 0, 3, 1, 4)   [3,B,H,S,Dh]      (H*Dh, S*3D,  Dh,  3D, 1)
+.unbind(0)                q,k,v [B,H,S,Dh]  (S*3D,  Dh,   3D,  1)
+```
+
+The last axis still has stride 1. head_dim was never the problem — the copy was only ever
+paying for a **row pitch**, `3*d_model` instead of `head_dim`. So every coalesced load, every
+`wmma::load_matrix_sync` out of shared memory, every access that walks head_dim is untouched,
+and exactly two things change inside each kernel: `bh_off` becomes `b*qs0 + h*qs1`, and the
+row multiplier becomes a runtime `qs2`.
+
+Coalescing survives for the same reason. One row at head_dim 64 is 256 B, which is two fully
+used 128 B sectors however far apart the rows sit. What is given up is DRAM page locality
+across rows, not transaction efficiency — which is why the measured cost is nothing.
+
+The mask had already established the pattern: it has been passed as four explicit strides
+with stride-0 broadcast dimensions since the beginning. q/k/v now follow it, minus the
+head_dim stride, which is not carried because it is required to be 1.
+
+### What it is worth
+
+| | before | after |
+| --- | --- | --- |
+| leaf CUDA kernels per forward, `impl=auto` | 91 | **73** |
+| of which the q/k/v clones (`elementwise_kernel`) | 18 | **0** |
+| forward min latency, default shape | 3.609 ms | **3.403 ms** |
+
+The 18 is exactly six layers times three tensors, and it goes to zero rather than down. The
+tile path is a useful control: it went 97 to 79, keeping 6 `elementwise_kernel` launches that
+are its own `to_bshd` repacks — the tile kernels cannot write layout 1 natively — so the only
+thing that moved is the thing that was meant to.
+
+Bit-exact, and checked as such rather than assumed. `scripts/verify_kernel.py` grew a
+`packed` column that reruns every case through genuinely non-contiguous views and compares
+with `torch.equal`, not with a tolerance: 57 of 57 rows exact, across 12 shapes and 5 impls.
+The error columns are identical to the pre-change build, and the harness's own `max_abs`
+stayed at `0.000736952`.
+
+### The tile kernels could take it too
+
+The first plan was to exempt them. `ct::tensor_span{q + bh_off, ct::extents{S, HD}}` bakes
+the row pitch into the layout *type*, so a strided pitch looked inexpressible.
+
+It is not. `crt/cuda_tile.h` has `ct::layout_right_padded`, which decouples the row pitch
+from the last extent — precisely "row-major, last axis contiguous, rows arbitrarily spaced".
+Build it as `ct::layout_right_padded_mapping{ct::extents{S, HD}, pitch}` and hand the mapping
+to `tensor_span`. A plain `int` pitch deduces to a dynamic stride, an `integral_constant` to
+a static one, the same trade the `HD` constant beside it already documents.
+
+The K^T trick survives intact, which was the part worth checking. `layout_left_padded` pads
+the *first* extent, so `extents{HD, S}` with pitch `p` puts element (d, j) at `k[j*p + d]` —
+still K^T for free, still no shuffle through shared memory.
+
+### What still copies
+
+A layout this ABI cannot describe: head_dim not stride-1, or q/k/v that are not three slices
+of one tensor. Those fall back to `.contiguous()` rather than widening the ABI. A clone costs
+microseconds; a wrong address costs a wrong answer.
+
+The trap on the way there was `torch::empty_like(qc)`, which allocates the output. It
+defaults to `MemoryFormat::Preserve`, so once `qc` became a view it would have returned a
+buffer carrying *q's* strides — which every kernel would then have written as though it were
+packed, scattering the result into the wrong rows. It is spelled out as `torch::empty` now.
+Nothing about that failure would have looked like a layout bug.
+
+### The one regression
+
+`scripts/ab_layout.py` times contiguous against packed inputs alternating call by call, with
+a contiguous-vs-contiguous control row for the noise floor. At the default shape every impl
+lands in 1.000–1.016 against controls of 0.992–1.016 — free, as predicted. At `long seq`,
+likewise inside the control.
+
+The exception is the scalar kernel at head_dim 128: **1.41x slower on strided input**, with
+the control at 1.006, reproducible. The cause is memory-level parallelism rather than index
+arithmetic. That kernel holds `q_reg[128]` and `acc[128]` — 256 registers before anything
+else — and asks for 64 KB of shared memory, so it runs one block, two warps, per SM. Two
+warps have nothing queued up to hide a longer latency behind, so the access pattern shows up
+directly in the time.
+
+Restructuring the staging loop row-outer, so the 64-bit row offset is computed once per row
+instead of once per element, more than halved that path in absolute terms. It made the
+*ratio* worse, because it sped the contiguous side up further still. The loop is kept in that
+shape for the absolute win; the ratio is not the thing to optimize.
+
+This is narrow. `auto` picks wmma at head_dim 128, which measures 1.000, so reaching the
+regression means forcing `impl=scalar` on a kernel that is already 0.26x of SDPA at that
+shape and exists as a correctness reference. It is recorded rather than fixed.
+
+### The measurement that had to be thrown away
+
+The harness's median is blind to an effect this size, and not marginally. Three consecutive
+runs of the **unchanged** build reported 1.217x, 1.525x and 1.554x. Its `min` column, over
+those same runs, held to within 0.5% — 3.609, 3.611, 3.625 ms — and resolved the 6% cleanly
+against 3.403, 3.406, 3.407 after.
+
+Two earlier readings of the head_dim 128 regression, taken while the card was throttled, said
+2.23x and 2.28x; their control rows read 1.148 and 1.026, which should have been enough to
+discard them on the spot. The 1.41x above comes from runs whose control is 1.000. The control
+row is not decoration — see also [Absolute speedups are unusually sensitive to host
+contention](#absolute-speedups-are-unusually-sensitive-to-host-contention).
+
 ## What's left
 
 Everything above is attention. This section is the other direction: given a kernel that is
@@ -800,8 +917,12 @@ triple-counts every GEMM.
 | fused attention kernel | 8.4% | **51.2%** | 4.7% | 2% |
 | GELU | 6.7% | 4.8% | 5.7% | <1% |
 | fused add+layernorm | 6.5% | 4.7% | 4.7% | 2% |
-| q/k/v `.contiguous()` copies | 5.6% | 3.6% | 3.6% | 1% |
+| ~~q/k/v `.contiguous()` copies~~ | ~~5.6%~~ | ~~3.6%~~ | ~~3.6%~~ | ~~1%~~ |
 | idle — CPU launch gaps | ~6% | ~0% | ~1% | **~80%** |
+
+The struck row is gone as of [Reading q/k/v in place](#reading-qkv-in-place). It is left in
+because the rest of the table is the profile the ranking below was decided against, and
+quietly deleting a row would misrepresent what that ranking saw.
 
 Two shapes are worth reading closely. At `wide`, four fifths of the forward pass is cuBLAS,
 and the attention kernel — the whole subject of this document — is 4.7%. At `small`, the GPU
@@ -851,15 +972,13 @@ optimizing a fixed one, and neither can appear in this project.
 1.029x at default, bit-exact. See [CUDA graphs](#cuda-graphs) for what it measured and for
 the three things this section originally got wrong about it.
 
-**1. The q/k/v `.contiguous()` copies — 5.6% at default, bit-exact.**
+**Done: the q/k/v `.contiguous()` copies.** Was candidate 1 here, estimated at 5.6% and
+bit-exact; measured at 18 clone kernels removed per forward pass and ~6% on min latency,
+bit-exact. Absorbed by reading strides, which cost nothing because head_dim was already
+stride-1 — the copy had only ever been paying for a row pitch. See [Reading q/k/v in
+place](#reading-qkv-in-place).
 
-[`fused_attention.cu`](csrc/fused_attention.cu) materializes contiguous copies of q, k and v
-because the fused QKV projection hands the kernel permuted views of one packed tensor. That
-is 18 clone kernels per forward pass for a layout change the kernel could absorb by reading
-strides — or avoid entirely by taking the packed `qkv` tensor and indexing it directly,
-since `MySelfAttention` produced that layout itself.
-
-**2. Fused Linear+GELU — ~5% available, and the cheap route collects 2% of it at a price.**
+**1. Fused Linear+GELU — ~5% available, and the cheap route collects 2% of it at a price.**
 
 PyTorch exposes cuBLASLt's bias+GELU epilogue as `torch._addmm_activation`. Measured at the
 default FFN shape:
@@ -875,29 +994,34 @@ tanh to three digits. Against end-to-end `max_abs` that already peaks at 8.7e-4 
 gate, that is most of the remaining margin for 2%. Collecting the full 5% means hand-writing
 a TF32 tensor-core GEMM with a GELU epilogue that beats cuBLAS.
 
-**3. INT8 / W8A8 — available on this hardware, dead on accuracy.** SM 8.6 has INT8 tensor
+**2. INT8 / W8A8 — available on this hardware, dead on accuracy.** SM 8.6 has INT8 tensor
 cores. But the gate is `abs <= 1e-3` against an fp32 reference, and bf16 — far finer than
 INT8 — already fails it for 29% of elements.
 
-**4. RMSNorm — disqualified above, and it would not pay.** The argument for it is one fewer
+**3. RMSNorm — disqualified above, and it would not pay.** The argument for it is one fewer
 pass over memory; `fused_add_layernorm` already removed that pass. The mean subtraction is
 arithmetic on data that is already in registers, competing for a fraction of 6.5%.
 
-**5. SwiGLU — disqualified above.**
+**4. SwiGLU — disqualified above.**
 
-**6. FP8 — impossible here.** FP8 tensor cores start at Ada (SM 89). This card is SM 8.6.
+**5. FP8 — impossible here.** FP8 tensor cores start at Ada (SM 89). This card is SM 8.6.
 
 ### What that adds up to
 
-Graphs are collected: default went 1.263x -> 1.353x and `small` went 2.49x -> 11.23x. What
-remains at the default configuration is the q/k/v copies at 5.6%, plus GELU at ~5% if it is
-written by hand — so roughly 1.35x to 1.50x. The other two thirds of the forward pass is
-cuBLAS, and beating cuBLAS is not a weekend.
+Both collectable items are collected. Graphs took default from 1.263x to 1.353x and `small`
+from 2.49x to 11.23x; the q/k/v copies were worth a further ~6% on top of that. What remains
+at the default configuration is GELU at ~5%, and only if it is hand-written — the cheap route
+costs most of the accuracy margin for 2%, as below.
 
-So **the q/k/v copies are now the whole remaining opportunity worth having** at default
-shapes. Note that graphs paid most at exactly the shapes where the attention kernel paid
-least, which is the useful shape of this result: the two cover different regimes rather than
-competing for the same time.
+So **the remaining opportunity is cuBLAS**, which is two thirds of the forward pass at
+default and four fifths at `wide`, and beating cuBLAS is not a weekend. Everything cheaper
+than that has been taken.
+
+The three wins landed in different places, which is the useful shape of the result rather
+than an accident: the attention kernel pays on long sequences, graphs pay when the GPU is
+starved at small shapes, and the q/k/v copies paid a flat few percent everywhere the
+attention op runs at all. They cover different regimes instead of competing for the same
+time.
 
 The usual caveat from [Performance](#performance) applies to the small numbers here. The
 graph figures are the exception — `scripts/ab_graph.py` times both sides interleaved in one
@@ -984,12 +1108,13 @@ and the slowest kernel here.
 
 | Script | Purpose |
 | --- | --- |
-| `scripts/verify_kernel.py` | Every kernel vs. reference vs. SDPA across 12 shapes. Fails fast and names the shape that broke. |
+| `scripts/verify_kernel.py` | Every kernel vs. reference vs. SDPA across 12 shapes. Fails fast and names the shape that broke. The `packed` column reruns each case through the non-contiguous views the model actually produces and demands a *bit-identical* result, not one within tolerance. |
 | `scripts/verify_split_kv.py` | Checks the tile kernel's split-KV path against its own single-pass path, and asserts the split actually fired. |
 | `scripts/verify_graph.py` | Checks that graph replay is *bit-identical* to eager — tolerance exactly zero — and that the graph actually fired rather than silently declining. `--test-failure` also exercises the capture-failure path; `--include-tile` adds the cuTile impls. |
 | `scripts/bench_attention.py` | Times the attention op alone — scalar vs. tensor-core vs. SDPA — with accuracy alongside, so a speed win bought with precision is visible. |
 | `scripts/compare_backends.py` | Runs the full harness once per backend and prints the comparison table above. Set `COMPARE_FULL=1` for the harness's own accuracy-trial count instead of the trimmed one. |
 | `scripts/ab_split_kv.py` | A/Bs the split-KV path against single-pass, interleaved in one process with a control group. |
+| `scripts/ab_layout.py` | A/Bs contiguous q/k/v against the packed views the model produces, alternating call by call, with a contiguous-vs-contiguous control row. Measures what reading strides costs, not what skipping the clones saves. |
 | `scripts/ab_graph.py` | A/Bs eager against graph replay, interleaved with an eager-vs-eager control row for the noise floor. `--recommend` measures the crossover on the machine it runs on and prints the `_GRAPH_MAX_ACTIVATION` to set, refusing to answer if the control rows say the machine is too noisy to trust. |
 | `scripts/tune_tile_tf32.py` | Sweeps the tile kernel's block shapes per mask mode. |
 | `scripts/sass_mix.py` | SASS instruction mix and occupancy for the head_dim 64 kernels. |

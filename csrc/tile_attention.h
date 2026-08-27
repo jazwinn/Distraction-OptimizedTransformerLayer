@@ -64,7 +64,11 @@ size_t workspace_bytes(int B, int H, int S, int head_dim,
 
 // Fused scaled-dot-product attention. float32 in and out regardless of mode.
 //
-//   q, k, v, out  [B, H, S, head_dim], contiguous, device pointers
+//   q, k, v       [B, H, S, head_dim] device pointers. qs holds their batch,
+//                 head and sequence strides in elements; head_dim must be
+//                 stride-1. Contiguous inputs pass {H*S*head_dim, S*head_dim,
+//                 head_dim} and behave exactly as before.
+//   out           [B, H, S, head_dim], contiguous, device pointer
 //   mask          optional [B,H,S,S] bool, true == may attend. ms holds its
 //                 four strides, which may be 0 on broadcast dimensions.
 //                 Pass nullptr for no mask.
@@ -76,7 +80,7 @@ size_t workspace_bytes(int B, int H, int S, int head_dim,
 // Returns false without launching when this head_dim or mode has no
 // specialisation compiled, so the caller can fall back.
 bool launch(const float* q, const float* k, const float* v,
-            const bool* mask, const long long* ms,
+            const bool* mask, const long long* ms, const long long* qs,
             float* out, void* ws, size_t ws_bytes,
             int B, int H, int S, int head_dim,
             bool is_causal, float scale, MathMode mode, cudaStream_t stream);
