@@ -911,29 +911,10 @@ bool launch_tile(const AttnArgs& a, tile_attn::MathMode math) {
                 "fused_attention_forward: this build has no tile kernel for that "
                 "math mode. tf32 needs a toolkit shipping <cuda_tf32.h> (CUDA "
                 "13.3+); see csrc/tile_attention.h.");
-    // Scratch for split-KV's per-split partials. Zero on most shapes -- the
-    // launcher only splits the key range when the grid is too small to fill the
-    // device -- so this is usually an empty tensor that is never allocated.
-    //
-    // It comes from torch's caching allocator rather than cudaMalloc because
-    // that allocator is stream-ordered (the kernel below runs on the current
-    // stream, and the buffer is freed to that same stream when `ws` dies) and
-    // because it draws on the pool the benchmark is already accounted against,
-    // instead of quietly competing with it.
-    const size_t ws_bytes = tile_attn::workspace_bytes(
-        a.B, a.H, a.S, a.head_dim, a.is_causal, math);
-    at::Tensor ws;
-    void* ws_ptr = nullptr;
-    if (ws_bytes > 0) {
-        ws = at::empty({static_cast<int64_t>(ws_bytes)},
-                       a.q.options().dtype(at::kByte));
-        ws_ptr = ws.data_ptr();
-    }
     return tile_attn::launch(
         a.q.const_data_ptr<float>(), a.k.const_data_ptr<float>(),
         a.v.const_data_ptr<float>(), a.mask_ptr, a.ms,
-        a.out.data_ptr<float>(), ws_ptr, ws_bytes,
-        a.B, a.H, a.S, a.head_dim, a.is_causal,
+        a.out.data_ptr<float>(), a.B, a.H, a.S, a.head_dim, a.is_causal,
         static_cast<float>(a.scale), math, at::cuda::getCurrentCUDAStream());
 }
 
@@ -1694,30 +1675,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("weight"),
           pybind11::arg("bias"),
           pybind11::arg("eps") = 1e-5);
-    m.def("tile_workspace_bytes",
-          [](int B, int H, int S, int head_dim, bool is_causal, int impl) {
-              // impl codes match fused_attention_forward's: 3 tile-fp32,
-              // 4 tile-bf16, 5 tile-tf32. Non-zero means the launcher intends
-              // to split the key range for this shape, so a test can assert
-              // that it is really exercising the split path rather than
-              // silently passing on the single-pass one.
-              tile_attn::MathMode math = tile_attn::MathMode::Fp32;
-              if (impl == 4) math = tile_attn::MathMode::Bf16;
-              if (impl == 5) math = tile_attn::MathMode::Tf32;
-              return static_cast<int64_t>(tile_attn::workspace_bytes(
-                  B, H, S, head_dim, is_causal, math));
-          },
-          "Scratch bytes the tile kernel would take for this shape; 0 when it "
-          "will not split the key range",
-          pybind11::arg("B"), pybind11::arg("H"), pybind11::arg("S"),
-          pybind11::arg("head_dim"), pybind11::arg("is_causal"),
-          pybind11::arg("impl"));
-    m.def("tile_set_split_kv", &tile_attn::set_split_kv,
-          "Enable/disable the tile kernel's split-KV (Flash-Decoding) path. "
-          "Runtime-settable so both paths can be timed in one process.",
-          pybind11::arg("enabled"));
-    m.def("tile_split_kv_enabled", &tile_attn::split_kv_enabled,
-          "Whether the tile kernel's split-KV path is currently enabled");
     m.def("fused_attention_forward", &fused_attention_forward,
           "Fused scaled-dot-product attention",
           pybind11::arg("q"),

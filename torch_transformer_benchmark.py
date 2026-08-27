@@ -20,6 +20,7 @@ import math
 import os
 import statistics
 import time
+import weakref
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -218,7 +219,48 @@ ATTENTION_IMPL = "auto"
 _IMPL_CODE = {"auto": 0, "scalar": 1, "wmma": 2, "tile": 3, "tile-bf16": 4,
               "tile-tf32": 5}
 
+# Ask the kernel for [B, S, H*head_dim] instead of [B, H, S, head_dim]. out_proj
+# wants the flattened layout, and the transpose+reshape that used to produce it
+# could not be a view -- it repacked the whole tensor once per layer. The kernel
+# epilogue reaches the same addresses for free, so the repack simply goes away.
+_OUT_LAYOUT_BSHD = 1
+
 _fallback_warned = False
+
+
+def _custom_kernels():
+    """The extension module, or None when it is unavailable or switched off.
+
+    ATTENTION_BACKEND == "sdpa" is honoured here as "use no custom kernels at
+    all", not just no custom attention -- otherwise --attn-backend sdpa would
+    still be timing hand-written code and the comparison would mean nothing.
+    """
+    if ATTENTION_BACKEND == "sdpa":
+        return None
+    import kernel_ext
+
+    return kernel_ext.get_kernels()
+
+
+def _add_layernorm(
+    x: torch.Tensor,
+    sub: torch.Tensor,
+    norm: "MyLayerNorm",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """(x + sub, norm(x + sub)), fused into one kernel where available.
+
+    The residual add and the LayerNorm that consumes it are two separate passes
+    over the same tensor, and the intermediate x + sub is written to global
+    memory only to be read straight back. One kernel holds it on chip instead
+    and returns both results, since the caller needs the un-normalised sum for
+    its own skip connection.
+    """
+    kernels = _custom_kernels()
+    if kernels is not None:
+        return kernels.fused_add_layernorm(x, sub, norm.weight, norm.bias, norm.eps)
+
+    total = x + sub
+    return total, norm(total)
 
 
 def _attention_dispatch(
@@ -229,7 +271,14 @@ def _attention_dispatch(
     is_causal: bool,
     scale: float,
 ) -> torch.Tensor:
-    """Route attention to the custom CUDA kernel or to SDPA."""
+    """Route attention to the custom CUDA kernel or to SDPA.
+
+    Returns [B, S, H*head_dim] -- already flattened over heads, the layout
+    out_proj consumes -- regardless of which backend served the call. The
+    custom kernels write it directly from their epilogue; SDPA cannot, so the
+    transpose/reshape happens here. Keeping the contract in one place means the
+    caller never has to ask which backend it got.
+    """
     global _fallback_warned
 
     if ATTENTION_BACKEND != "sdpa":
@@ -238,7 +287,8 @@ def _attention_dispatch(
         kernels = kernel_ext.get_kernels()
         if kernels is not None:
             return kernels.fused_attention_forward(
-                q, k, v, attn_mask, is_causal, scale, _IMPL_CODE[ATTENTION_IMPL]
+                q, k, v, attn_mask, is_causal, scale,
+                _IMPL_CODE[ATTENTION_IMPL], _OUT_LAYOUT_BSHD
             )
         if ATTENTION_BACKEND == "custom":
             raise RuntimeError(
@@ -257,9 +307,30 @@ def _attention_dispatch(
                 f"at the top of this file"
             )
 
-    return F.scaled_dot_product_attention(
+    context = F.scaled_dot_product_attention(
         q, k, v, attn_mask=attn_mask, is_causal=is_causal, scale=scale
     )
+    # [B, H, S, D] -> [B, S, H*D]. Cannot be a view across the transpose, so
+    # this is the strided repack the custom kernels skip. flatten(2) rather than
+    # reshape(b, s, h*d): same result, but it keeps the shape arithmetic on the
+    # C++ side instead of adding a Python-level unpack and multiply per layer,
+    # which is not free in a model this close to launch-bound.
+    return context.transpose(1, 2).flatten(2)
+
+
+def _version_or_none(t: torch.Tensor) -> Optional[int]:
+    """t._version, or None when the tensor does not track one.
+
+    Inference tensors raise instead of reporting a version, and both cache keys
+    below can be handed one -- the accuracy path builds its mask inside
+    inference_mode(). Falling back to None makes the version half of a key a
+    best-effort check rather than a hard requirement; the identity half of the
+    key still carries correctness.
+    """
+    try:
+        return t._version
+    except RuntimeError:
+        return None
 
 
 class MyLinear(nn.Module):
@@ -312,6 +383,37 @@ class MySelfAttention(nn.Module):
         self._causal_mask_key: Optional[Tuple] = None
         self._causal_mask: Optional[torch.Tensor] = None
 
+        # Fused QKV projection cache. See _get_qkv_weight.
+        self._qkv_key: Optional[Tuple] = None
+        self._qkv_weight: Optional[torch.Tensor] = None
+        self._qkv_bias: Optional[torch.Tensor] = None
+
+    def _get_qkv_weight(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Q, K and V as one [3*d_model, d_model] weight, built on demand.
+
+        Three separate [B*S, d]x[d, d] GEMMs leave the GPU with ~32 output tiles
+        for 46 SMs, so cuBLAS splits the contraction and launches a second
+        kernel to add the partial sums back together -- that reduction alone was
+        9.5% of total GPU time in a profile. One [d, 3*d] GEMM produces ~96
+        tiles, which fills the card in a single pass with no split needed.
+
+        Built lazily rather than in __init__ because the weights are not there
+        yet at construction time: they arrive via load_state_dict() and then
+        move under .to(device, dtype). The key covers both, so either one
+        rebuilds the fused copy. Plain attributes rather than buffers, so
+        state_dict() is untouched and strict weight copying keeps working.
+        """
+        w_q, w_k, w_v = self.q_proj.weight, self.k_proj.weight, self.v_proj.weight
+        key = (w_q.device, w_q.dtype,
+               _version_or_none(w_q), _version_or_none(w_k), _version_or_none(w_v))
+        if self._qkv_key != key:
+            self._qkv_weight = torch.cat([w_q, w_k, w_v], dim=0)
+            self._qkv_bias = torch.cat(
+                [self.q_proj.bias, self.k_proj.bias, self.v_proj.bias], dim=0
+            )
+            self._qkv_key = key
+        return self._qkv_weight, self._qkv_bias
+
     def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         key = (seq_len, device)
         if self._causal_mask_key != key:
@@ -335,9 +437,19 @@ class MySelfAttention(nn.Module):
         # above did.
         batch, seq_len, d_model = x.shape
 
-        q = self.q_proj(x).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        # One GEMM for all three projections instead of three narrow ones.
+        # The weights were concatenated along dim 0, so the output columns are
+        # [q | k | v] and 3 is the slowest-varying axis of the split below --
+        # the view and permute only relabel strides, they move no data. The
+        # three results are non-contiguous views, exactly as .transpose(1, 2)
+        # left them before, so nothing downstream sees a new layout.
+        qkv_w, qkv_b = self._get_qkv_weight()
+        qkv = F.linear(x, qkv_w, qkv_b)  # [B, S, 3*d_model]
+        q, k, v = (
+            qkv.view(batch, seq_len, 3, self.num_heads, self.head_dim)
+            .permute(2, 0, 3, 1, 4)      # [3, B, H, S, head_dim]
+            .unbind(0)
+        )
 
         # An all-valid mask (the default --padding-ratio 0 case) still costs a
         # real tensor and blocks the faster is_causal-only path below, so it's
@@ -361,13 +473,17 @@ class MySelfAttention(nn.Module):
             # so this path only applies once we know there's no padding to fold in.
             is_causal = causal
 
+        # Already [B, S, d_model] -- see _attention_dispatch. No transpose or
+        # reshape here any more; the kernel epilogue wrote this layout directly.
         context = _attention_dispatch(
             q, k, v, attn_mask=attn_mask, is_causal=is_causal, scale=self.scale
         )
-        context = context.transpose(1, 2).reshape(batch, seq_len, d_model)
         output = self.out_proj(context)
 
-        if valid_token_mask is not None:
+        # An all-valid mask makes ~mask all-False, so this masked_fill writes
+        # nothing -- but it is out-of-place, so it still clones the whole tensor
+        # first. Skipping it when the mask is trivial is a no-op on the output.
+        if valid_token_mask is not None and not mask_is_trivial:
             output = output.masked_fill(~valid_token_mask[..., None], 0)
         return output
         # ============================================================
@@ -388,16 +504,34 @@ class MyTransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        normed: torch.Tensor,
+        next_norm: "MyLayerNorm",
         valid_token_mask: Optional[torch.Tensor] = None,
         mask_is_trivial: bool = False,
-    ) -> torch.Tensor:
-        # ====================== your codes here ======================
-        x = x + self.attention(self.norm1(x), valid_token_mask, self.causal, mask_is_trivial)
-        x = x + self.ffn_out(F.gelu(self.ffn_in(self.norm2(x)), approximate="none"))
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns (residual stream, next_norm applied to it).
 
-        if valid_token_mask is not None:
-            x = x.masked_fill(~valid_token_mask[..., None], 0)
-        return x
+        Both of this block's residual adds feed a LayerNorm, so both are fused
+        -- but only one of those norms belongs to this block. `normed` is
+        norm1(x), already computed by whoever produced x; `next_norm` is the
+        LayerNorm that will consume this block's output, which lives in the
+        *next* block (or is final_norm). A block cannot see either of those, so
+        the caller supplies them. See UserOptimizedTransformer.forward.
+        """
+        # ====================== your codes here ======================
+        attn_out = self.attention(normed, valid_token_mask, self.causal, mask_is_trivial)
+        x, normed = _add_layernorm(x, attn_out, self.norm2)
+
+        ffn_out = self.ffn_out(F.gelu(self.ffn_in(normed), approximate="none"))
+
+        if valid_token_mask is not None and not mask_is_trivial:
+            # Padded rows are zeroed *between* the add and the norm, so this
+            # pair cannot fuse -- the reference normalises the zeroed rows, not
+            # the raw sum, and matching that matters more than one kernel.
+            x = (x + ffn_out).masked_fill(~valid_token_mask[..., None], 0)
+            return x, next_norm(x)
+
+        return _add_layernorm(x, ffn_out, next_norm)
         # ============================================================
 
 
@@ -422,6 +556,41 @@ class UserOptimizedTransformer(BaselineTransformer):
         )
         self.final_norm = MyLayerNorm(config.d_model)
 
+        # Cache for _mask_is_trivial below. Plain attributes, not buffers or
+        # parameters, so they stay out of state_dict() and strict weight
+        # copying keeps working.
+        self._triv_ref: Optional[weakref.ReferenceType] = None
+        self._triv_version: Optional[int] = None
+        self._triv: bool = False
+
+    def _mask_is_trivial(self, mask: Optional[torch.Tensor]) -> bool:
+        """True when every position is valid, so every mask op is a no-op.
+
+        mask.all().item() is a device->host sync. It stalls the pipeline once
+        per forward pass, and it makes CUDA graph capture illegal outright.
+        The harness reuses one mask tensor for a whole run, so caching the
+        answer costs one sync during warmup and none in the measured region.
+
+        Keyed on a weakref to the tensor, not on data_ptr(): the caching
+        allocator recycles addresses, so a freed mask and an unrelated new one
+        can share a pointer and the cache would serve a stale answer. A live
+        weakref instead proves the object was never freed. The version is a
+        best-effort check for in-place mutation on top of that; see
+        _version_or_none.
+        """
+        if mask is None:
+            return False
+
+        version = _version_or_none(mask)
+        cached = self._triv_ref() if self._triv_ref is not None else None
+        if cached is mask and self._triv_version == version:
+            return self._triv
+
+        self._triv = bool(mask.all().item())
+        self._triv_ref = weakref.ref(mask)
+        self._triv_version = version
+        return self._triv
+
     def forward(
         self,
         x: torch.Tensor,
@@ -430,15 +599,27 @@ class UserOptimizedTransformer(BaselineTransformer):
         # ====================== your codes here ======================
         # Computed once per forward pass instead of once per layer (6x
         # redundant GPU->CPU syncs otherwise) -- valid_token_mask doesn't
-        # change between layers.
-        mask_is_trivial = valid_token_mask is not None and bool(valid_token_mask.all().item())
+        # change between layers -- and memoized across calls on top of that,
+        # so the steady state has no sync at all.
+        mask_is_trivial = self._mask_is_trivial(valid_token_mask)
 
-        for layer in self.layers:
-            x = layer(x, valid_token_mask, mask_is_trivial)
-        x = self.final_norm(x)
-        if valid_token_mask is not None:
-            x = x.masked_fill(~valid_token_mask[..., None], 0)
-        return x
+        # Every LayerNorm in the model consumes the output of a residual add, so
+        # every one of them fuses into that add -- except the very first, which
+        # has no add before it. That one runs on its own here; the rest are
+        # handed to the block whose add produces their input.
+        normed = self.layers[0].norm1(x)
+        last = len(self.layers) - 1
+        for index, layer in enumerate(self.layers):
+            next_norm = self.final_norm if index == last else self.layers[index + 1].norm1
+            x, normed = layer(
+                x, normed, next_norm, valid_token_mask, mask_is_trivial
+            )
+
+        # The last block folded final_norm into its trailing add, so `normed` is
+        # already final_norm(x) and there is no separate call to make here.
+        if valid_token_mask is not None and not mask_is_trivial:
+            normed = normed.masked_fill(~valid_token_mask[..., None], 0)
+        return normed
         # ============================================================
 
 

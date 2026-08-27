@@ -10,8 +10,6 @@
 
 #include <cuda_runtime.h>
 
-#include <cstddef>
-
 namespace tile_attn {
 
 // Precision of the two GEMM operands, and the only thing that decides whether
@@ -48,46 +46,12 @@ bool available();
 // with no other change; the kernel is already written for it.
 bool supports(MathMode mode);
 
-// Turn the split-KV path on or off for subsequent launches, and read the
-// current setting. It starts from the TILE_SPLIT_KV environment variable
-// (TILE_SPLIT_KV=0 means off) and defaults to on.
-//
-// This is settable at run time, not just at build or process start, so the two
-// paths can be timed against each other inside one process. That is not a
-// convenience: run-to-run variance on the causal long-sequence cases here is
-// +/-10-15%, larger than the effect being measured, and comparing across two
-// runs has already inverted a block-shape ranking in this project once.
-//
-// Turning it off changes workspace_bytes() to 0 as well, so a caller that
-// queries and launches in that order stays consistent. Flipping it between the
-// query and the launch is the one way to get a mismatch; do not.
-void set_split_kv(bool enabled);
-bool split_kv_enabled();
-
-// Device scratch launch() wants for this problem, in bytes, or 0 if it needs
-// none. It is non-zero only when the launcher decides to split the key range
-// across blocks (Flash-Decoding), which happens on grids too small to fill the
-// device; the scratch holds the per-split partial outputs and their running
-// max / sum until a second pass folds them together.
-//
-// Query with exactly the arguments you will pass to launch(): the split count
-// depends on the block shape, which depends on head_dim, mode and is_causal.
-// Both functions resolve it through the same code, so they cannot disagree.
-//
-// Passing launch() nullptr, or a buffer smaller than this, is allowed and
-// costs performance rather than correctness -- it falls back to the
-// single-pass kernel.
-size_t workspace_bytes(int B, int H, int S, int head_dim,
-                       bool is_causal, MathMode mode);
-
 // Fused scaled-dot-product attention. float32 in and out regardless of mode.
 //
 //   q, k, v, out  [B, H, S, head_dim], contiguous, device pointers
 //   mask          optional [B,H,S,S] bool, true == may attend. ms holds its
 //                 four strides, which may be 0 on broadcast dimensions.
 //                 Pass nullptr for no mask.
-//   ws, ws_bytes  device scratch of at least workspace_bytes(); nullptr/0 is
-//                 valid and selects the single-pass kernel.
 //   is_causal     lower-triangular masking. Never combined with mask.
 //   mode          operand precision; see MathMode.
 //
@@ -95,8 +59,7 @@ size_t workspace_bytes(int B, int H, int S, int head_dim,
 // specialisation compiled, so the caller can fall back.
 bool launch(const float* q, const float* k, const float* v,
             const bool* mask, const long long* ms,
-            float* out, void* ws, size_t ws_bytes,
-            int B, int H, int S, int head_dim,
+            float* out, int B, int H, int S, int head_dim,
             bool is_causal, float scale, MathMode mode, cudaStream_t stream);
 
 }  // namespace tile_attn

@@ -14,6 +14,7 @@ the detail of how the kernel was moved onto the tensor cores.
 - [Why the harness number looks small](#why-the-harness-number-looks-small)
 - [Accuracy](#accuracy)
 - [Coverage and limits](#coverage-and-limits)
+- [What's left](#whats-left)
 - [Reproducing](#reproducing)
 
 ---
@@ -303,6 +304,88 @@ Every shape improves, and the tensor-core kernel is faster than SDPA on all of t
 earlier independent run of the same table gave 2.07x / 1.87x, which is the size of the
 run-to-run error bar.
 
+### Why the tile kernel loses to wmma, and where it doesn't
+
+The table above ranks wmma first and tile-tf32 second, which invites the obvious question:
+the tile kernel is written at a higher level, the compiler does the register allocation and
+the load scheduling, so why is the hand-written one faster? The answer is worth writing down
+because it is **not** a code-quality problem, and three rounds of trying to fix it as one
+came back empty.
+
+Timed interleaved in a single process, five rounds, best round kept — head_dim 64 unless
+noted, fp32 in and out for every row. **Measured on an RTX 3070 (SM 8.6, 46 SMs), CUDA 13.3,
+PyTorch 2.12.0+cu132** — not the RTX 4050 Laptop this document's footer names, so these
+milliseconds are not comparable with the tables above. The ratios inside this section are
+internally consistent; ones drawn across sections are not.
+
+| Shape | wmma-tf32 | tile-tf32 | tile-bf16 | tile-fp32 |
+| --- | --- | --- | --- | --- |
+| B2 H8 S512 dense | **0.170** | 0.250 | 0.140 | 0.372 |
+| B2 H8 S512 causal | **0.114** | 0.155 | 0.103 | 0.245 |
+| B1 H8 S2048 dense | **0.973** | 1.289 | 0.865 | 2.746 |
+| B1 H8 S2048 causal | **0.579** | 0.807 | 0.495 | 1.463 |
+| B2 H8 S2048 dense | **1.915** | 2.572 | 1.705 | 5.317 |
+| B2 H8 S2048 causal | **1.032** | 1.503 | 0.923 | 2.776 |
+| B2 H8 S1024 head_dim 32 dense | **0.254** | 0.308 | 0.202 | 0.743 |
+| B2 H8 S1024 head_dim 16 dense | 0.158 | **0.126** | 0.077 | 0.387 |
+
+Geometric mean: **tile-tf32 is 1.28x slower than wmma; tile-bf16 is 1.25x faster.** Read the
+right row before concluding anything — tile-bf16 does beat the hand-written kernel, but it is
+8 significand bits against tf32's 10, so it is a cheaper computation and not a faster
+implementation of the same one. Against the mode that does the *same* arithmetic, wmma wins
+almost everywhere. head_dim 16 is the one exception.
+
+Three things explain the gap, and none of them is the kernel source.
+
+**The tf32 conversion is software in cuTile and free in wmma.** `ct::tile<__nv_tf32,...>(x)`,
+the only way to reach the tf32 MMA units from tile code, lowers to a full IEEE
+round-to-nearest-even written in integer operations — masks against `0x7f800000`, tie
+detection on `0xfff` and `0x3000`, `+0x2000`, a NaN fixup, and a final `& 0xffffe000`. That is
+about fourteen instructions per element. `wmma::__float_to_tf32` compiles to **nothing**:
+ptxas deletes it outright, because `HMMA.1688.F32.TF32` reads ordinary fp32 registers and
+rounds in hardware. Grep the SASS for `0xffffe000` to see which one you have.
+
+**Occupancy.** tile-tf32 at its tuned 128x32 shape needs **95.5 KB** of static shared memory,
+which on this card is **one block per SM** — four warps, with nothing else resident to hide a
+memory stall behind. wmma asks for **43.8 KB** dynamically and gets **two**.
+
+**It is not instruction-bound, so the usual levers do nothing.** This is the part that took
+longest to accept. Counting SASS at head_dim 64, the tile kernel emits the *better* tensor-core
+instruction — `HMMA.1688` (m16n8k8, 1024 MACs per warp-op) where wmma's `mma_sync` on tf32
+fragments lowers to `HMMA.1684` (m16n8k4, 512), so wmma issues twice as many MMA instructions
+for the same work. Normalised per MAC of attention, tile-tf32 executes **1.03** instructions
+where wmma executes **1.38**. It is more instruction-efficient and still slower. Consistent
+with that, removing 12% of the tile kernel's instructions once bought 3% of its time.
+
+The clinching evidence that the programming model is not at fault is the bf16 column. Same
+tile source, same compiler, same one-block-per-SM occupancy — the only thing that changes is
+that cuTile's bf16 narrowing gets a hardware `F2F` instead of the software rounding sequence.
+With the conversion free, the tile kernel beats the hand-written one.
+
+So the honest summary of "tile programming is fast": it buys **portability and a great deal
+less code** — the tile kernel is a few hundred lines against the wmma kernel's fragment
+choreography, shared-memory padding and manual barriers — and on this hardware it costs about
+28% on the tf32 path. cuTile is aimed at Hopper and Blackwell, where TMA and a larger shared
+allocation exist; the paper describing it asserts compute capability 10.0 or newer is required,
+which is wrong for CUDA 13.3 but tells you plainly what it was tuned against. On SM 8.6 it
+runs correctly and gets none of that hardware.
+
+What this rules out is worth as much as what it explains. Every plausible source-level fix was
+A/B'd with both variants compiled and timed in one process: hoisting the Q cast out of the key
+loop, replacing `ct::transpose(k)` with a `layout_left` K-transpose view, `ct::mma(a,b,c)` in
+place of `c + ct::matmul(a,b)`, skipping the bounds `select` on interior tiles, static
+`integral_constant` extents, and plain `load()` instead of `load_masked()`. All measured
+neutral or worse — the last one 12% worse, because `load_masked` is what gets the TMA path.
+The tile compiler had already normalised the rest. Reading K and V through a `__nv_tf32*`
+reinterpret does remove ~520 instructions and 3% of the time, but it is truncation rather than
+rounding and the error grows ten-fold, from 3.1e-4 to 3.0e-3; it was rejected.
+
+**Practical reading.** For fp32 in and out on this GPU, wmma is the right default and the
+table at the top of this document already says so. If the accuracy budget tolerates bf16,
+tile-bf16 is the fastest kernel here and by a wide margin the least code. The tile-tf32 path
+earns its place as the same-accuracy comparison that makes both of those claims checkable, not
+as the fast option.
+
 ### The whole transformer
 
 Harness speedup against `BaselineTransformer`:
@@ -414,6 +497,150 @@ Both were worth real speed, not just coverage — at `head_dim=128` the tensor-c
 runs 0.041 ms against the scalar fallback's 0.142 ms, turning a 0.40x loss to SDPA into a
 1.40x win.
 
+## What's left
+
+Everything above is attention. This section is the other direction: given a kernel that is
+already faster than SDPA on every shape, what is still worth doing to the model around it?
+
+The measurements here come from a profiler run over the optimized path at four shapes with
+the harness's own settings (`allow_tf32=True`, `matmul_precision="high"`), reading leaf CUDA
+kernels only — `key_averages()` reports `aten::linear`, `aten::addmm` and the underlying
+`cutlass_80_tensorop_s1688gemm` as three separate rows with the same time, and summing them
+triple-counts every GEMM.
+
+### Where the time goes now
+
+| | default B8·S128 | seq2048 | wide d1024 | small B1·S32 |
+| --- | --- | --- | --- | --- |
+| cuBLAS GEMMs (projections + FFN) | **66.4%** | 36.4% | **79.8%** | 13% |
+| fused attention kernel | 8.4% | **51.2%** | 4.7% | 2% |
+| GELU | 6.7% | 4.8% | 5.7% | <1% |
+| fused add+layernorm | 6.5% | 4.7% | 4.7% | 2% |
+| q/k/v `.contiguous()` copies | 5.6% | 3.6% | 3.6% | 1% |
+| idle — CPU launch gaps | ~6% | ~0% | ~1% | **~80%** |
+
+Two shapes are worth reading closely. At `wide`, four fifths of the forward pass is cuBLAS,
+and the attention kernel — the whole subject of this document — is 4.7%. At `small`, the GPU
+is idle for four fifths of the wall clock, waiting to be fed.
+
+### What decides whether launch overhead is exposed
+
+Kernel launches are asynchronous, so the CPU races ahead queueing kernel *n+1* while the GPU
+is still running *n*. If the average kernel outlasts the time it takes to issue one, the CPU
+stays ahead, the queue never drains, and launch cost is invisible. The GPU only stalls when
+the average kernel finishes faster than the next can be submitted.
+
+Counting launches does not predict this. Counting *duration* does:
+
+| | kernels/fwd | mean kernel | GPU idle |
+| --- | --- | --- | --- |
+| small B1·S32 | 79 | 5.99 us | **80.3%** |
+| default B8·S128 | 79 | 48.98 us | 10.4% |
+| seq2048 | 91 | 1018.29 us | 0.9% |
+
+`small` and `default` issue the identical 79 kernels per forward pass and sit at opposite
+ends of the table; `seq2048` issues *more* than either and is never launch-bound at all. The
+rule of thumb is to compare mean kernel duration against launch cost — roughly 3-8 us of CPU
+— rather than comparing kernel count against one. Without a profiler, the same question is
+answered by timing the forward loop without synchronising, to get CPU dispatch cost, and
+comparing that to GPU time: if they are equal, the GPU is starved.
+
+### Implementation changes and architecture changes are not the same list
+
+A survey of "transformer optimization techniques" will mix two categories that this harness
+treats very differently:
+
+* **Implementation changes** — CUDA graphs, fused epilogues, lower-precision GEMMs — compute
+  the same function by a different route. They are graded on speed and on staying inside
+  `atol=1e-3`.
+* **Architecture changes** — SwiGLU gating, RMSNorm — compute a *different function*.
+
+`copy_model_weights` loads the baseline's `state_dict` with `strict=True`, and
+`compare_outputs` compares against `BaselineTransformer`'s own output elementwise. A SwiGLU
+FFN has no `W3` to load; RMSNorm drops the mean subtraction `nn.LayerNorm` performs. Both
+miss by O(1), not by O(1e-3). They are what you do when training a new model, not when
+optimizing a fixed one, and neither can appear in this project.
+
+### Ranked candidates
+
+**1. CUDA graphs — measured 4.20x at `small`, and bit-exact.**
+
+```
+small (B1 S32):  eager 2.048 ms -> graph 0.488 ms   (2.49x -> 10.46x vs baseline)
+default:         eager 3.944 ms -> graph 3.809 ms   (1.32x -> 1.37x)
+deep 12L:        eager 7.881 ms -> graph 7.673 ms   (1.27x -> 1.30x)
+seq2048:         eager 93.5 ms  -> graph 95.5 ms    (no gain)
+graph output vs eager output: max_abs = 0.000e+00 on all four
+```
+
+The replay time at `small`, 0.488 ms, lands almost exactly on the sum of the kernels
+themselves (0.474 ms) — the rest was pure launch gap, and collapsing 79 submissions into one
+recovers essentially all of it. The payoff tracks the idle column above exactly, which is
+why it is 4.20x at one shape and nothing at another. This is also the only remaining
+candidate with no accuracy question attached, because a replay runs the identical kernels in
+the identical order.
+
+A graph does not *need* many nodes to be legal — a single-node capture replays fine — but it
+needs them to be worth anything: `cudaGraphLaunch` costs about what one `cudaLaunchKernel`
+costs, so a one-kernel graph saves nothing.
+
+What it needs: capture on a side stream under `torch.no_grad()` — capture from inside
+`inference_mode` did not work — with a graph cache keyed on
+`(shape, dtype, causal, mask_is_trivial)` and inputs `copy_()`d into a static buffer, since
+every accuracy trial passes a fresh `x`. It should be gated off above some `batch*seq`: the
+graph pool pins every intermediate, and `seq2048` gains nothing for that memory. The
+`mask_is_trivial` caching in `UserOptimizedTransformer` already removed the `.item()` sync
+that would make capture illegal outright.
+
+**2. The q/k/v `.contiguous()` copies — 5.6% at default, bit-exact.**
+
+[`fused_attention.cu`](csrc/fused_attention.cu) materializes contiguous copies of q, k and v
+because the fused QKV projection hands the kernel permuted views of one packed tensor. That
+is 18 clone kernels per forward pass for a layout change the kernel could absorb by reading
+strides — or avoid entirely by taking the packed `qkv` tensor and indexing it directly,
+since `MySelfAttention` produced that layout itself.
+
+**3. Fused Linear+GELU — ~5% available, and the cheap route collects 2% of it at a price.**
+
+PyTorch exposes cuBLASLt's bias+GELU epilogue as `torch._addmm_activation`. Measured at the
+default FFN shape:
+
+```
+F.linear + F.gelu(erf)          188.7 us
+torch._addmm_activation fused   184.6 us    <- 2%; cuBLASLt picks a slower GEMM algo
+F.linear alone                  138.9 us    <- so GELU itself is only ~50 us
+```
+
+It is also the **tanh** approximation, not erf: 3.87e-4 against an erf reference, matching
+tanh to three digits. Against end-to-end `max_abs` that already peaks at 8.7e-4 on a 1e-3
+gate, that is most of the remaining margin for 2%. Collecting the full 5% means hand-writing
+a TF32 tensor-core GEMM with a GELU epilogue that beats cuBLAS.
+
+**4. INT8 / W8A8 — available on this hardware, dead on accuracy.** SM 8.6 has INT8 tensor
+cores. But the gate is `abs <= 1e-3` against an fp32 reference, and bf16 — far finer than
+INT8 — already fails it for 29% of elements.
+
+**5. RMSNorm — disqualified above, and it would not pay.** The argument for it is one fewer
+pass over memory; `fused_add_layernorm` already removed that pass. The mean subtraction is
+arithmetic on data that is already in registers, competing for a fraction of 6.5%.
+
+**6. SwiGLU — disqualified above.**
+
+**7. FP8 — impossible here.** FP8 tensor cores start at Ada (SM 89). This card is SM 8.6.
+
+### What that adds up to
+
+At the default configuration: graphs 3.5%, plus the q/k/v copies 5.6%, plus GELU 5% if it is
+written by hand — roughly 1.32x to 1.50x. The other two thirds of the forward pass is
+cuBLAS, and beating cuBLAS is not a weekend.
+
+The honest summary is that **CUDA graphs and the q/k/v copies are the whole remaining
+opportunity**, and graphs pay most at exactly the shapes where the attention kernel pays
+least. The usual caveat from [Performance](#performance) applies to the small numbers here:
+these are single-run medians, and differences under ~10% are not evidence. The 4.20x at
+`small` and the 5.6% of copies are well outside that band; the 3.5% graph gain at default is
+not.
+
 ## Reproducing
 
 ```bash
@@ -421,6 +648,7 @@ cmd.exe /c scripts\build_ext.bat     # build once (optional; a plain run builds 
 python scripts\verify_kernel.py      # every kernel, 12 shapes
 python scripts\bench_attention.py    # attention-op table
 python scripts\compare_backends.py   # full harness sweep
+python scripts\sass_mix.py           # SASS instruction mix + occupancy, head_dim 64
 ```
 
 `kernel_ext.py` puts MSVC on `PATH` itself, so none of these need the `devenv.bat`
