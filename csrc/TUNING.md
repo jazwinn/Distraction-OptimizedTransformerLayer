@@ -233,5 +233,11 @@ GEMM-tuning project, not a step in this one.
 
 ## CUDA graph capture gate
 
-See REPORT.md — "The gate is on activation volume, not on tokens" — for the
-sweep behind `_GRAPH_MAX_ACTIVATION`.
+See REPORT.md — "The gate is on activation volume, and it is a measured
+constant" — for the sweep behind `_GRAPH_MAX_ACTIVATION`.
+
+To re-derive it on another machine, `scripts/ab_graph.py --recommend` does the
+sweep and the interpreting; README.md, Setup step 4 walks through reading its
+output. It obeys both rules at the top of this file: candidates are timed
+interleaved in one process, and it carries an eager-vs-eager control row so the
+noise floor is measured rather than assumed.

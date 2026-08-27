@@ -1,7 +1,8 @@
 # Optimizing a Transformer's Attention Layer
 
-A record of the work done on the fused attention kernels in [`csrc/`](csrc/): what was
-built, what broke, and what each fix was actually worth.
+Everything measured, and the record of what was built, what broke, and what each fix was
+actually worth. [README.md](README.md) covers installing, building and how the code works;
+this file covers what it does and how well.
 
 It opens with a plain-language account for readers who don't work with GPUs, then goes into
 the detail of how the kernel was moved onto the tensor cores.
@@ -14,9 +15,11 @@ the detail of how the kernel was moved onto the tensor cores.
 - [Why the harness number looks small](#why-the-harness-number-looks-small)
 - [Accuracy](#accuracy)
 - [Coverage and limits](#coverage-and-limits)
+- [Notes and known limits](#notes-and-known-limits)
 - [CUDA graphs](#cuda-graphs)
 - [What's left](#whats-left)
-- [Reproducing](#reproducing)
+- [Running](#running)
+- [Environment](#environment)
 
 ---
 
@@ -406,6 +409,19 @@ median with no interleaving, and `deep 12L` was measured at both 1.401x and 0.95
 runs. `seq_len 2048` and `seq_len 2048 causal` are well outside that band and agree with the
 attention-op table.
 
+**Where the tensor cores show up.** At `seq_len=2048` the custom backend goes from 1.678x
+with the scalar kernel to 2.270x with the tensor-core one, overtaking SDPA's 1.816x; with
+causal masking, 2.915x to 3.785x against SDPA's 3.124x. Those are the configurations where
+attention is most of the runtime, and they are the ones the kernel was written for.
+
+**The PASS/FAIL verdicts are not a precision ranking.** Three configurations sit on the
+accuracy gate — `causal`, `causal + padded` and `deep 12L` — and which backend passes is
+close to a coin flip. On `deep 12L` over 8 trials, SDPA failed on 1 element of 4.19M, wmma on
+2, and the scalar kernel passed *with the largest `max_abs` of the three* (1.187e-3, against
+wmma's 1.140e-3). The gate is `abs <= atol OR rel <= rtol`, so which elements fail depends on
+where the reference happens to be near zero, not on which kernel rounds more. See
+[Accuracy](#accuracy) and [Notes and known limits](#notes-and-known-limits).
+
 ## Why the harness number looks small
 
 At the default configuration the end-to-end speedup is ~1.05x, which looks underwhelming
@@ -497,6 +513,112 @@ brings the same head_dim down to 35.9 KB. `WmmaShape` now picks the block per he
 Both were worth real speed, not just coverage — at `head_dim=128` the tensor-core kernel
 runs 0.041 ms against the scalar fallback's 0.142 ms, turning a 0.40x loss to SDPA into a
 1.40x win.
+
+## Notes and known limits
+
+**A CUDA graph freezes more than the kernels.** Capture bakes in the kernel chosen for each
+op, the cuBLAS algorithm, `allow_tf32` / matmul precision, and the extension's own runtime
+knobs — `tile_set_split_kv` among them. `ATTENTION_BACKEND` and `ATTENTION_IMPL` are part of
+the graph cache key so changing those re-captures, but the rest are invisible to a key, so
+changing them after the first forward pass is silently ignored by a captured model. In
+particular `verify_split_kv.py`'s trick of flipping the split flag in-process would do nothing
+against one.
+
+**The size gate is a measured constant, and it was measured on one machine.**
+`_GRAPH_MAX_ACTIVATION = 524288` is where replay stopped beating eager on an RTX 3070. The
+crossover is really the point where the GPU stops starving, which depends on the card's
+throughput relative to how fast the host can feed it — so a faster GPU starves at larger
+shapes and wants a *larger* value. `scripts/ab_graph.py --recommend` re-derives it on whatever
+machine it runs on; the procedure is in
+[README.md, Setup step 4](README.md#4-find-the-cuda-graph-gate-value-for-your-machine).
+
+Getting it wrong is cheap either way: too low leaves latency on the table, too high pins
+memory for nothing, and neither can produce a wrong answer, because replay is bit-identical to
+eager at any setting. The gate is on activation volume rather than tokens because tokens
+mispredict — at 512 tokens, `d_model` 256 measured 2.708x and `d_model` 512 measured 1.036x —
+and not on `num_layers` at all, since 3/6/12/24 layers measured
+1.031x/1.037x/1.040x/1.040x at fixed activation volume.
+
+**Static graph inputs have to be normal tensors, not inference tensors.** The harness calls the
+model inside `torch.inference_mode()`, and an inference tensor cannot be updated in place from
+outside inference mode — so a static input buffer allocated there could never be refilled. The
+buffers are allocated under `torch.inference_mode(False)` for that reason, and the capture body
+additionally runs under `torch.no_grad()`: parameters have `requires_grad=True` and the model is
+only `.eval()`ed, so escaping inference mode without it would build an autograd graph during
+capture. Capture itself works fine from inside `inference_mode`; an earlier note claiming
+otherwise was wrong.
+
+**The cuTile kernels crash the interpreter at shutdown.** An access violation (`0xC0000005`),
+raised *after* `main()` has returned its exit code, so a run looks like it passed and then
+reports a nonzero status. It is unrelated to CUDA graphs — it reproduces with `--cuda-graph
+off` — and `scripts/verify_split_kv.py` already exits this way. `scripts/verify_graph.py`
+therefore leaves the tile impls behind `--include-tile` so its own exit code stays meaningful.
+Not yet diagnosed.
+
+**The accuracy budget is tighter than it looks.** The baseline's *own* TF32 rounding sits
+9.8e-4 (non-causal) to 1.2e-3 (causal) away from an exact fp32 result — at or above
+`atol=0.001`. Since the harness compares against the baseline's rounded output rather than
+ground truth, being *more* mathematically correct does not help. Only closeness to the
+baseline's specific rounding does. This is why restructuring GEMM order (for example fusing
+Q/K/V into one matmul) can fail the gate while being no less correct: it was measured to
+push `max_abs` from 9.9e-4 to 1.12e-3.
+
+**fp16 / bf16 are not winnable.** The bf16 baseline sits 6.1e-2 from exact fp32, with
+153,627 of 524,288 elements failing the tolerance test *for a mathematically perfect
+implementation*. No restructured attention can pass at those dtypes; the limit is the
+harness's tolerance versus the baseline's own noise, not the kernel.
+
+**The tile kernel is accuracy-first, not speed-first, on Ampere.** `csrc/tile_attention.cu`
+is the same FlashAttention math expressed per *block* rather than per *thread*: tiles are
+fixed-size arrays the whole block owns, `ct::matmul` is a matrix multiply of two of them,
+and register allocation, the load schedule, bank-conflict avoidance and intra-block
+synchronisation are the compiler's job. There is no `threadIdx` in the file. Two things cap
+its speed on an RTX 3070, and neither is the model's fault:
+
+- `ct::matmul` takes no rounding-mode argument: it dispatches purely on operand element
+  type, and no tensor core does a true fp32 MMA. So `--attn-impl tile` — float operands —
+  runs on the fp32 CUDA cores by construction. That is why it is the *most* accurate kernel
+  here (~1e-6 versus ~1e-3) and the slowest. Narrowing the operands is the only lever, and
+  both narrow modes pull it: `tile-tf32` reaches the tensor cores at wmma's own precision,
+  `tile-bf16` goes further to 8 mantissa bits (~4e-3, enough to fail the accuracy gate on
+  all but one measured config). bfloat16 and TF32 are the two narrow types cuTile
+  accumulates into `float`; `__half` accumulates into `__half`, which attention cannot use.
+
+  Reaching TF32 needed only `#include <cuda_tf32.h>`. `crt/cuda_tile.h` has no `#include`
+  lines at all — it forward-declares `__half`, `__nv_bfloat16`, `__nv_fp8_*` and `__nv_tf32`
+  and leaves completing them to the caller, exactly as this kernel already did for bf16. An
+  earlier version of this claimed CUDA 13.3 does not define `__nv_tf32`; it does, in
+  `include/cuda_tf32.h`. Confirm which units a mode got with
+  `cuobjdump -sass build/tile_attention.cuda.o | grep HMMA`: fp32 kernels contain none.
+- The TMA hardware the tile model is designed around is Blackwell-only; on Ampere the
+  loads fall back to software-managed async copies.
+
+Block shape matters far more here than in the hand-written kernels, and not smoothly: the
+kernel keeps Q, O, K, V and the score tile live at once, and past a footprint threshold the
+compiler spills and the cost jumps an order of magnitude. At `head_dim=64`, `BLOCK_N=16`
+runs at 1.5 ms where `BLOCK_N=32` runs at 10.9 ms. The per-`head_dim` shapes in `BlockCfg`
+were measured on SM 8.6 and are worth re-measuring on another architecture; the tables are in
+[`csrc/TUNING.md`](csrc/TUNING.md).
+
+**Tensor cores did not cost precision the way an earlier note predicted.** The worry was
+that TF32 fragments would push the kernel away from the baseline. On the attention op the
+opposite holds: because the harness runs the baseline with TF32 on, the tensor-core kernel
+lands about 2x *closer* to it than the scalar kernel does (6.4e-5 vs 2.1e-4 at `seq2048`,
+3.7e-4 vs 7.1e-4 at the default shape). End to end that does not translate — over 12
+accuracy trials the scalar kernel peaked at `max_abs` 7.7e-4 and the tensor-core kernel at
+8.7e-4 — but it does not reverse either.
+
+**Three configurations sit on the accuracy gate, and which backend passes is close to
+chance.** `causal`, `causal + padded` and `deep 12L` all fail intermittently, by one or two
+elements out of hundreds of thousands to millions, at `max_abs` ~1.0-1.2e-3 against
+`atol=1e-3`. This is not specific to the custom kernels: plain `--attn-backend sdpa` fails
+`causal` and `deep 12L` too. Measured directly on `causal + padded` over 8 seeds, the custom
+kernel failed 2 and stock SDPA failed 2 — while the **baseline compared against itself with
+TF32 disabled** failed all 8, by up to 1.566e-3. The reference the harness grades against is
+further from exact arithmetic than the tolerance allows, which is the whole of the effect.
+
+`--no-allow-tf32 --matmul-precision highest` removes the TF32 rounding from both sides and
+the margin returns.
 
 ## CUDA graphs
 
@@ -783,24 +905,39 @@ process and prints an eager-vs-eager control row, which put the noise floor at �
 1.029x at default sits just above it rather than inside it. The harness's own single-run
 median cannot see that effect at all.
 
-## Reproducing
+## Running
+
+### The benchmark harness
 
 ```bash
-cmd.exe /c scripts\build_ext.bat     # build once (optional; a plain run builds too)
-python scripts\verify_kernel.py      # every kernel, 12 shapes
-python scripts\bench_attention.py    # attention-op table
-python scripts\compare_backends.py   # full harness sweep
-python scripts\sass_mix.py           # SASS instruction mix + occupancy, head_dim 64
+python torch_transformer_benchmark.py
 ```
 
-`kernel_ext.py` puts MSVC on `PATH` itself, so none of these need the `devenv.bat`
-prefix any more.
+Runs the accuracy check first and **skips benchmarking entirely if it fails** (exit code 2),
+so a passing speedup number always means a correct implementation.
 
-A third kernel now sits alongside the two this document describes:
-[`csrc/tile_attention.cu`](csrc/tile_attention.cu) is the same FlashAttention math
-written against the CUDA tile programming model rather than per-thread. It is selected
-with `--attn-impl tile`, needs CUDA 13.3+, and is documented in the README under
-[Notes and known limits](README.md#notes-and-known-limits).
+Useful flags — the graders sweep these:
+
+```bash
+python torch_transformer_benchmark.py --seq-len 2048 --batch-size 1 --causal
+```
+
+`--batch-size --seq-len --d-model --heads --ffn-dim --layers --causal --dtype
+--padding-ratio --input-scale --atol --rtol`
+
+`--cuda-graph {off,auto,always}` controls CUDA graph capture, `auto` by default. `always`
+ignores the size gate and exists so `scripts/ab_graph.py` can measure the shapes `auto`
+declines; it is not for benchmark runs. Replay is bit-identical to eager, so this is purely a
+latency switch — see [CUDA graphs](#cuda-graphs).
+
+To use the CUDA kernel, run through `devenv.bat` so the build can find `cl.exe`:
+
+```bash
+cmd.exe /c scripts\devenv.bat python torch_transformer_benchmark.py
+```
+
+Use `--attn-backend custom` rather than the default `auto` when timing the kernel: it raises
+if the extension fails to load, instead of silently falling back to SDPA and looking slow.
 
 To see the kernel rather than the FFN, benchmark where attention dominates:
 
@@ -808,12 +945,102 @@ To see the kernel rather than the FFN, benchmark where attention dominates:
 python torch_transformer_benchmark.py --seq-len 2048 --batch-size 1 --attn-backend custom
 ```
 
-Use `--attn-backend custom` rather than the default `auto`: it raises if the extension
-fails to load instead of silently falling back to SDPA and looking slow.
+### Choosing the attention backend
+
+Edit `ATTENTION_BACKEND` near the top of
+[`torch_transformer_benchmark.py`](torch_transformer_benchmark.py), or pass `--attn-backend`
+for a single run:
+
+| Value | Behavior |
+| --- | --- |
+| `auto` | Use the CUDA kernel if it loads, otherwise fall back to SDPA with a one-time notice. |
+| `sdpa` | Always use `F.scaled_dot_product_attention`. No build required. |
+| `custom` | Require the CUDA kernel; raise if it is unavailable, so a broken build fails loudly instead of quietly benchmarking the fallback and looking slow. |
+
+### Choosing the kernel inside the custom backend
+
+`ATTENTION_IMPL` (or `--attn-impl` for one run) picks which of the custom kernels handles
+attention:
+
+| Value | Behavior |
+| --- | --- |
+| `auto` | Tensor-core kernel where it applies, scalar kernel otherwise. |
+| `scalar` | Force the scalar kernel. No tensor cores, no TF32 rounding. |
+| `wmma` | Force the tensor-core kernel; raises on shapes it does not cover, so a silent fallback cannot be mistaken for a slow kernel. |
+| `tile` | Force the cuTile kernel — the same math written against the CUDA tile programming model instead of per-thread. float32, `head_dim` in {8,16,32,64}. Raises rather than falling back. |
+| `tile-tf32` | The same cuTile kernel with its two GEMMs narrowed to TF32, which is what puts them on the tensor cores. Same arithmetic `wmma` uses for fp32 inputs and the same ~1e-3 accuracy, so it clears the harness gate wherever `wmma` does. The tensor-core tile mode to reach for first. |
+| `tile-bf16` | As above but narrowed to bfloat16 — 8 mantissa bits. Marginally faster than `tile-tf32` on some shapes and far less accurate; fails the harness gate on most configs. |
+
+The tensor-core kernel covers `head_dim` 8, 16, 32, 64 and 128 in float32, float16 and
+bfloat16, on compute capability 8.0 and up — every head_dim the harness can produce, since
+`d_model` is divisible by `num_heads`. Nothing falls through to ATen any more.
+
+Neither tile mode is ever chosen by `auto`: they are a separate programming model whose
+performance you should opt into deliberately. They need a build that found CUDA 13.3+;
+without one, `--attn-impl tile` raises instead of silently running something else. See
+[Notes and known limits](#notes-and-known-limits) for why plain `tile` is the most accurate
+and the slowest kernel here.
+
+### Helper scripts
+
+| Script | Purpose |
+| --- | --- |
+| `scripts/verify_kernel.py` | Every kernel vs. reference vs. SDPA across 12 shapes. Fails fast and names the shape that broke. |
+| `scripts/verify_split_kv.py` | Checks the tile kernel's split-KV path against its own single-pass path, and asserts the split actually fired. |
+| `scripts/verify_graph.py` | Checks that graph replay is *bit-identical* to eager — tolerance exactly zero — and that the graph actually fired rather than silently declining. `--test-failure` also exercises the capture-failure path; `--include-tile` adds the cuTile impls. |
+| `scripts/bench_attention.py` | Times the attention op alone — scalar vs. tensor-core vs. SDPA — with accuracy alongside, so a speed win bought with precision is visible. |
+| `scripts/compare_backends.py` | Runs the full harness once per backend and prints the comparison table above. Set `COMPARE_FULL=1` for the harness's own accuracy-trial count instead of the trimmed one. |
+| `scripts/ab_split_kv.py` | A/Bs the split-KV path against single-pass, interleaved in one process with a control group. |
+| `scripts/ab_graph.py` | A/Bs eager against graph replay, interleaved with an eager-vs-eager control row for the noise floor. `--recommend` measures the crossover on the machine it runs on and prints the `_GRAPH_MAX_ACTIVATION` to set, refusing to answer if the control rows say the machine is too noisy to trust. |
+| `scripts/tune_tile_tf32.py` | Sweeps the tile kernel's block shapes per mask mode. |
+| `scripts/sass_mix.py` | SASS instruction mix and occupancy for the head_dim 64 kernels. |
+
+`kernel_ext.py` puts MSVC on `PATH` itself, so these do not strictly need the `devenv.bat`
+prefix; it remains for cases that need `cl.exe` before Python starts.
+
+```bash
+cmd.exe /c scripts\devenv.bat python scripts\compare_backends.py
+```
+
+The measurements behind the kernels' block shapes and thresholds — and the two rules every
+one of them follows — are in [`csrc/TUNING.md`](csrc/TUNING.md).
 
 ---
 
-Measured on an RTX 4050 Laptop (SM 8.9), CUDA 13.0, PyTorch 2.12.0+cu132. The GPU is power-
-and thermally capped — `nvidia-smi` reports `SW Power Cap` and `SW Thermal Slowdown` active
-under load, and absolute latencies drift 2–3x across a long session. Every ratio here comes
-from interleaved timings; absolute milliseconds across runs are not comparable.
+## Environment
+
+| | |
+| --- | --- |
+| GPU | NVIDIA GeForce RTX 4050 Laptop, 6 GB, SM 8.9 |
+| Driver | 595.79 |
+| CUDA Toolkit | 13.0 (V13.0.48) |
+| PyTorch | 2.12.0+cu132 |
+| Python | 3.11 |
+| Compiler | MSVC 14.44, pinned via `-vcvars_ver` |
+| OS | Windows 11 |
+
+> **Mixed provenance, not yet reconciled.** The tables above were taken across two machines.
+> The RTX 4050 Laptop in this table is the original development machine. Later work — the
+> tile-kernel comparison, everything in [`csrc/TUNING.md`](csrc/TUNING.md), the split-KV
+> measurements and the whole of [CUDA graphs](#cuda-graphs) — was measured on an **RTX 3070
+> (8 GiB, SM 8.6, 46 SMs, driver 610.47, CUDA 13.3, PyTorch 2.12.0+cu132, Python 3.10.6)**,
+> and those sections say so where it matters. Ratios within one section are internally
+> consistent; ratios or milliseconds drawn across sections are not comparable. One consequence
+> worth flagging: the 4050 is Ada (SM 8.9) and *does* have FP8 tensor cores, so the note in
+> [What's left](#whats-left) calling FP8 unavailable applies to the 3070 only.
+
+The GPU is a power- and thermally-capped laptop part: `nvidia-smi` reports
+`SW Power Cap` and `SW Thermal Slowdown` active under load, and absolute latencies drift by
+2-3x across a long session. Every ratio quoted here therefore comes from timings taken
+*interleaved* — candidates measured round-robin, minimum or best-of-N — so the clock state is
+shared between them. Absolute milliseconds from different runs are not comparable; ratios
+within one run are.
+
+Host load matters more than is comfortable for anything launch-bound, which the
+[CUDA graphs](#cuda-graphs) section covers: a game running in the background moved the default
+config's reported speedup from 1.39x to 2.08x with no code change.
+
+`torch.compile` and Triton are unavailable in this environment (Triton has no working
+Windows build here), which is why the custom-kernel path is C++/CUDA via
+`torch.utils.cpp_extension` rather than Triton — and why CUDA graphs are captured by hand
+rather than through `--compile-mode reduce-overhead`.

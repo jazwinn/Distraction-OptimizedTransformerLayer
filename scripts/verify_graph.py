@@ -52,6 +52,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch_transformer_benchmark as bench  # noqa: E402
+from optimized import config, graphs  # noqa: E402
+
+# The runtime knobs live in optimized/config.py, and the model reads them
+# from there on every call. Setting them on the harness module instead
+# would create a dead attribute that nothing reads -- which is worse than
+# an error here, because both sides of every comparison below would then
+# be the *same* path and every delta would come out zero.
 
 DEV = torch.device("cuda")
 
@@ -131,7 +138,7 @@ def main() -> int:
         # Eager first, with capture switched off entirely. Note this records no
         # denial -- _graph_eligible returns False before _maybe_capture can mark
         # the key -- which is what makes the second pass able to capture.
-        bench.CUDA_GRAPH = "off"
+        config.CUDA_GRAPH = "off"
         with torch.inference_mode():
             eager = opt(x, m).clone()
         if opt._graphs:
@@ -146,7 +153,7 @@ def main() -> int:
         # negative, which is not a number anyone can act on.
         torch.cuda.empty_cache()
         reserved_before = torch.cuda.memory_reserved(DEV)
-        bench.CUDA_GRAPH = "always"
+        config.CUDA_GRAPH = "always"
         with torch.inference_mode():
             graphed = opt(x, m).clone()
         pool_mib = (torch.cuda.memory_reserved(DEV) - reserved_before) / (1 << 20)
@@ -179,7 +186,7 @@ def main() -> int:
 
     # ---------------------------------------------------------------- behaviours
     print("\n=== behaviours that fail silently rather than loudly ===\n")
-    bench.CUDA_GRAPH = "always"
+    config.CUDA_GRAPH = "always"
 
     # 1. Fresh inputs must actually reach the graph. A missing copy_ replays
     #    stale data: finite, right shape, and *identical* every call.
@@ -187,10 +194,10 @@ def main() -> int:
     outs, refs = [], []
     for seed in (1, 2, 3):
         x, m = case_data(cfg, 0.0, seed=seed)
-        bench.CUDA_GRAPH = "off"
+        config.CUDA_GRAPH = "off"
         with torch.inference_mode():
             refs.append(opt(x, m).clone())
-        bench.CUDA_GRAPH = "always"
+        config.CUDA_GRAPH = "always"
         with torch.inference_mode():
             outs.append(opt(x, m).clone())
     ok = all(delta(o, r) == 0.0 for o, r in zip(outs, refs))
@@ -246,10 +253,10 @@ def main() -> int:
     big = torch.randn(2, 64, 1024, device=DEV)
     xs = big[:, :, :512]                        # non-contiguous view
     ms = torch.ones(2, 64, device=DEV, dtype=torch.bool)
-    bench.CUDA_GRAPH = "off"
+    config.CUDA_GRAPH = "off"
     with torch.inference_mode():
         ref_s = opt(xs, ms).clone()
-    bench.CUDA_GRAPH = "always"
+    config.CUDA_GRAPH = "always"
     with torch.inference_mode():
         got_s = opt(xs, ms).clone()
     report("non-contiguous input", not xs.is_contiguous() and delta(got_s, ref_s) == 0.0,
@@ -262,33 +269,33 @@ def main() -> int:
     #    to re-check the sweep.
     cfg, _, opt = build(8, 512, 512, 8, 2048, 6, False)
     xg, mg = case_data(cfg, 0.0, seed=41)
-    bench.CUDA_GRAPH = "auto"
+    config.CUDA_GRAPH = "auto"
     with torch.inference_mode():
         gated = opt(xg, mg).clone()
     declined = len(opt._graphs) == 0
-    bench.CUDA_GRAPH = "off"
+    config.CUDA_GRAPH = "off"
     with torch.inference_mode():
         gated_ref = opt(xg, mg).clone()
     report("auto declines above the size gate",
            declined and delta(gated, gated_ref) == 0.0, failures,
-           f"activation={8 * 512 * 512} vs gate {bench._GRAPH_MAX_ACTIVATION}, "
+           f"activation={8 * 512 * 512} vs gate {config._GRAPH_MAX_ACTIVATION}, "
            f"entries={len(opt._graphs)}, delta={delta(gated, gated_ref):.3e}")
 
     # 7. And a shape under the gate must still be captured, so the decline above
     #    is the gate working rather than something else refusing.
     cfg, _, opt = build(4, 128, 512, 8, 2048, 6, False)
     xh, mh = case_data(cfg, 0.0, seed=42)
-    bench.CUDA_GRAPH = "auto"
+    config.CUDA_GRAPH = "auto"
     with torch.inference_mode():
         opt(xh, mh)
     report("auto captures below the size gate",
            len(opt._graphs) == 1, failures,
-           f"activation={4 * 128 * 512} vs gate {bench._GRAPH_MAX_ACTIVATION}, "
+           f"activation={4 * 128 * 512} vs gate {config._GRAPH_MAX_ACTIVATION}, "
            f"entries={len(opt._graphs)}")
 
     # ------------------------------------------------------- per-impl coverage
     print("\n=== per attention impl ===\n")
-    saved_impl = bench.ATTENTION_IMPL
+    saved_impl = config.ATTENTION_IMPL
     # scalar and wmma are the two impls "auto" can actually select, so they are
     # the ones that matter by default. The cuTile impls are opt-in only because
     # of the shutdown crash noted at the top of this file -- not because they
@@ -297,14 +304,14 @@ def main() -> int:
     if args.include_tile:
         impls += ["tile", "tile-tf32"]
     for impl in impls:
-        bench.ATTENTION_IMPL = impl
+        config.ATTENTION_IMPL = impl
         try:
             cfg, _, opt = build(2, 128, 512, 8, 2048, 6, False)
             xi, mi = case_data(cfg, 0.0, seed=51)
-            bench.CUDA_GRAPH = "off"
+            config.CUDA_GRAPH = "off"
             with torch.inference_mode():
                 ref_i = opt(xi, mi).clone()
-            bench.CUDA_GRAPH = "always"
+            config.CUDA_GRAPH = "always"
             with torch.inference_mode():
                 got_i = opt(xi, mi).clone()
             d_i = delta(got_i, ref_i)
@@ -313,14 +320,14 @@ def main() -> int:
                    f"delta={d_i:.3e}, captured={fired}")
         except Exception as exc:  # noqa: BLE001
             print(f"  SKIP  impl={impl}: unavailable ({type(exc).__name__})")
-    bench.ATTENTION_IMPL = saved_impl
+    config.ATTENTION_IMPL = saved_impl
 
     # ------------------------------------------------------------ failure path
     if args.test_failure:
         print("\n=== capture failure falls back to eager ===\n")
         cfg, _, opt = build(2, 64, 512, 8, 2048, 6, False)
         xf, mf = case_data(cfg, 0.0, seed=61)
-        bench.CUDA_GRAPH = "off"
+        config.CUDA_GRAPH = "off"
         with torch.inference_mode():
             ref_f = opt(xf, mf).clone()
 
@@ -335,8 +342,8 @@ def main() -> int:
             return out
 
         opt._forward_eager = poisoned
-        bench._graph_warned = False
-        bench.CUDA_GRAPH = "always"
+        graphs._graph_warned = False
+        config.CUDA_GRAPH = "always"
         try:
             with torch.inference_mode():
                 got_f = opt(xf, mf).clone()

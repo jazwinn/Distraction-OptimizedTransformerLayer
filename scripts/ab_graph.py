@@ -60,6 +60,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch_transformer_benchmark as bench  # noqa: E402
+from optimized import config  # noqa: E402
+
+# The runtime knobs live in optimized/config.py, and the model reads them
+# from there on every call. Setting them on the harness module instead
+# would create a dead attribute that nothing reads -- which is worse than
+# an error here, because both sides of every comparison below would then
+# be the *same* path and every delta would come out zero.
 
 DEV = torch.device("cuda")
 
@@ -184,14 +191,14 @@ def measure(shape, rounds, iters):
     eager_model, x, m = build(*shape)
     graph_model, _, _ = build(*shape)
 
-    bench.CUDA_GRAPH = "off"
+    config.CUDA_GRAPH = "off"
     with torch.inference_mode():
         for _ in range(5):
             eager_model(x, m)
 
     torch.cuda.empty_cache()
     reserved_before = torch.cuda.memory_reserved(DEV)
-    bench.CUDA_GRAPH = "always"
+    config.CUDA_GRAPH = "always"
     with torch.inference_mode():
         for _ in range(5):
             graph_model(x, m)
@@ -205,11 +212,11 @@ def measure(shape, rounds, iters):
         # equally rather than whichever went first. The second eager timing is
         # the control: identical code to the first, so its ratio against the
         # first is this machine's noise floor and nothing else.
-        bench.CUDA_GRAPH = "off"
+        config.CUDA_GRAPH = "off"
         e1 = time_ms(eager_model, x, m, iters)
-        bench.CUDA_GRAPH = "always"
+        config.CUDA_GRAPH = "always"
         gt = time_ms(graph_model, x, m, iters)
-        bench.CUDA_GRAPH = "off"
+        config.CUDA_GRAPH = "off"
         e2 = time_ms(eager_model, x, m, iters)
 
         best_eager = min(best_eager, e1)
@@ -315,9 +322,20 @@ def recommend(rounds, iters):
 
     print(f"\n  set _GRAPH_MAX_ACTIVATION = {gate}"
           f"{'    # ' + hex(gate) if gate & (gate - 1) else '    # 1 << ' + str(gate.bit_length() - 1)}")
-    print(f"\nin torch_transformer_benchmark.py. That is the largest activation")
+    print(f"\nin optimized/config.py. That is the largest activation")
     print(f"volume whose worse shape still beat eager by more than the noise")
     print(f"floor. Above it, replay measured nothing worth the pinned memory.")
+
+    # How much daylight was there between the winning row and the threshold? A
+    # thin margin is what produces a one-bucket disagreement between runs, and
+    # the reader should know before pasting the number into the source.
+    margin = next(lo for v, lo, _, _ in results if v == gate) - threshold
+    if margin < 0.01:
+        print(f"\nThat was a close call: the winning row cleared the threshold by")
+        print(f"only {margin:.3f}x, so a repeat run could pick the bucket either")
+        print(f"side of it. Re-run with --rounds 9 to settle it, or just take the")
+        print(f"lower value -- capturing slightly less costs a little latency and")
+        print(f"nothing else.")
 
     if smaller:
         print(f"\nNote: {smaller} did NOT clear the threshold despite being smaller,")
@@ -325,10 +343,10 @@ def recommend(rounds, iters):
         print(f"usually means the machine was busier for part of it -- worth a")
         print(f"second run before trusting the number above.")
 
-    if gate == bench._GRAPH_MAX_ACTIVATION:
+    if gate == config._GRAPH_MAX_ACTIVATION:
         print(f"\nThis matches the value already set. Nothing to change.")
     else:
-        cur = bench._GRAPH_MAX_ACTIVATION
+        cur = config._GRAPH_MAX_ACTIVATION
         direction = "larger" if gate > cur else "smaller"
         print(f"\nCurrently set to {cur}, so this machine wants a {direction} gate.")
         print(f"Leaving it as-is is safe either way -- too low costs some latency,")
@@ -339,7 +357,12 @@ def recommend(rounds, iters):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--rounds", type=int, default=3)
+    # Default deferred so --recommend can ask for more rounds than the browsing
+    # tables need. It has to: at 2 rounds --recommend returned 262144 and at 5 it
+    # returned 524288 on the same machine, one bucket apart. A tuning run happens
+    # once and its answer gets written into the source, so it is the wrong place
+    # to economise on samples.
+    ap.add_argument("--rounds", type=int, default=None)
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--axis",
                     choices=("all", "tokens", "depth", "width", "product"),
@@ -354,14 +377,16 @@ def main() -> int:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
+    rounds = args.rounds if args.rounds is not None else (5 if args.recommend else 3)
+
     if args.recommend:
         # --recommend prints its own header and does the interpreting itself, so
         # the "read the crossover off the table" preamble below would only be
         # telling the reader to do a job the script is about to do for them.
-        return recommend(args.rounds, args.iters)
+        return recommend(rounds, args.iters)
 
-    print(f"rounds={args.rounds} iters={args.iters}  "
-          f"_GRAPH_MAX_ACTIVATION={bench._GRAPH_MAX_ACTIVATION} -- not applied "
+    print(f"rounds={rounds} iters={args.iters}  "
+          f"_GRAPH_MAX_ACTIVATION={config._GRAPH_MAX_ACTIVATION} -- not applied "
           f"here: this script forces capture with CUDA_GRAPH='always' so the "
           f"shapes auto declines can still be measured. To have the crossover "
           f"read off for you and turned into a value to set, use --recommend.")
@@ -370,17 +395,17 @@ def main() -> int:
           "floor, and nothing closer to 1 than that is a result.")
 
     if args.axis in ("all", "tokens"):
-        run_axis("tokens (batch x seq)", TOKEN_AXIS, args.rounds, args.iters,
+        run_axis("tokens (batch x seq)", TOKEN_AXIS, rounds, args.iters,
                  lambda sh: f"b{sh[0]} s{sh[1]}")
     if args.axis in ("all", "depth"):
-        run_axis("depth (layers, tokens fixed at 512)", DEPTH_AXIS, args.rounds,
+        run_axis("depth (layers, tokens fixed at 512)", DEPTH_AXIS, rounds,
                  args.iters, lambda sh: f"{sh[5]} layers")
     if args.axis in ("all", "width"):
-        run_axis("width (d_model, tokens fixed at 512)", WIDTH_AXIS, args.rounds,
+        run_axis("width (d_model, tokens fixed at 512)", WIDTH_AXIS, rounds,
                  args.iters, lambda sh: f"d_model {sh[2]}")
     if args.axis in ("all", "product"):
         run_axis("tokens x d_model held constant in pairs", PRODUCT_AXIS,
-                 args.rounds, args.iters,
+                 rounds, args.iters,
                  lambda sh: f"{sh[0]*sh[1]}tok d{sh[2]} = {sh[0]*sh[1]*sh[2]}")
 
     return 0

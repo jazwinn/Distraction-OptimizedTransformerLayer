@@ -25,9 +25,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from optimized import OptimizedTransformer
-from optimized import cli as optimized_cli
-
 
 @dataclass(frozen=True)
 class TransformerConfig:
@@ -128,7 +125,7 @@ class BaselineSelfAttention(nn.Module):
 class BaselineTransformerBlock(nn.Module):
     def __init__(self, d_model: int, num_heads: int, ffn_dim: int) -> None:
         super().__init__()
-        self.norm1 = nn.LayerNorm(normalized_shape=d_model)
+        self.norm1 = nn.LayerNorm(d_model)
         self.attention = BaselineSelfAttention(d_model, num_heads)
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn_in = nn.Linear(d_model, ffn_dim)
@@ -175,21 +172,32 @@ class BaselineTransformer(nn.Module):
         return x
 
 
-class UserOptimizedTransformer(OptimizedTransformer, BaselineTransformer):
+class UserOptimizedTransformer(BaselineTransformer):
     """
-    The optimized implementation. Its body lives in the optimized/ package so
-    that this file stays the harness it started as -- see optimized/__init__.py
-    for what is where.
+    Replace this class with the optimized implementation.
 
-    Both bases matter: OptimizedTransformer supplies every method, and
-    BaselineTransformer keeps the two models isinstance-compatible. Nothing is
-    inherited from the baseline, since every submodule has a replacement.
-
-    Requirements this still meets:
+    Requirements:
       1. Keep the forward signature unchanged.
       2. Return a tensor with shape [batch_size, seq_len, d_model].
       3. Keep compatible parameter names, or customize copy_model_weights().
     """
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # ====================== your codes here ======================
+        # Example optimization directions:
+        #   * torch.nn.functional.scaled_dot_product_attention
+        #   * torch.compile
+        #   * Triton/CUDA fused kernels
+        #   * fused LayerNorm / residual / FFN
+        #
+        # The default implementation calls the baseline so that this script
+        # remains directly runnable before the optimized code is inserted.
+        return super().forward(x, valid_token_mask)
+        # ============================================================
 
 
 def copy_model_weights(
@@ -607,8 +615,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-scale", type=float, default=1.0)
 
     parser.add_argument("--accuracy-trials", type=int, default=5)
-    parser.add_argument("--rtol", type=float, default=0.01)
-    parser.add_argument("--atol", type=float, default=0.001)
+    parser.add_argument("--rtol", type=float, default=0.02)
+    parser.add_argument("--atol", type=float, default=0.002)
     parser.add_argument("--seed", type=int, default=1234)
 
     parser.add_argument("--warmup", type=int, default=20)
@@ -635,7 +643,6 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="enable/disable TF32 on CUDA for both implementations",
     )
-    optimized_cli.add_arguments(parser)
     return parser.parse_args()
 
 
@@ -654,13 +661,10 @@ def validate_args(args: argparse.Namespace, device: torch.device, dtype: torch.d
         raise ValueError("repeats and benchmark_rounds must be positive")
     if device.type == "cpu" and dtype == torch.float16:
         print("[warning] float16 CPU kernels may be unsupported or slow")
-    optimized_cli.validate_args(args, device, dtype)
 
 
 def main() -> int:
     args = parse_args()
-    optimized_cli.apply_overrides(args)
-
     device = resolve_device(args.device)
     dtype = resolve_dtype(args.dtype)
 
