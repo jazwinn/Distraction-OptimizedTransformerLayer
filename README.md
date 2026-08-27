@@ -4,10 +4,16 @@ An optimized Transformer layer for **TikTok TechJam 2026, Problem Statement 3** 
 standard Transformer layer with custom GPU kernels while staying inside a strict
 per-element accuracy budget.
 
-The work is in `UserOptimizedTransformer` and the modules it builds on, all inside
-[`torch_transformer_benchmark.py`](torch_transformer_benchmark.py). Attention runs through
-one of two interchangeable backends: PyTorch's `scaled_dot_product_attention`, or a
-hand-written fused CUDA kernel in [`csrc/fused_attention.cu`](csrc/fused_attention.cu).
+The work lives in the [`optimized/`](optimized/) package, which
+[`torch_transformer_benchmark.py`](torch_transformer_benchmark.py) mixes into
+`UserOptimizedTransformer` — the harness file itself stays close to the one that was issued,
+so the diff against it is readable. `optimized/model.py` holds the forward pass,
+`optimized/layers.py` its submodules, `optimized/kernels.py` the dispatch into CUDA,
+`optimized/graphs.py` the CUDA-graph machinery, and `optimized/config.py` every runtime knob.
+
+Attention runs through one of two interchangeable backends: PyTorch's
+`scaled_dot_product_attention`, or a hand-written fused CUDA kernel in
+[`csrc/fused_attention.cu`](csrc/fused_attention.cu).
 
 The custom backend has two kernels behind it. The default one runs both of attention's
 matrix multiplies — `Q @ K^T` and `P @ V` — on the GPU's tensor cores through
@@ -125,7 +131,7 @@ cmd.exe /c scripts\devenv.bat python scripts\verify_graph.py
 ### 4. Find the CUDA-graph gate value for your machine
 
 CUDA graph capture is **on by default**, and how widely it applies is decided by one
-constant in [`torch_transformer_benchmark.py`](torch_transformer_benchmark.py):
+constant in [`optimized/config.py`](optimized/config.py):
 
 ```python
 _GRAPH_MAX_ACTIVATION = 1 << 19    # 524288
@@ -206,8 +212,8 @@ Every run needs the prefix, because `torch.utils.cpp_extension.load()` probes fo
 compiler before it will even check whether a rebuild is needed. To make a missing kernel a
 hard error rather than a silent fallback, use `--attn-backend custom`.
 
-To use SDPA deliberately and silence the message, set `ATTENTION_BACKEND = "sdpa"` at the
-top of the file.
+To use SDPA deliberately and silence the message, set `ATTENTION_BACKEND = "sdpa"` in
+[`optimized/config.py`](optimized/config.py).
 
 **`'vswhere.exe' is not recognized`** — harmless, printed by `vcvarsall.bat` itself. The
 build succeeds regardless.
@@ -353,9 +359,11 @@ inputs are copied in per call, and a graph is cached per
 `(shape, dtype, device, mask mode, backend, impl)`.
 
 **Custom modules that keep baseline parameter names.** `MyLinear`, `MyLayerNorm`,
-`MySelfAttention`, and `MyTransformerBlock` reuse the baseline's attribute names and
-parameter shapes, so `state_dict` keys line up and strict weight loading works untouched —
-full freedom over `forward`, no custom weight-mapping code.
+`MySelfAttention` and `MyTransformerBlock` in [`optimized/layers.py`](optimized/layers.py)
+reuse the baseline's attribute names and parameter shapes, so `state_dict` keys line up and
+strict weight loading works untouched — full freedom over `forward`, no custom
+weight-mapping code. `UserOptimizedTransformer` inherits from both `OptimizedTransformer` and
+`BaselineTransformer`, which is what keeps the two `isinstance`-compatible for the harness.
 
 ### Why the score matrix is the bottleneck
 
@@ -375,10 +383,10 @@ the time actually goes.
 
 ```
 torch_transformer_benchmark.py            the harness as issued, plus three hooks into optimized/
-torch_transformer_benchmark-template.py   the harness as issued, unmodified, for diffing
 kernel_ext.py                             JIT loader; returns None instead of raising if unavailable
 requirements.txt                          pinned Python dependencies
 
+optimized/__init__.py                     package exports
 optimized/config.py                       the runtime knobs: backend, kernel, CUDA graphs
 optimized/cli.py                          --attn-backend / --attn-impl / --cuda-graph
 optimized/model.py                        OptimizedTransformer: the whole forward pass

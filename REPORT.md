@@ -947,9 +947,8 @@ python torch_transformer_benchmark.py --seq-len 2048 --batch-size 1 --attn-backe
 
 ### Choosing the attention backend
 
-Edit `ATTENTION_BACKEND` near the top of
-[`torch_transformer_benchmark.py`](torch_transformer_benchmark.py), or pass `--attn-backend`
-for a single run:
+Edit `ATTENTION_BACKEND` in [`optimized/config.py`](optimized/config.py), or pass
+`--attn-backend` for a single run:
 
 | Value | Behavior |
 | --- | --- |
