@@ -105,6 +105,21 @@ existing kernel. It costs about four orders of magnitude of accuracy, so it **fa
 grader on four of five configurations** — and passes the fifth, where it is the fastest
 option available. It is opt-in only.
 
+**10. The second wrong diagnosis — a missing `#include`.**
+The tile kernel's fp32 path was documented, in three places, as unable to reach the tensor
+cores because the toolkit "does not define" the TF32 number type. Asked to justify that
+claim, we went looking for the source and found it was never verified — it had been written
+once and then cited by everything downstream, including this report. The type *is* defined,
+in a header nobody was including. The tile headers include nothing at all; they name each
+special number type and leave it to the caller to supply the definition, which this kernel
+already did for bfloat16 and simply never did for TF32.
+
+One line of `#include` turned it on. The result is a mode with **the same accuracy as the
+existing tensor-core kernel** — it is the identical arithmetic — at tensor-core speed, and
+it clears the accuracy gate everywhere that kernel does. The lesson is not about CUDA: a
+plausible explanation, written down once, had been treated as established fact for as long
+as nobody asked where it came from.
+
 ### One diagnosis that was wrong
 
 A configuration with 12 layers fails the accuracy check. The explanation given at the time —
@@ -121,6 +136,7 @@ it.** It was the wrong target.
 | --- | --- | --- | --- |
 | **wmma** (tensor cores) | Fastest overall | ~1 in 1,000 | Everyday use; the default |
 | **tile** (fp32) | Slowest | ~1 in 1,000,000 | When precision matters most |
+| **tile-tf32** | Fast | ~1 in 1,000 | The tile kernel on tensor cores; same accuracy as wmma |
 | **tile-bf16** | Near-fastest | ~1 in 250 | Opt-in; fails the grader on most configs |
 | **scalar** | Middle | ~1 in 1,000,000 | Older cards; a reference to check against |
 

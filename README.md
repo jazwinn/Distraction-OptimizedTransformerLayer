@@ -283,7 +283,8 @@ attention:
 | `scalar` | Force the scalar kernel. No tensor cores, no TF32 rounding. |
 | `wmma` | Force the tensor-core kernel; raises on shapes it does not cover, so a silent fallback cannot be mistaken for a slow kernel. |
 | `tile` | Force the cuTile kernel — the same math written against the CUDA tile programming model instead of per-thread. float32, `head_dim` in {8,16,32,64}. Raises rather than falling back. |
-| `tile-bf16` | The same cuTile kernel with its two GEMMs narrowed to bfloat16, which is what puts them on the tensor cores. 2–3× faster than `tile` and ~4 orders of magnitude less accurate; fails the harness gate on most configs. |
+| `tile-tf32` | The same cuTile kernel with its two GEMMs narrowed to TF32, which is what puts them on the tensor cores. Same arithmetic `wmma` uses for fp32 inputs and the same ~1e-3 accuracy, so it clears the harness gate wherever `wmma` does. The tensor-core tile mode to reach for first. |
+| `tile-bf16` | As above but narrowed to bfloat16 — 8 mantissa bits. Marginally faster than `tile-tf32` on some shapes and ~4 orders of magnitude less accurate; fails the harness gate on most configs. |
 
 The tensor-core kernel covers `head_dim` 8, 16, 32, 64 and 128 in float32, float16 and
 bfloat16, on compute capability 8.0 and up — every head_dim the harness can produce, since
@@ -292,10 +293,10 @@ bfloat16, on compute capability 8.0 and up — every head_dim the harness can pr
 Neither tile mode is ever chosen by `auto`: they are a separate programming model whose
 performance you should opt into deliberately. It needs a build that found CUDA 13.3+ (see
 [Building the CUDA extension](#2-build-the-cuda-extension-optional)); without one,
-`--attn-impl tile` raises instead of silently running something else. On an RTX 3070 it is
-the most accurate of the three (plain fp32 throughout, ~1e-6 against an exact reference,
-versus ~1e-3 for the TF32 tensor-core path) and roughly 1.3-2.5x slower than `wmma` — see
-[Notes and known limits](#notes-and-known-limits) for why.
+`--attn-impl tile` raises instead of silently running something else. On an RTX 3070 plain
+`tile` is the most accurate kernel here (fp32 throughout, ~1e-6 against an exact reference)
+and the slowest; `tile-tf32` trades that for the tensor cores at wmma's ~1e-3 — see
+[Notes and known limits](#notes-and-known-limits).
 
 ### Helper scripts
 
@@ -446,14 +447,21 @@ and register allocation, the load schedule, bank-conflict avoidance and intra-bl
 synchronisation are the compiler's job. There is no `threadIdx` in the file. Two things cap
 its speed on an RTX 3070, and neither is the model's fault:
 
-- CUDA 13.3 forward-declares `__nv_tf32` but does not define it, so a tf32 tile cannot be
-  instantiated and `ct::matmul` on float tiles runs on fp32 CUDA cores rather than the TF32
-  tensor cores `wmma` reaches. That is most of the gap — and also why `tile` is the *most*
-  accurate kernel here, at ~1e-6 versus ~1e-3. `--attn-impl tile-bf16` narrows the operands
-  to bfloat16 instead, which does reach the tensor cores and closes most of the speed gap
-  (2–3×, and faster than `wmma` on some shapes) at ~4e-3 — enough to fail the accuracy gate
-  on all but one measured config. bfloat16 is the only narrow type cuTile accumulates into
-  `float`; `__half` accumulates into `__half`, which attention cannot use.
+- `ct::matmul` takes no rounding-mode argument: it dispatches purely on operand element
+  type, and no tensor core does a true fp32 MMA. So `--attn-impl tile` — float operands —
+  runs on the fp32 CUDA cores by construction. That is why it is the *most* accurate kernel
+  here (~1e-6 versus ~1e-3) and the slowest. Narrowing the operands is the only lever, and
+  both narrow modes pull it: `tile-tf32` reaches the tensor cores at wmma's own precision,
+  `tile-bf16` goes further to 8 mantissa bits (~4e-3, enough to fail the accuracy gate on
+  all but one measured config). bfloat16 and TF32 are the two narrow types cuTile
+  accumulates into `float`; `__half` accumulates into `__half`, which attention cannot use.
+
+  Reaching TF32 needed only `#include <cuda_tf32.h>`. `crt/cuda_tile.h` has no `#include`
+  lines at all — it forward-declares `__half`, `__nv_bfloat16`, `__nv_fp8_*` and `__nv_tf32`
+  and leaves completing them to the caller, exactly as this kernel already did for bf16. An
+  earlier version of this file claimed CUDA 13.3 does not define `__nv_tf32`; it does, in
+  `include/cuda_tf32.h`. Confirm which units a mode got with
+  `cuobjdump -sass build/tile_attention.cuda.o | grep HMMA`: fp32 kernels contain none.
 - The TMA hardware the tile model is designed around is Blackwell-only; on Ampere the
   loads fall back to software-managed async copies.
 

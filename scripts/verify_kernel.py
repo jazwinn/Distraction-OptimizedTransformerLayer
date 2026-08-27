@@ -103,15 +103,22 @@ def timed(fn, iters=30):
 # the reference is a bug rather than rounding. The tensor-core kernel rounds Q,
 # K, P and V to TF32 (10 mantissa bits) before every multiply, exactly as cuBLAS
 # does for the baseline; on unit-scale inputs that is worth ~1e-3.
-# The tile kernel does its matmuls in plain fp32 -- cuTile has no usable tf32
-# tile type in CUDA 13.3 -- so it holds the same budget as the scalar kernel
-# rather than the tensor-core one.
+# The tile kernel does its matmuls in plain fp32, so it holds the same budget
+# as the scalar kernel rather than the tensor-core one.
+# tile-tf32 rounds the same operands the wmma kernel does to the same 10
+# mantissa bits, so it gets the same budget.
 # tile-bf16 narrows both GEMM operands to bfloat16 (8 significand bits), so
-# its budget is an order of magnitude looser than the tf32 path's, not tighter.
+# its budget is an order of magnitude looser than the tf32 paths', not tighter.
+# Impls that raise on a case they do not cover rather than falling back, so a
+# raise from one of these is coverage rather than a failure. Everything in
+# IMPLS except the scalar kernel, which has always fallen back silently.
+DECLINING_IMPLS = frozenset({2, 3, 4, 5})
+
 IMPLS = (
     (1, "scalar", 5e-6),
     (2, "wmma", 3e-3),
     (3, "tile", 5e-6),
+    (5, "tile-tf32", 3e-3),
     (4, "tile-bf16", 3e-2),
 )
 
@@ -159,7 +166,7 @@ def main() -> int:
                         q, k, v, attn_mask, is_causal, scale, impl
                     )
                 except RuntimeError as exc:
-                    if impl in (2, 3, 4):
+                    if impl in DECLINING_IMPLS:
                         # No tensor-core / tile specialization for this
                         # head_dim (or no tile support in this build). The
                         # scalar row above already covered the case.

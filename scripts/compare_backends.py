@@ -38,8 +38,23 @@ BACKENDS = (
     ("custom scalar", ["--attn-backend", "custom", "--attn-impl", "scalar"]),
     ("custom wmma",   ["--attn-backend", "custom", "--attn-impl", "wmma"]),
     ("custom tile",   ["--attn-backend", "custom", "--attn-impl", "tile"]),
+    ("custom tile-tf32", ["--attn-backend", "custom", "--attn-impl", "tile-tf32"]),
     ("custom tile-bf16", ["--attn-backend", "custom", "--attn-impl", "tile-bf16"]),
 )
+
+# A full sweep is len(CASES) * len(BACKENDS) harness invocations, so restrict the
+# columns when only some are interesting:
+#   COMPARE_BACKENDS="sdpa,custom wmma,custom tile-tf32"
+# Names must match the column labels above; an unknown one is an error rather
+# than a silently empty table.
+_want = os.environ.get("COMPARE_BACKENDS", "").strip()
+if _want:
+    _names = [n.strip() for n in _want.split(",") if n.strip()]
+    _known = {b for b, _ in BACKENDS}
+    _bad = [n for n in _names if n not in _known]
+    if _bad:
+        raise SystemExit(f"unknown backend(s) {_bad}; choose from {sorted(_known)}")
+    BACKENDS = tuple((b, a) for b, a in BACKENDS if b in _names)
 
 
 # The harness is re-entered once per (config, backend); its own defaults spend

@@ -200,16 +200,23 @@ ATTENTION_BACKEND = "auto"
 #             tile programming model instead of per-thread. float32 and
 #             head_dim in {8,16,32,64} only, and needs a build that found
 #             CUDA 13.3+. Never picked by "auto" -- opt in deliberately.
+#   "tile-tf32"
+#             the same cuTile kernel with its two GEMMs narrowed to tf32, which
+#             is what puts them on the tensor cores. tf32 keeps fp32's exponent
+#             range and 10 of its 23 mantissa bits, so this is the same
+#             arithmetic cuBLAS gives the baseline under allow_tf32 (~1e-3):
+#             the tensor-core mode to reach for first.
 #   "tile-bf16"
-#             the same cuTile kernel with its two GEMMs narrowed to bfloat16,
-#             which is what puts them on the tensor cores. Faster than "tile"
-#             and far less accurate (~4e-3 vs ~1e-6); expect it to fail the
-#             accuracy gate on configs that "tile" passes.
+#             as above but narrowed to bfloat16, 8 mantissa bits. Slightly
+#             faster than tile-tf32 on some shapes and far less accurate
+#             (~4e-3); expect it to fail the accuracy gate on configs that
+#             "tile" passes.
 #
 # (--attn-impl overrides this for a single run.)
 ATTENTION_IMPL = "auto"
 
-_IMPL_CODE = {"auto": 0, "scalar": 1, "wmma": 2, "tile": 3, "tile-bf16": 4}
+_IMPL_CODE = {"auto": 0, "scalar": 1, "wmma": 2, "tile": 3, "tile-bf16": 4,
+              "tile-tf32": 5}
 
 _fallback_warned = False
 
@@ -887,7 +894,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--attn-impl",
-        choices=("auto", "scalar", "wmma", "tile", "tile-bf16"),
+        choices=("auto", "scalar", "wmma", "tile", "tile-bf16", "tile-tf32"),
         default=None,
         help="override ATTENTION_IMPL for this run only: which kernel inside "
              "the custom extension runs attention",

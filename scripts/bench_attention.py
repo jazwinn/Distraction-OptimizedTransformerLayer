@@ -67,8 +67,19 @@ def main() -> int:
     # kernels have to match.
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    head = (f"{'case':<18}{'sdpa':>8}{'scalar':>8}{'wmma':>8}{'tile':>8}"
-            f"{'wmma/sdpa':>11}{'tile/sdpa':>11}{'wmma err':>10}{'tile err':>10}")
+    # Tile modes are optional columns: each raises rather than falling back on
+    # a shape it does not specialize (head_dim 128 in this table), and the whole
+    # tile kernel is absent from builds that found no CUDA 13.3+. Both show as
+    # n/a. Kept as a list so a new math mode is one entry, not another set of
+    # hand-written column branches.
+    TILE_COLS = (("tile", 3), ("tile-tf32", 5), ("tile-bf16", 4))
+
+    head = (f"{'case':<18}{'sdpa':>10}{'scalar':>10}{'wmma':>10}"
+            + "".join(f"{name:>10}" for name, _ in TILE_COLS)
+            + f"{'wmma/sdpa':>11}"
+            + "".join(f"{name + '/sdpa':>16}" for name, _ in TILE_COLS)
+            + f"{'wmma err':>10}"
+            + "".join(f"{name + ' err':>14}" for name, _ in TILE_COLS))
     print(head)
     print("-" * len(head))
 
@@ -77,49 +88,53 @@ def main() -> int:
                                      torch.device("cuda"), torch.float32)
         scale = d ** -0.5
 
+        def run(impl):
+            return kernels.fused_attention_forward(q, k, v, am, ic, scale, impl)
+
         with torch.inference_mode():
             ref = reference_attention(q, k, v, am, ic, scale).float()
-            err_scalar = (kernels.fused_attention_forward(
-                q, k, v, am, ic, scale, 1).float() - ref).abs().max().item()
-            err_wmma = (kernels.fused_attention_forward(
-                q, k, v, am, ic, scale, 0).float() - ref).abs().max().item()
-
-            # impl=3 raises rather than falling back, so a shape it does not
-            # cover has to be caught instead of silently timed as something
-            # else. head_dim 128 is the case in this table.
-            try:
-                err_tile = (kernels.fused_attention_forward(
-                    q, k, v, am, ic, scale, 3).float() - ref).abs().max().item()
-            except RuntimeError:
-                err_tile = None
+            err_scalar = (run(1).float() - ref).abs().max().item()
+            err_wmma = (run(0).float() - ref).abs().max().item()
 
             timed = {
                 "sdpa": lambda: F.scaled_dot_product_attention(
                     q, k, v, attn_mask=am, is_causal=ic, scale=scale),
-                "scalar": lambda: kernels.fused_attention_forward(
-                    q, k, v, am, ic, scale, 1),
-                "wmma": lambda: kernels.fused_attention_forward(
-                    q, k, v, am, ic, scale, 0),
+                "scalar": lambda: run(1),
+                "wmma": lambda: run(0),
             }
-            if err_tile is not None:
-                timed["tile"] = lambda: kernels.fused_attention_forward(
-                    q, k, v, am, ic, scale, 3)
+            errs = {}
+            for name, impl in TILE_COLS:
+                try:
+                    errs[name] = (run(impl).float() - ref).abs().max().item()
+                except RuntimeError:
+                    errs[name] = None
+                    continue
+                # Bind impl per iteration; a bare closure over the loop
+                # variable would time the last mode under every name.
+                timed[name] = (lambda i: lambda: run(i))(impl)
             t = bench(timed)
 
-        tile_ms = f"{t['tile']:>8.3f}" if err_tile is not None else f"{'n/a':>8}"
-        tile_ratio = (f"{t['sdpa'] / t['tile']:>10.2f}x" if err_tile is not None
-                      else f"{'-':>11}")
-        tile_err = f"{err_tile:>10.1e}" if err_tile is not None else f"{'-':>10}"
-        print(f"{label:<18}{t['sdpa']:>8.3f}{t['scalar']:>8.3f}{t['wmma']:>8.3f}"
-              f"{tile_ms}{t['sdpa'] / t['wmma']:>10.2f}x{tile_ratio}"
-              f"{err_wmma:>10.1e}{tile_err}")
+        def cell(name, width, fmt):
+            return (f"{fmt(name):>{width}}" if errs[name] is not None
+                    else f"{'n/a':>{width}}")
+
+        print(f"{label:<18}{t['sdpa']:>10.3f}{t['scalar']:>10.3f}{t['wmma']:>10.3f}"
+              + "".join(cell(n, 10, lambda n=n: f"{t[n]:.3f}") for n, _ in TILE_COLS)
+              + f"{t['sdpa'] / t['wmma']:>10.2f}x"
+              + "".join(cell(n, 16, lambda n=n: f"{t['sdpa'] / t[n]:.2f}x")
+                        for n, _ in TILE_COLS)
+              + f"{err_wmma:>10.1e}"
+              + "".join(cell(n, 14, lambda n=n: f"{errs[n]:.1e}")
+                        for n, _ in TILE_COLS))
 
     print("-" * len(head))
     print("ratios >1 mean the custom kernel is faster than sdpa. wmma now "
           "covers every")
-    print("head_dim in the table; the tile column reports n/a at head_dim 128, "
-          "which it")
-    print("does not specialize.")
+    print("head_dim in the table; the tile columns report n/a at head_dim 128, "
+          "which they")
+    print("do not specialize. tile runs on the CUDA cores; tile-tf32 and "
+          "tile-bf16 are the")
+    print("same kernel with its GEMM operands narrowed onto the tensor cores.")
     return 0
 
 

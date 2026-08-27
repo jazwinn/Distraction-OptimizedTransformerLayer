@@ -805,6 +805,7 @@ enum class Impl : int64_t {
     Wmma     = 2,
     Tile     = 3,   // cuTile, fp32 operands -- CUDA cores,   ~1e-6
     TileBf16 = 4,   // cuTile, bf16 operands -- tensor cores, ~4e-3
+    TileTf32 = 5,   // cuTile, tf32 operands -- tensor cores, ~1e-3
 };
 
 const char* impl_name(Impl impl) {
@@ -814,6 +815,7 @@ const char* impl_name(Impl impl) {
         case Impl::Wmma:     return "wmma";
         case Impl::Tile:     return "tile";
         case Impl::TileBf16: return "tile-bf16";
+        case Impl::TileTf32: return "tile-tf32";
     }
     return "?";
 }
@@ -877,8 +879,8 @@ bool launch_tile(const AttnArgs& a, tile_attn::MathMode math) {
                 a.q.scalar_type());
     TORCH_CHECK(tile_attn::supports(math),
                 "fused_attention_forward: this build has no tile kernel for that "
-                "math mode. tf32 needs a CUDA toolkit that defines __nv_tf32, "
-                "plus -DTILE_HAVE_TF32; see csrc/tile_attention.h.");
+                "math mode. tf32 needs a toolkit shipping <cuda_tf32.h> (CUDA "
+                "13.3+); see csrc/tile_attention.h.");
     return tile_attn::launch(
         a.q.const_data_ptr<float>(), a.k.const_data_ptr<float>(),
         a.v.const_data_ptr<float>(), a.mask_ptr, a.ms,
@@ -896,6 +898,7 @@ bool run_kernel(Impl impl, const AttnArgs& a) {
         case Impl::Wmma:     return launch_wmma(a);
         case Impl::Tile:     return launch_tile(a, tile_attn::MathMode::Fp32);
         case Impl::TileBf16: return launch_tile(a, tile_attn::MathMode::Bf16);
+        case Impl::TileTf32: return launch_tile(a, tile_attn::MathMode::Tf32);
         // Tile is deliberately absent here: it covers only float32 and is a
         // separate programming model whose performance the caller should opt
         // into deliberately rather than inherit.
@@ -970,9 +973,9 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
                                       bool is_causal,
                                       double scale,
                                       int64_t impl) {
-    TORCH_CHECK(impl >= 0 && impl <= 4,
+    TORCH_CHECK(impl >= 0 && impl <= 5,
                 "fused_attention_forward: impl must be 0 (auto), 1 (scalar), "
-                "2 (wmma), 3 (tile) or 4 (tile-bf16)");
+                "2 (wmma), 3 (tile), 4 (tile-bf16) or 5 (tile-tf32)");
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(),
                 "fused_attention_forward: q/k/v must be CUDA tensors");
     TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
@@ -1025,7 +1028,7 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
         // inconsistency rather than a decision -- it can time ATen and label it
         // "scalar" -- but changing it is a behaviour change, not a cleanup.
         TORCH_CHECK(mode != Impl::Wmma && mode != Impl::Tile &&
-                        mode != Impl::TileBf16,
+                        mode != Impl::TileBf16 && mode != Impl::TileTf32,
                     "fused_attention_forward: impl=", impl, " (", impl_name(mode),
                     ") does not cover dtype=", qc.scalar_type(),
                     ", head_dim=", head_dim, " on compute capability ",
