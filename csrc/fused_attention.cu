@@ -4,39 +4,26 @@
 // memory. K/V are streamed through shared memory a tile at a time and the
 // softmax is accumulated online (running max + running sum).
 //
-// Two implementations of the same math:
+// Three implementations of the same math:
 //
-//   wmma   -- tensor-core path. Both GEMMs (Q@K^T and P@V) run on the MMA
-//             units via nvcuda::wmma, 64 queries x 32 keys per block, 4 warps.
-//             fp32 inputs go through TF32 fragments with fp32 accumulate,
-//             which is exactly what cuBLAS does for the baseline's matmuls
-//             when torch.backends.cuda.matmul.allow_tf32 is on (the harness
-//             default), so this path is *closer* to the reference than the
-//             scalar one, not further. half/bfloat16 use native 16x16x16
-//             fragments. Needs SM 8.0+ and head_dim in {8,16,32,64,128}.
-//             head_dim 8 is narrower than the 16-wide fragment, so it is
-//             widened to 16 with zeros inside the kernel; head_dim 128 uses a
-//             32x16 block to stay inside the 48 KB shared-memory budget.
+//   wmma    tensor cores via nvcuda::wmma, 64 queries x 32 keys per block, 4
+//           warps. fp32 goes through TF32 fragments with fp32 accumulate --
+//           what cuBLAS does for the baseline under allow_tf32, so this path is
+//           *closer* to the reference than the scalar one, not further.
+//           half/bfloat16 use native 16x16x16 fragments. SM 8.0+, head_dim in
+//           {8,16,32,64,128}.
 //
-//   scalar  -- one thread per query row, plain fp32 FMA. No tensor cores, so
-//             no TF32 rounding at all. It is the pre-Ampere path and the
-//             exact-arithmetic reference for A/B comparison (impl=1); wmma now
-//             covers every head_dim the scalar kernel does.
+//   scalar  one thread per query row, plain fp32 FMA. No tensor cores and no
+//           TF32 rounding, so it is the pre-Ampere path and the exact-arithmetic
+//           reference for A/B comparison (impl=1). head_dim in {8,16,32,64}.
 //
-//   tile    -- the same FlashAttention math written against the CUDA tile
-//             programming model (cuTile) instead of per-thread. Lives in
-//             tile_attention.cu, which is a separate translation unit because
-//             it needs -std=c++20 and -enable-tile. float32 and head_dim in
-//             {8,16,32,64} only. Present only when the build found CUDA 13.3+,
-//             otherwise it declines and the caller falls back.
+//   tile    the same math on the CUDA tile programming model, in
+//           tile_attention.cu -- a separate translation unit because it needs
+//           -std=c++20 -enable-tile. float32 and head_dim in {8,16,32,64}, and
+//           only when the build found CUDA 13.3+. impl=3/4/5 select fp32, bf16
+//           and tf32 operands; none is picked by impl=0.
 //
-//             Two math modes, same kernel: impl=3 keeps fp32 operands (CUDA
-//             cores, exact, ~1e-6) and impl=4 narrows them to bf16 (tensor
-//             cores, ~2-3x faster, ~4e-3). Neither is picked by impl=0.
-//
-// Coverage: head_dim in {8,16,32,64,128} for wmma and {8,16,32,64} for the
-// scalar and tile kernels, in float/half/bfloat16 (tile is float32 only). A
-// head_dim outside those sets -- 24 or 48, say -- falls back to the ATen
+// A head_dim outside those sets -- 24 or 48, say -- falls back to the ATen
 // implementation at the bottom, which mirrors BaselineSelfAttention.forward
 // exactly. head_dim is a template parameter, so each supported value is a
 // separately compiled kernel and the set cannot be open-ended.
@@ -68,13 +55,12 @@ __global__ void identity_kernel(const float* __restrict__ in,
 // Where row (b, h, i) of the output starts, for either output layout.
 //
 //   out_bshd == false  ->  [B, H, S, D], the natural per-head layout.
-//   out_bshd == true   ->  [B, S, H*D], which is what out_proj consumes. The
-//                          caller would otherwise have to transpose(1,2) and
-//                          reshape the whole tensor, which cannot be a view and
-//                          so costs a full strided repack per layer. Writing it
-//                          here is free: only the destination index changes, and
-//                          the head_dim column stays the fastest-varying axis
-//                          either way, so the stores stay just as coalesced.
+//   out_bshd == true   ->  [B, S, H*D], what out_proj consumes. Otherwise the
+//                          caller pays a transpose(1,2) + reshape, which cannot
+//                          be a view -- a full strided repack per layer. Free
+//                          here: only the destination index changes, and
+//                          head_dim stays the fastest-varying axis either way,
+//                          so the stores stay just as coalesced.
 __device__ __forceinline__ int64_t out_base(bool out_bshd, int b, int h, int i,
                                             int H, int S, int D) {
     const int64_t bi = b;
@@ -511,11 +497,10 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
     //
     // Keeping O in accumulator registers means applying the per-row softmax
     // rescale directly to fragment elements, and the element-to-row mapping is
-    // architecture-defined -- CUDA deliberately does not document it. So probe
-    // it: store a fragment whose elements are tagged with (lane, slot), read
-    // back which position each tag landed in, and invert. One 16x16 tile per
-    // warp, once per block, and it is exact by construction on any device the
-    // kernel compiles for.
+    // architecture-defined -- CUDA does not document it. So probe it: store a
+    // fragment whose elements are tagged with (lane, slot), read back where
+    // each tag landed, and invert. One 16x16 tile per warp, once per block,
+    // exact by construction on any device the kernel compiles for.
     constexpr int ACC_ELEMS = 16 * 16 / 32;
     // Q is already in registers and the first K/V tile has not been staged, so
     // the O/K/V/S span is dead and hosts the probe. s_s alone is not always big
@@ -823,10 +808,10 @@ bool dispatch_wmma(const torch::Tensor& q, const torch::Tensor& k,
 // ---------------------------------------------------------------------------
 // Kernel selection.
 //
-// Every launcher below answers one question: "can you handle this case?" It
-// returns true having launched, or false having done nothing. That keeps the
-// choice of kernel (here) separate from the coverage rules of each kernel
-// (inside it), so the caller is a plain list of preferences.
+// Every launcher below answers "can you handle this case?": true having
+// launched, false having done nothing. That keeps the choice of kernel (here)
+// separate from each kernel's coverage rules (inside it), so the caller is a
+// plain list of preferences.
 // ---------------------------------------------------------------------------
 
 enum class Impl : int64_t {
@@ -911,15 +896,10 @@ bool launch_tile(const AttnArgs& a, tile_attn::MathMode math) {
                 "fused_attention_forward: this build has no tile kernel for that "
                 "math mode. tf32 needs a toolkit shipping <cuda_tf32.h> (CUDA "
                 "13.3+); see csrc/tile_attention.h.");
-    // Scratch for split-KV's per-split partials. Zero on most shapes -- the
-    // launcher only splits the key range when the grid is too small to fill the
-    // device -- so this is usually an empty tensor that is never allocated.
-    //
-    // It comes from torch's caching allocator rather than cudaMalloc because
-    // that allocator is stream-ordered (the kernel below runs on the current
-    // stream, and the buffer is freed to that same stream when `ws` dies) and
-    // because it draws on the pool the benchmark is already accounted against,
-    // instead of quietly competing with it.
+    // Scratch for split-KV's per-split partials, zero on most shapes. From
+    // torch's caching allocator rather than cudaMalloc: it is stream-ordered
+    // (freed to the same stream the kernel runs on when `ws` dies) and it draws
+    // on the pool the benchmark is already accounted against.
     const size_t ws_bytes = tile_attn::workspace_bytes(
         a.B, a.H, a.S, a.head_dim, a.is_causal, math);
     at::Tensor ws;
@@ -994,16 +974,14 @@ torch::Tensor attention_aten(const torch::Tensor& q, const torch::Tensor& k,
 //                                        the next sublayer's skip connection
 //   normed = LayerNorm(x_new) * w + b    what the next sublayer consumes
 //
-// Unfused this is two kernels and five passes over the tensor: the add reads x
-// and sub and writes x_new, then layer_norm reads x_new back and writes normed.
-// Keeping the row sum on chip cuts that to four -- x and sub in, x_new and
-// normed out -- and removes a kernel launch, which at these sizes costs about
-// as much as the bandwidth does.
+// Unfused this is two kernels and five passes over the tensor. Keeping the row
+// on chip cuts that to four -- x and sub in, x_new and normed out -- and
+// removes a launch, which at these sizes costs about as much as the bandwidth.
 //
-// The row lives in shared memory rather than registers so that d_model can stay
-// a runtime value; at 512 floats that is 2 KB per block, nowhere near a limit.
-// Reading it back from shared is also what makes the corrected two-pass
-// statistics free -- see the note on precision inside the kernel.
+// The row lives in shared memory rather than registers so d_model can stay a
+// runtime value; at 512 floats that is 2 KB per block. Reading it back from
+// shared is also what makes the corrected two-pass statistics free -- see the
+// note on precision inside the kernel.
 // ---------------------------------------------------------------------------
 
 // Sum of v across the whole block, broadcast back to every thread. scratch
@@ -1072,20 +1050,16 @@ __global__ void fused_add_layernorm_kernel(const scalar_t* __restrict__ x,
     }
     __syncthreads();
 
-    // Corrected two-pass statistics.
-    //
-    // A plain sum-then-mean is accurate only while the row's mean is small
-    // relative to its spread. Once the activations grow -- a deep residual
-    // stream, or --input-scale turned up -- accumulating D values of magnitude
-    // m into a float loses the low bits, and every (x - mean) inherits that
-    // error while itself being O(spread). Measured against F.layer_norm, which
-    // uses Welford, a naive mean drifted to 1.5e-3 at mean 1e4: past atol on
+    // Corrected two-pass statistics. A plain sum-then-mean is accurate only
+    // while the row's mean is small relative to its spread: once activations
+    // grow (a deep residual stream, or --input-scale up) the sum loses low bits
+    // and every (x - mean) inherits that error. Against F.layer_norm, which
+    // uses Welford, a naive mean drifted to 1.5e-3 at mean 1e4 -- past atol on
     // its own.
     //
-    // So the first mean is treated as an estimate only. The second pass sums
-    // the residuals (x - mean_est), which are O(spread) regardless of how large
-    // the mean is, and their mean is the correction. Same two passes over
-    // shared memory, one extra reduction, no global traffic.
+    // So the first mean is an estimate only, and the second pass sums the
+    // residuals (x - mean_est), which are O(spread) however large the mean is.
+    // One extra reduction over shared memory, no global traffic.
     const float mean_est = block_reduce_sum(local_sum, scratch) / static_cast<float>(D);
 
     float local_c = 0.0f;
@@ -1120,61 +1094,22 @@ __global__ void fused_add_layernorm_kernel(const scalar_t* __restrict__ x,
 // GEMM with a fused bias + GELU epilogue:   C = GELU(A @ W^T + bias)
 //
 //   A     [M, K]  row-major. The layer input, M = batch * seq_len.
-//   W     [N, K]  row-major -- nn.Linear's own weight layout. That makes W^T
+//   W     [N, K]  row-major -- nn.Linear's own weight layout, which makes W^T
 //                 [K, N] column-major with ldm = K, so matrix_b reads it with
-//                 no transpose pass, exactly the trick the attention kernel
-//                 uses for K^T.
+//                 no transpose pass. The trick the attention kernel uses for
+//                 K^T.
 //   bias  [N]
 //   C     [M, N]  row-major.
 //
-// Why fuse the activation rather than the whole FFN: unfused, GELU is its own
-// kernel that reads all M*N of C back out of global memory, applies one cheap
-// function, and writes it again. At [1024, 2048] that is 16 MB of traffic for
-// 2M flops of arithmetic, and it measured 0.046 ms against the GEMM's own
-// 0.133 ms -- a quarter of the pair's cost for none of its work. Folding it
-// into the accumulator before the first store makes it free.
+// 128x128 block tile, 8 warps in a 4x2 grid, each owning a 32x64 quadrant as
+// 2x4 wmma tiles. The tile size is forced by DRAM traffic, not chosen.
 //
-// Block tile is 128x128, and that is forced rather than chosen. Counting only
-// DRAM traffic, a BMxBN tile does BM*BN*K MACs per (BM+BN)*K floads loaded, so
-// 64x64 sustains 32 MAC/float -- against this card's 448 GB/s that caps the
-// kernel at ~7 TFLOPS, less than half of what cuBLAS gets on this shape.
-// 128x128 doubles the ratio to 64 and lifts the cap to ~14 TFLOPS; L2 reuse
-// between blocks sharing a row or column of tiles is what has to make up the
-// rest. 128x256 would be better still and does not fit: its two staging tiles
-// want 55 KB against the 48 KB budget.
-//
-// 8 warps in a 4x2 grid, each owning a 32x64 quadrant as 2x4 wmma tiles.
-//
-// ---------------------------------------------------------------------------
-// MEASURED RESULT: this kernel loses to cuBLAS and is NOT wired into the model.
-//
-// On an RTX 3070, [1024,512]x[512,2048] fp32/tf32:
-//
-//   cuBLAS GEMM alone            0.119 ms   18.1 TFLOPS
-//   cuBLAS GEMM + separate GELU  0.178 ms   12.1 TFLOPS   <- what to beat
-//   this kernel, GELU fused      0.202 ms   10.6 TFLOPS   0.88x -- a loss
-//
-// The fused activation is worth what it was predicted to be worth; the GEMM
-// underneath is not competitive. Folding GELU in removes ~25% of the unfused
-// pair's cost, which cannot cover a 1.7x deficit on the multiply itself. The
-// same holds at every shape the model uses -- 0.48x to 0.82x of cuBLAS,
-// including out_proj, where cuBLAS is at its weakest (9.4 TFLOPS) and this
-// kernel still only reaches 7.7.
-//
-// Register prefetching of the next K tile (below) took it from 9.6 to 10.6
-// TFLOPS, so the memory pipeline was a real bottleneck but not the binding one.
-// At 10.6 the kernel sits at 74% of its own tile's DRAM-bandwidth ceiling
-// (~14.3 TFLOPS for 128x128, ignoring L2 reuse), which says the remaining gap
-// is not one missing trick. Closing it would need, roughly in order of
-// expected value: cp.async staging so the pipeline is not bounded by register
-// pressure; a 4x4 warp tile to lift the mma-per-fragment-load ratio from 1.33
-// to 2.0 (needs 128 accumulator registers, so it may spill); and swizzled
-// block scheduling for L2 reuse between tiles sharing a row or column. That is
-// a GEMM-tuning project, not a step in this one.
-//
-// Kept because it is correct and measured -- it is the evidence for the
-// conclusion, and the harness never calls it. Delete it if the dead code is
-// not worth the file space.
+// DEAD CODE, DELIBERATELY: this kernel is correct, is exported as linear_gelu,
+// and loses to cuBLAS at every shape the model uses (0.88x on the FFN's first
+// GEMM), so nothing calls it. The fused activation is worth what it was
+// predicted to be worth; the GEMM underneath is not competitive. It is kept as
+// the evidence for that conclusion -- csrc/TUNING.md has the numbers and what
+// closing the gap would take. Delete both if the file space matters more.
 // ---------------------------------------------------------------------------
 
 // Exact GELU, matching F.gelu(approximate="none") rather than the tanh form.
@@ -1241,17 +1176,15 @@ void gemm_bias_gelu_kernel(const float* __restrict__ A,
     static_assert(A_SLOTS % NTHREADS == 0 && W_SLOTS % NTHREADS == 0,
                   "staging must divide evenly over the block for the prefetch");
 
-    // Software pipelining. Without it the MMA units sit idle for the whole
-    // global-memory latency of every K tile: the first version of this kernel
-    // reached 9.6 TFLOPS where cuBLAS gets 16.1 on the same shape, and the two
-    // __syncthreads per iteration bracket a stall, not work.
+    // Software pipelining: the next tile is fetched into registers *before* the
+    // current tile's MMAs are issued, so the loads are in flight while the
+    // tensor cores run. Without it the MMA units sit idle for the whole
+    // global-memory latency of every K tile (9.6 TFLOPS, and the two
+    // __syncthreads per iteration bracket a stall rather than work).
     //
-    // The next tile is fetched into registers *before* the current tile's MMAs
-    // are issued, so the loads are in flight while the tensor cores run and
-    // only reach shared memory afterwards. Registers rather than a second
-    // shared buffer because double-buffering the tiles would want 73.7 KB
-    // against the 48 KB budget; 8 float4 per thread costs 32 registers, which
-    // the accumulators can afford.
+    // Registers rather than a second shared buffer: double-buffering the tiles
+    // would want 73.7 KB against the 48 KB budget, where 8 float4 per thread
+    // costs 32 registers, which the accumulators can afford.
     float4 pa[A_PER_THREAD];
     float4 pw[W_PER_THREAD];
 

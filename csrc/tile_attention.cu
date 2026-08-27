@@ -1,65 +1,38 @@
 // Fused attention on the CUDA tile programming model (cuTile).
 //
-// This is a third implementation of the same math already covered by the
-// scalar and wmma kernels in fused_attention.cu. The difference is the level
-// the code is written at:
+// Same FlashAttention math as the scalar and wmma kernels in
+// fused_attention.cu, written per *block* instead of per *thread*: a tile is a
+// fixed-size array the whole block owns, ct::matmul multiplies two of them, and
+// register/shared allocation, the load schedule, bank-conflict avoidance and
+// intra-block synchronisation are the compiler's job. There is no threadIdx in
+// this file, and the launch uses one "thread" per block because the block *is*
+// the unit of work.
 //
-//   scalar / wmma   the kernel is written per *thread*. The author picks the
-//                   block size, stages K/V through shared memory by hand,
-//                   pads leading dimensions to dodge bank conflicts, places
-//                   __syncthreads(), and drives the MMA units through
-//                   explicit 16x16x8 fragments.
+// Scope: float32 in and out, head_dim in {8,16,32,64}. MathMode narrows only
+// the two GEMMs' operands -- see tile_attention.h.
 //
-//   tile (here)     the kernel is written per *block*, once. A tile is a
-//                   fixed-size array that the whole block owns collectively;
-//                   `ct::matmul` is a matrix multiply of two such arrays, not
-//                   a fragment dance. Register/shared allocation, the load
-//                   schedule, bank-conflict avoidance and the intra-block
-//                   synchronisation are all the compiler's job. There is no
-//                   threadIdx in this file, and the launch uses one "thread"
-//                   per block because the block *is* the unit of work.
+// Requires CUDA 13.3+, -std=c++20 and -enable-tile. The build defines
+// TRANSFORMER_HAVE_TILE only when all of that is present; without it this file
+// compiles into a launcher that declines so the caller falls back.
 //
-// The algorithm is still FlashAttention: the [B,H,S,S] score matrix is never
-// materialised in global memory, K/V are streamed a tile at a time, and the
-// softmax is accumulated online with a running max and running sum.
-//
-// Scope: float32 tensors in and out, head_dim in {8,16,32,64}. The MathMode
-// parameter narrows only the two GEMMs' operands, which is what decides
-// whether the tensor cores run: Fp32 stays on the CUDA cores everywhere and is
-// exact; Tf32 reaches the MMA units keeping fp32's exponent range and 10 of
-// its 23 mantissa bits (~1e-3, the same arithmetic cuBLAS gives the baseline
-// under allow_tf32); Bf16 reaches them with 8 mantissa bits and costs ~4
-// orders of magnitude. There is no Fp16 mode -- cuTile accumulates a __half
-// matmul into __half, and this kernel sums hundreds of products per output.
-//
-// Verify which units a mode actually got with:
-//     cuobjdump -sass build/tile_attention.cuda.o | grep HMMA
-// Fp32 kernels contain none; Tf32 emits HMMA.1688.F32.TF32 and Bf16
-// HMMA.16816.F32.BF16.
-//
-// Requires CUDA 13.3+ (for <cuda_tile.h>), -std=c++20 and -enable-tile.
-// TRANSFORMER_HAVE_TILE is defined by the build only when all of that is
-// present; without it this file still compiles, into a launcher that reports
-// "not available" so the caller falls back.
+// Block shapes and thresholds here are measured, not derived. csrc/TUNING.md
+// has the tables and the two rules for re-measuring them.
 
 #include "tile_attention.h"
 
 #ifdef TRANSFORMER_HAVE_TILE
 
 #include <cuda_tile.h>
-// crt/cuda_tile.h (which <cuda_tile.h> is a one-line wrapper around) contains
-// no #includes at all: it forward-declares __half, __nv_bfloat16, __nv_fp8_*
-// and __nv_tf32 and leaves completing them to whoever wants to instantiate a
-// tile of one. So each narrow operand type needs its defining header pulled in
-// here, and that is the *only* thing standing between a mode and the MMA units.
+// crt/cuda_tile.h has no #includes of its own: it forward-declares __half,
+// __nv_bfloat16 and __nv_tf32 and leaves completing them to whoever wants a
+// tile of one. Pulling in the defining header is the *only* thing standing
+// between a narrow mode and the MMA units.
 #include <cuda_bf16.h>
 
-// __nv_tf32 is defined in <cuda_tf32.h> (a 4-byte struct, gated only on
-// __cplusplus) and has been since CUDA 13.3 -- the same toolkit that first
-// ships <cuda_tile.h>, so in practice it is always there. It is guarded anyway
-// because it was added separately from the tile header and a future toolkit
-// could rename it. Including it defines __CUDA_TF32_TYPES_EXIST__, which is
-// what turns the Tf32 mode on below; -DTILE_HAVE_TF32 still forces it.
+// <cuda_tf32.h> defines __nv_tf32 and has shipped since CUDA 13.3 -- the same
+// toolkit that first ships <cuda_tile.h> -- but it was added separately, so it
+// is guarded. Including it defines __CUDA_TF32_TYPES_EXIST__, which is what
+// turns the Tf32 mode on below; -DTILE_HAVE_TF32 forces it.
 #if __has_include(<cuda_tf32.h>)
 #include <cuda_tf32.h>
 #endif
@@ -76,11 +49,10 @@ using tile_attn::MathMode;
 
 namespace {
 
-// Finite stand-in for -inf on masked-out scores. A true -inf would make the
-// rescale term (m_run - m_new) evaluate to nan on a row where *every* key is
-// masked, and that nan then spreads through the accumulator. A large negative
-// float keeps every intermediate finite; the final reciprocal is where a dead
-// row is turned into zeros.
+// Finite stand-in for -inf on masked-out scores: a true -inf makes the rescale
+// term (m_run - m_new) nan on a row where every key is masked, and that nan
+// spreads through the accumulator. The final reciprocal is where a dead row
+// becomes zeros instead.
 constexpr float NEG = -1e30f;
 constexpr float NEG_THRESH = -1e29f;
 
@@ -90,9 +62,7 @@ constexpr float NEG_THRESH = -1e29f;
 enum class MaskMode { None, Causal, Explicit };
 
 // The element type each GEMM's operands are cast to. Only this changes between
-// math modes -- the accumulator stays fp32 in all of them, which cuTile
-// guarantees for float, bf16 and tf32 operands (and pointedly does not for
-// __half, which accumulates into __half; that is why there is no Fp16 mode).
+// math modes: cuTile accumulates float, bf16 and tf32 operands into float.
 template <MathMode MODE> struct Operand;
 template <> struct Operand<MathMode::Fp32> { using type = float; };
 template <> struct Operand<MathMode::Bf16> { using type = __nv_bfloat16; };
@@ -121,13 +91,10 @@ __tile__ auto as_operand(In x) {
 }
 
 // SPLIT selects the Flash-Decoding variant: the block covers one slice of the
-// key range rather than all of it, and writes an *unnormalised* partial --
-// accumulator, running max, running sum -- for split_combine_kernel to fold
-// together, instead of a finished output row.
-//
-// It is one template rather than two kernels because everything between the
-// prologue and the epilogue is identical, and the online-softmax recurrence is
-// exactly the part that must not drift between the two paths.
+// key range and writes an *unnormalised* partial -- accumulator, running max,
+// running sum -- for split_combine_kernel to fold together, instead of a
+// finished output row. One template rather than two kernels because the
+// online-softmax recurrence is exactly what must not drift between the paths.
 template <int BLOCK_M, int BLOCK_N, int HEAD_DIM, MaskMode MODE, MathMode MATH,
           bool SPLIT>
 __tile_global__ void tile_attention_kernel(const float* __restrict__ q,
@@ -156,40 +123,22 @@ __tile_global__ void tile_attention_kernel(const float* __restrict__ q,
     const int h = static_cast<int>(bid.y);
     const int b = static_cast<int>(bid.z);
 
-    // Under causal masking a block's cost depends on where it sits: block m
-    // walks m+1 key tiles. Blocks are dispatched in roughly increasing linear
-    // index and grid.x varies fastest, so the natural mapping hands out the
-    // cheapest blocks first and leaves the most expensive ones for the final
-    // wave, where they alone set the makespan. Reversing it is
-    // longest-processing-time-first: the expensive blocks start immediately and
-    // the cheap ones fill in around them. The dense kernel has no such spread,
-    // so it keeps the identity mapping.
+    // Under causal masking block m walks m+1 key tiles, so reversing the block
+    // index is longest-processing-time-first: the expensive blocks start
+    // immediately instead of landing in the final wave alone. Worth ~1% on the
+    // geometric mean, and it is close to a wash case by case -- see TUNING.md
+    // before trusting the reasoning. The dense kernel has no such spread and
+    // keeps the identity mapping.
     //
-    // Worth knowing before trusting that reasoning: A/B'd against the identity
-    // mapping, both compiled and timed interleaved in one process, it is close
-    // to a wash. It wins where the spread is widest and loses in the middle:
-    //
-    //   seq 2048 causal head_dim 32   0.411 -> 0.387   1.06x
-    //   seq 2048 causal head_dim 64   0.999 -> 0.960   1.04x
-    //   seq 2048 causal head_dim 16   0.223 -> 0.221   1.01x
-    //   seq 128  causal head_dim 64   0.083 -> 0.083   1.00x
-    //   seq 512  causal head_dim 64   0.301 -> 0.317   0.95x
-    //
-    // About 1% on the geometric mean, positive on absolute milliseconds because
-    // the wins land on the long cases. Kept for that, not for the theory; three
-    // lines to drop if the seq 512 regression ever matters more.
-    //
-    // n_m is the same ceil(S / BLOCK_M) the launcher used for grid.x -- both S
-    // and BLOCK_M are already here, so this costs no extra kernel argument.
+    // n_m is the same ceil(S / BLOCK_M) the launcher used for grid.x, rederived
+    // from arguments already here rather than passed in.
     const int n_m = (S + BLOCK_M - 1) / BLOCK_M;
 
-    // Under split-KV grid.x carries both axes, because a CUDA grid has only
-    // three and y/z are already spoken for by heads and batch. `splits`
-    // consecutive blocks share one query tile and divide its key range; laying
-    // them out adjacent rather than strided means the blocks reading the same Q
-    // rows are co-resident, so Q is fetched once into L2 per group instead of
-    // once per split. The m axis keeps the ordering the comment above argues
-    // for, since it is the quotient.
+    // Under split-KV grid.x carries both axes: a CUDA grid has only three and
+    // y/z are spoken for by heads and batch. `splits` consecutive blocks share
+    // one query tile and divide its key range -- adjacent rather than strided,
+    // so blocks reading the same Q rows are co-resident and Q is fetched once
+    // into L2 per group. m stays the quotient, keeping the ordering above.
     int lane  = static_cast<int>(bid.x);
     int split = 0;
     if constexpr (SPLIT) {
@@ -202,24 +151,19 @@ __tile_global__ void tile_attention_kernel(const float* __restrict__ q,
     // matrix and the views below need no stride gymnastics.
     const long long bh_off = static_cast<long long>(b * H + h) * S * HEAD_DIM;
 
-    // ct::extents deduces a *static* extent from a ct::integral_constant and a
-    // dynamic one from a plain int, so `ct::extents{S, HEAD_DIM}` -- HEAD_DIM
-    // being an ordinary int template parameter -- gave both extents a runtime
-    // value and put the row stride in a register. Handing head_dim over as an
-    // integral_constant makes it a compile-time power of two instead. Measured
-    // neutral on CUDA 13.3 / sm_86 (4462 SASS instructions either way, so the
-    // tile compiler was already recovering it), kept because it is the honest
-    // description of the tensor and costs nothing.
+    // ct::extents deduces a static extent from a ct::integral_constant and a
+    // dynamic one from a plain int, so passing HEAD_DIM as an int put the row
+    // stride in a register. Measured neutral (4462 SASS instructions either
+    // way -- the tile compiler was already recovering it), kept because it is
+    // the honest description of the tensor and costs nothing.
     constexpr ct::integral_constant<HEAD_DIM> HD{};
     auto q_view = ct::partition_view{ct::tensor_span{q + bh_off, ct::extents{S, HD}},
                                      ct::shape<BLOCK_M, HEAD_DIM>{}};
-    // K is read only as K^T. Rather than loading a [BLOCK_N, HEAD_DIM] tile and
-    // calling ct::transpose on it -- which is a real shuffle through shared
-    // memory, once per key tile -- describe the same bytes as a column-major
-    // [HEAD_DIM, S] matrix. layout_left puts stride 1 on dim 0 and HEAD_DIM on
-    // dim 1, so element (d, j) is k[j * HEAD_DIM + d]: exactly K^T, for free.
-    // This is the tile-level equivalent of the wmma kernel loading k_s into a
-    // col_major matrix_b fragment instead of transposing it.
+    // K is read only as K^T. Rather than load a [BLOCK_N, HEAD_DIM] tile and
+    // ct::transpose it -- a real shuffle through shared memory, once per key
+    // tile -- describe the same bytes as a column-major [HEAD_DIM, S] matrix:
+    // layout_left makes element (d, j) be k[j * HEAD_DIM + d], exactly K^T for
+    // free. The tile-level equivalent of wmma's col_major matrix_b fragment.
     auto kt_view = ct::partition_view{ct::tensor_span{k + bh_off, ct::extents{HD, S},
                                                       ct::layout_left{}},
                                       ct::shape<HEAD_DIM, BLOCK_N>{}};
@@ -228,18 +172,14 @@ __tile_global__ void tile_attention_kernel(const float* __restrict__ q,
     // The output view is built in the epilogue instead of here: under SPLIT this
     // block writes partials rather than `out`, and `out` is null on that path.
 
-    // Q is read once and reused against every key tile. load_masked zero-fills
-    // rows past S; those rows are computed but never stored.
+    // Q is read once and reused against every key tile, so the narrowing cast
+    // is hoisted out of the key loop -- under tf32 it is expensive. load_masked
+    // zero-fills rows past S; those rows are computed but never stored.
     //
-    // The narrowing cast to the MATH mode's operand type is hoisted here rather
-    // than left in the key loop: Q does not change across key tiles, and under
-    // tf32 that cast is expensive (see as_operand). The wmma kernel converts
-    // q_frag to tf32 once before its key loop for the same reason.
-    //
-    // The scale is deliberately *not* folded in here. Scaling Q changes what
-    // gets rounded to tf32 and measurably widened the error (3.1e-4 -> 6.2e-4
-    // on the 8x8x128x64 case), for no measurable speed; it stays on the fp32
-    // score tile below, where the rounding is already done.
+    // The scale is deliberately not folded in here: pre-scaling Q changes what
+    // gets rounded to tf32 and widened the error 3.1e-4 -> 6.2e-4 on the
+    // 8x8x128x64 case for no measurable speed. It goes on the fp32 score tile
+    // below, where the rounding is already done.
     auto q_op = as_operand<MATH, BLOCK_M, HEAD_DIM>(q_view.load_masked(m_tile, 0));
 
     auto acc   = ct::zeros<OTile>();
@@ -255,17 +195,15 @@ __tile_global__ void tile_attention_kernel(const float* __restrict__ q,
     const int key_limit =
         (MODE == MaskMode::Causal) ? (causal_end < S ? causal_end : S) : S;
 
-    // Each split takes a contiguous run of whole key tiles out of *this block's*
-    // range, not out of [0, S). That distinction is the whole reason split-KV
-    // works under causal masking: block m walks only m+1 tiles, so slicing the
-    // dense range would give the later splits of an early m nothing to do while
-    // the splits of a late m still carried everything. Slicing key_limit keeps
-    // every split of every block the same size to within one tile.
+    // Each split takes a contiguous run of whole key tiles out of *this
+    // block's* range, not out of [0, S). That is why split-KV works under
+    // causal masking: slicing the dense range would leave the later splits of
+    // an early m with nothing to do while a late m still carried everything.
     //
-    // A split can still come up empty, when a block has fewer key tiles than
-    // there are splits. It falls straight through the loop and stores the
-    // initial (NEG, 0, 0), which the combine pass weights to exactly zero --
-    // cheaper than a launch-time special case, and impossible to get wrong.
+    // A split can come up empty when a block has fewer key tiles than there are
+    // splits. It falls through the loop and stores the initial (NEG, 0, 0),
+    // which the combine pass weights to exactly zero -- cheaper than a
+    // launch-time special case, and impossible to get wrong.
     int kt_begin = 0;
     int kt_end   = key_limit;
     if constexpr (SPLIT) {
@@ -281,15 +219,11 @@ __tile_global__ void tile_attention_kernel(const float* __restrict__ q,
         auto ktt = kt_view.load_masked(0, kt / BLOCK_N);
         auto vv  = v_view.load_masked(kt / BLOCK_N, 0);
 
-        // S = Q @ K^T. One expression per block; no fragments. The scale and
-        // the base change are already in q_op, and K^T came out of the view
-        // that way, so the only work left here is the cast that puts the
-        // operands on the tensor cores.
-        // exp(x) is evaluated as exp2(x * log2e), so folding log2e into the
-        // scale that is applied here anyway removes one multiply per score
-        // element per key tile. It is applied to the fp32 result of the GEMM,
-        // not to Q before the narrowing cast: pre-scaling Q changes what gets
-        // rounded to tf32 and measurably widens the error.
+        // S = Q @ K^T. One expression per block, no fragments -- K^T came out
+        // of the view that way, so the only work here is the cast that puts
+        // the operands on the tensor cores. log2(e) is folded into the scale
+        // because the softmax below is exp2, which saves one multiply per
+        // score element per key tile.
         auto s = ct::matmul(q_op, as_operand<MATH, HEAD_DIM, BLOCK_N>(ktt))
                  * (scale * 1.4426950408889634f);
 
@@ -316,19 +250,17 @@ __tile_global__ void tile_attention_kernel(const float* __restrict__ q,
         s = ct::select(valid, s, ct::full<STile>(NEG));
 
         // Online softmax. Unlike the scalar kernel, which rescales only when a
-        // new max actually appears, the tile form rescales every iteration:
-        // the whole [BLOCK_M, BLOCK_N] tile is evaluated as one expression, so
-        // a data-dependent branch per row would not buy anything.
+        // new max appears, this rescales every iteration: the whole tile is one
+        // expression, so a data-dependent branch per row would buy nothing.
         auto m_new = ct::max(m_run, ct::reduce_max<1>(s));
         auto corr  = ct::exp2(m_run - m_new);
         auto p     = ct::exp2(s - m_new);
 
         l_run = l_run * corr + ct::sum<1>(p);
-        // ct::mma(A, B, C) is a fused multiply-accumulate into C, the tile
-        // equivalent of wmma's mma_sync(o, p, v, o). Written as
-        // `acc * corr + ct::matmul(...)` the product had to be materialised
-        // into its own [BLOCK_M, HEAD_DIM] tile and then added, which is a
-        // whole extra pass over the accumulator per key tile.
+        // ct::mma(A, B, C) accumulates into C, the tile equivalent of wmma's
+        // mma_sync(o, p, v, o). Written as `acc * corr + ct::matmul(...)` the
+        // product materialises into its own tile first -- a whole extra pass
+        // over the accumulator per key tile.
         acc = ct::mma(as_operand<MATH, BLOCK_M, BLOCK_N>(p),
                       as_operand<MATH, BLOCK_N, HEAD_DIM>(vv),
                       acc * corr);
@@ -336,19 +268,17 @@ __tile_global__ void tile_attention_kernel(const float* __restrict__ q,
     }
 
     // A row whose every key was masked still holds the sentinel max. The
-    // reference would produce nan there; emit zeros instead, matching what the
-    // scalar and wmma kernels do, since such rows are zero-filled downstream
-    // anyway and a nan would only risk contaminating something else.
+    // reference would produce nan there; emit zeros instead, as the scalar and
+    // wmma kernels do -- such rows are zero-filled downstream anyway.
     if constexpr (SPLIT) {
-        // Hand the three running quantities over untouched. Normalising here
-        // would be wrong, not merely early: this block has seen one slice of the
-        // row, so l_run is a partial denominator and m_run a partial max. The
-        // reciprocal can only be taken once every split has been folded in.
+        // The three running quantities go over untouched: this block saw one
+        // slice of the row, so l_run is a partial denominator and m_run a
+        // partial max, and the reciprocal can only be taken once every split
+        // has been folded in.
         //
-        // Partials are laid out [B, H, SPLITS, S, HEAD_DIM], and [B,H,SPLITS,S]
-        // for the two row vectors, so head_dim stays the fastest axis and the
-        // combine pass reads each row contiguously. Putting SPLITS outside S
-        // rather than inside also keeps one split's writes contiguous here.
+        // Layout is [B,H,SPLITS,S,HEAD_DIM] and [B,H,SPLITS,S], so head_dim
+        // stays the fastest axis (the combine pass reads each row contiguously)
+        // and one split's writes stay contiguous here.
         const long long p_row =
             (static_cast<long long>(b * H + h) * splits + split) * S;
         constexpr ct::integral_constant<1> ONE{};
@@ -377,17 +307,15 @@ __tile_global__ void tile_attention_kernel(const float* __restrict__ q,
 
 // Second pass of split-KV: fold the per-split partials into the finished row.
 //
-// Ordinary CUDA rather than tile code, deliberately. This is one reduction of
-// at most kMaxSplits terms per output element with no matmul in it -- bounded
-// by the [B,H,SPLITS,S,HEAD_DIM] read, and the tile dialect has nothing to
-// offer a pure streaming pass. Both compile in the same translation unit;
-// -enable-tile adds the tile dialect, it does not remove the other one.
+// Ordinary CUDA rather than tile code, deliberately -- this is one reduction of
+// at most kMaxSplits terms per output element with no matmul in it, and the tile
+// dialect has nothing to offer a pure streaming pass. -enable-tile adds the tile
+// dialect to the translation unit, it does not remove the other one.
 //
-// The math is the rescale the inner loop already does, one level up: each split
-// reports the max over its own slice, so every partial is re-based onto the max
-// over all slices before its numerator and denominator are added. Everything
-// stays base-2, because the kernel folded log2(e) into the scale and never
-// leaves that domain.
+// The math is the inner loop's rescale one level up: each split reports the max
+// over its own slice, so every partial is re-based onto the max over all slices
+// before its numerator and denominator are added. Everything stays base-2,
+// since the kernel folded log2(e) into the scale.
 //
 // One thread per (row, head_dim element), blockDim.y rows per block, so a warp
 // stays contiguous in head_dim and the [B,H,S,HEAD_DIM] writes coalesce.
@@ -413,9 +341,8 @@ __global__ void split_combine_kernel(const float* __restrict__ part_o,
         const float mj = part_m[base + static_cast<long long>(j) * S];
         m_g = mj > m_g ? mj : m_g;
     }
-    // Every split of this row was empty or entirely masked out. The single-pass
-    // kernel emits zeros in the same situation and for the same reason: the
-    // reference would produce nan, and a nan here would only spread.
+    // Every split of this row was empty or entirely masked out. Zeros, for the
+    // same reason as the single-pass kernel's dead rows.
     if (m_g <= NEG_THRESH) {
         out[row * HEAD_DIM + d] = 0.0f;
         return;
@@ -435,62 +362,23 @@ __global__ void split_combine_kernel(const float* __restrict__ part_o,
     out[row * HEAD_DIM + d] = o_g / l_g;
 }
 
-// Block shape per (head_dim, math mode), measured on SM 8.6.
+// ---------------------------------------------------------------------------
+// Block shapes
+// ---------------------------------------------------------------------------
 //
-// The kernel holds Q, O, K, V and the score tile live at once, so the footprint
-// goes as BLOCK_M*HEAD_DIM*2 + BLOCK_N*HEAD_DIM*2 + BLOCK_M*BLOCK_N. Past a
+// Swept per (head_dim, math mode, mask mode) on SM 8.6, not derived. The kernel
+// holds Q, O, K, V and the score tile live at once, and past a footprint
 // threshold the compiler spills and the cost jumps an order of magnitude rather
-// than degrading smoothly -- at head_dim 64 in Fp32, BLOCK_N 16 runs at 1.5 ms
-// where BLOCK_N 32 runs at 10.9 ms.
+// than degrading smoothly -- which is also why a narrow mode wants a different
+// shape rather than a scaled one. Every extent must be a power of two; cuTile
+// enforces is_pow2 per dimension (crt/cuda_tile.h:749).
 //
-// A narrow mode halves the operand width, which moves that cliff rather than
-// just shifting the curve: the head_dim 64 that wants 32x16 in Fp32 runs best
-// at 64x64 in Bf16 -- the shape that was *worst* in Fp32. So these are per
-// mode, not merely per head_dim.
-//
-// Measured on SM 8.6. On a part with working TMA the load cost changes and the
-// cliff will sit elsewhere; re-measure rather than trusting these.
-// Swept block shapes for the tf32 mode, overridable from the build line so
-// scripts/tune_tile_tf32.py can search them without editing this file.
-//
-// Measured on an RTX 3070 (SM 8.6), best-of-5 interleaved rounds over six shapes
-// spanning seq_len 128/512/2048, causal and dense:
-//
-//   head_dim 8    128x64    0.585 ms   (next 64x64 0.587 -- within noise)
-//   head_dim 16   128x32    0.751 ms   (next 64x64 0.779, 1.04x)
-//   head_dim 32   128x64    1.419 ms   (next 128x32 1.469, 1.04x)
-//   head_dim 64   128x32    2.855 ms   (next 64x64 3.151, 1.10x)
-//
-// BLOCK_M is 128 in all four, which is exactly what FlashAttention-2 does:
-// tile_size_fwd_sm8x returns kBlockM=128 unconditionally for every head_dim,
-// arch and dtype. Only BLOCK_N moves. Reaching for that table first would have
-// been cheaper than searching a 16x16..128x128 grid blind.
-//
-// Every extent must be a power of two -- cuTile enforces is_pow2 per dimension
-// (crt/cuda_tile.h:749). FA2's kBlockN for the headdim<=64 bucket that all four
-// of these fall into is 112, which cannot be expressed here at all; 64 and 128
-// are its legal neighbours, and 128 loses badly at head_dim 64 (11.6 ms).
-//
-// Two traps, both of which caught this kernel once:
-//
-//   Never compare timings across runs. Run-to-run variance here was large
-//   enough to invert the ranking outright: a cross-run comparison "showed"
-//   128x128 beating 128x32 by 1.58x at head_dim 8, when timed interleaved in
-//   one process it is 4th of 5. Rank candidates only within a single run, and
-//   re-measure the incumbent alongside any challenger.
-//
-//   Score short and long sequences together. Summing raw ms weights seq_len
-//   2048 about 10x over seq_len 128, so a shape that tanks short sequences can
-//   still win the sum. An early pass scored only 512/2048 and regressed
-//   seq_len 128 by ~20%.
-//
-// What block shape cannot fix: at seq_len 128 a 128-row block leaves only
-// batch*heads blocks in the grid, and no choice here fills 46 SMs. FlashAttention
-// keeps kBlockM at 128 regardless and solves that by splitting the key dimension
-// across blocks (Flash-Decoding), reducing the partials afterwards, with a
-// heuristic that stops splitting once ~80% of SMs are busy. That is a structural
-// change to this kernel, not a tuning parameter, and is not implemented here --
-// it is why tile-tf32 still trails wmma at seq_len 128.
+// csrc/TUNING.md has the sweeps, the FlashAttention-2 shapes they agree with,
+// and the two ways this measurement goes wrong. On a part with working TMA the
+// cliff sits elsewhere; re-measure rather than trusting these.
+
+// tf32, dense. Overridable from the build line so scripts/tune_tile_tf32.py can
+// search shapes without editing this file.
 #ifndef TF32_M_8
 #define TF32_M_8  128
 #define TF32_N_8  64
@@ -508,19 +396,10 @@ __global__ void split_combine_kernel(const float* __restrict__ part_o,
 #define TF32_N_64 32
 #endif
 
-// ...and again for the causal kernel, which wants a different shape.
-//
-// Causal masking makes a block's cost depend on where it sits in the sequence:
-// block m walks m+1 key tiles, not S/BLOCK_N of them. A 128-row block is
-// therefore doing two things at once -- it halves the number of blocks
-// available to fill 46 SMs, and it doubles the *spread* between the cheapest
-// and the most expensive block, so the tail of the grid is longer. Both push
-// the optimum towards a smaller BLOCK_M than the dense kernel wants, and
-// measurably so: at head_dim 64, seq_len 2048 causal, 64x64 runs 0.867 ms where
-// the dense winner 128x32 runs 0.981; at seq_len 128 causal it is 0.082 against
-// 0.110. Tuning one shape across both mask modes gave up that much.
-//
-// Swept by scripts/tune_tile_tf32.py --causal, which scores only causal cases.
+// tf32, causal. Block m walks m+1 key tiles, so a 128-row block both halves
+// the block count and doubles the spread between cheapest and most expensive
+// block; the optimum sits at a smaller BLOCK_M than dense wants. Swept by
+// scripts/tune_tile_tf32.py --causal.
 #ifndef TF32_CM_8
 #define TF32_CM_8  128
 #define TF32_CN_8  64
@@ -538,24 +417,11 @@ __global__ void split_combine_kernel(const float* __restrict__ part_o,
 #define TF32_CN_64 64
 #endif
 
-// ...and once more for a dense grid too small to fill the device.
-//
-// BLOCK_M sets how many blocks there are: ceil(S/BLOCK_M) * H * B. At batch 8,
-// heads 8, seq_len 128 and BLOCK_M 128 that is 64 blocks on a 46-SM card --
-// 1.4 waves, so the second wave runs 18 blocks against 46 slots and a third of
-// the device idles for half the kernel. Halving BLOCK_M doubles the block count
-// and fills it. Measured at head_dim 64, seq_len 128 dense, one interleaved
-// run: 64x32 = 0.096 ms against the long-sequence winner 128x32 = 0.109. The
-// same shape loses at seq_len 512 (0.474 vs 0.376), which is why this is a
-// launch-time choice rather than a retune.
-//
-// This is also the whole realistic upside of split-KV (Flash-Decoding), which
-// attacks the same idle SMs by giving each block a slice of the key range
-// instead of a slice of the query range. Split-KV is the better lever when K/V
-// traffic dominates Q -- long sequences with few heads -- because it does not
-// replicate the Q tile per block. At the short sequences where this grid is
-// actually starved, Q and K/V are the same size and the two degenerate to the
-// same trade, so the cheap one wins.
+// tf32, dense, on a grid too small to fill the device. BLOCK_M sets the block
+// count (ceil(S/BLOCK_M) * H * B), so halving it is the cheap way to fill 46 SMs
+// at seq_len 128 -- and it loses at seq_len 512, which is why this is a
+// launch-time choice rather than a retune. Split-KV attacks the same idle SMs
+// and is the alternative, not a stack; see TUNING.md for which wins where.
 //
 // Only head_dim 64 has been measured. The others default to their dense shape,
 // which makes have_short_shape below false and costs no extra instantiation.
@@ -576,9 +442,9 @@ __global__ void split_combine_kernel(const float* __restrict__ part_o,
 #define TF32_SN_64 32
 #endif
 
-// CAUSAL is a separate axis because the causal kernel's grid is triangular;
-// see the TF32_CM_* note above. Only tf32 has been swept both ways -- fp32 and
-// bf16 use one shape for both, which is what they were measured at.
+// CAUSAL is a separate axis because the causal grid is triangular; see the
+// TF32_CM_* note. Only tf32 was swept both ways -- fp32 and bf16 use one shape
+// for both, which is what they were measured at.
 template <int HEAD_DIM, MathMode MODE, bool CAUSAL = false> struct BlockCfg;
 
 template <bool C> struct BlockCfg<8,  MathMode::Fp32, C> { static constexpr int M = 64; static constexpr int N = 64; };
@@ -592,12 +458,10 @@ template <bool C> struct BlockCfg<32, MathMode::Bf16, C> { static constexpr int 
 template <bool C> struct BlockCfg<64, MathMode::Bf16, C> { static constexpr int M = 64; static constexpr int N = 64; };
 
 #ifdef TILE_HAVE_TF32
-// tf32 is the one mode where the two pressures pull apart. It occupies the same
-// 32 bits as fp32, so the spill cliff sits where fp32's does -- but it runs on
-// the MMA units, whose 16x8x8 shape the narrow fp32 tiles (BLOCK_N 16) starve:
-// at head_dim 16 the inherited 32x16 emitted 4 HMMA where bf16's 64x64 emitted
-// 16. Inheriting either mode's shapes is therefore wrong, and these were swept
-// on SM 8.6 rather than derived. See the fp32 note above on re-measuring.
+// tf32 is the one mode where the two pressures pull apart: it occupies fp32's
+// 32 bits, so the spill cliff sits where fp32's does, but it runs on the MMA
+// units, whose 16x8x8 shape the narrow fp32 tiles starve. Inheriting either
+// neighbour's shapes is wrong; these were swept.
 template <> struct BlockCfg<8,  MathMode::Tf32, false> { static constexpr int M = TF32_M_8;  static constexpr int N = TF32_N_8;  };
 template <> struct BlockCfg<8,  MathMode::Tf32, true>  { static constexpr int M = TF32_CM_8; static constexpr int N = TF32_CN_8; };
 template <> struct BlockCfg<16, MathMode::Tf32, false> { static constexpr int M = TF32_M_16;  static constexpr int N = TF32_N_16;  };
@@ -608,9 +472,9 @@ template <> struct BlockCfg<64, MathMode::Tf32, false> { static constexpr int M 
 template <> struct BlockCfg<64, MathMode::Tf32, true>  { static constexpr int M = TF32_CM_64; static constexpr int N = TF32_CN_64; };
 #endif
 
-// The dense shape to use when the grid is too small to fill the device. Only
-// tf32 has been measured; every other mode reports its dense shape, which turns
-// the short-grid path off for it entirely.
+// The dense shape for a grid too small to fill the device. Only tf32 has been
+// measured; every other mode reports its dense shape, which turns the
+// short-grid path off for it entirely.
 template <int HEAD_DIM, MathMode MODE> struct ShortCfg {
     static constexpr int M = BlockCfg<HEAD_DIM, MODE, false>::M;
     static constexpr int N = BlockCfg<HEAD_DIM, MODE, false>::N;
@@ -622,9 +486,8 @@ template <> struct ShortCfg<32, MathMode::Tf32> { static constexpr int M = TF32_
 template <> struct ShortCfg<64, MathMode::Tf32> { static constexpr int M = TF32_SM_64; static constexpr int N = TF32_SN_64; };
 #endif
 
-// SM count of the current device, queried once per device rather than per
-// launch: the short-grid test below runs on every call, and a driver round trip
-// is a measurable share of a 60 us kernel.
+// SM count of the current device, cached: the short-grid test runs on every
+// call, and a driver round trip is a measurable share of a 60 us kernel.
 inline int sm_count() {
     constexpr int kMaxDevices = 16;
     static int cached[kMaxDevices] = {};
@@ -635,9 +498,8 @@ inline int sm_count() {
     if (cached[dev] == 0) {
         int n = 0;
         if (cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) {
-            // Never let a failed query change behaviour: a count of 1 makes the
-            // threshold unreachable, so the long-grid shape always wins, which
-            // is what this did before the short shape existed.
+            // A count of 1 makes every threshold unreachable, so a failed
+            // query falls back to the plain long-grid path.
             n = 1;
         }
         cached[dev] = n;
@@ -649,87 +511,50 @@ inline int sm_count() {
 // Split-KV (Flash-Decoding)
 // ---------------------------------------------------------------------------
 //
-// Block shape decides how the *query* dimension is cut up, and that is the only
-// lever the launcher had until now. It runs out at short sequences: the grid is
-// ceil(S/BLOCK_M)*H*B, and at batch 1, heads 8, seq 512 with BLOCK_M 128 that is
-// 32 blocks on a 46-SM card. Shared-memory use pins this kernel at one block per
-// SM, so 14 SMs simply do nothing, and no choice of BLOCK_M fixes it -- halving
-// BLOCK_M doubles the block count but also doubles the K/V stream, since every
-// block walks the whole key range regardless.
+// Block shape only cuts up the *query* dimension, which runs out at short
+// sequences: shared-memory use pins this kernel at one block per SM, so a grid
+// of ceil(S/BLOCK_M)*H*B blocks can leave a third of the device idle with no
+// BLOCK_M that fixes it. Split-KV cuts the *key* dimension instead -- each
+// block takes a slice of the keys and writes an unnormalised partial, and a
+// second pass folds them together. That multiplies the grid by `splits` without
+// touching BLOCK_M, and the extra blocks read disjoint K/V.
 //
-// Split-KV cuts the *key* dimension instead. Each block takes a slice of the
-// keys, runs the same online softmax over it, and writes an unnormalised
-// partial; a second pass folds the partials together with one more rescale.
-// That multiplies the grid by `splits` without touching BLOCK_M, and the extra
-// blocks read disjoint K/V rather than re-reading the same ones.
-//
-// What it costs is the second pass over [B,H,SPLITS,S,HEAD_DIM] and the scratch
-// to hold it, which is why choose_splits() below is conservative about when to
-// do it at all.
+// It costs a full pass over [B,H,SPLITS,S,HEAD_DIM] plus the scratch, so
+// choose_splits() is conservative about when to do it at all. TUNING.md has the
+// A/B table behind every constant here.
 
 // Ceiling on how far the key range is cut up. Past a handful of splits the
-// combine pass -- which reads splits*B*H*S*(head_dim+2) floats -- costs more
-// than the idle SMs it buys back, and the scratch stops being incidental.
+// combine pass -- splits*B*H*S*(head_dim+2) floats -- costs more than the idle
+// SMs it buys back, and the scratch stops being incidental.
 constexpr int kMaxSplits = 8;
 
-// Key tiles a split must walk before splitting is worth doing at all.
-//
-// This is the guard against the failure mode split-KV shares with simply
-// shrinking BLOCK_M: both buy blocks by replicating work. Shrinking BLOCK_M
-// replicates the K/V stream; split-KV replicates the Q tile and adds a whole
-// pass over the partials. When each split would walk only a tile or two, that
-// second pass is the dominant term and splitting is a straight loss.
-//
-// The threshold is not one number, because causal and dense are buying
-// different things. Measured on an RTX 3070 (SM 8.6) with scripts/ab_split_kv.py
-// -- both paths compiled into one binary, toggled at run time, timed
-// round-robin over 5 rounds, best round kept. Geometric mean of the per-case
-// ratio over the cases that actually split, split-KV against single-pass:
-//
-//              causal          dense           explicit
-//   fp32       1.47x  (n=3)    0.98x  (n=7)    1.02x  (n=2)
-//   tf32       1.19x  (n=5)    0.98x  (n=11)   1.04x  (n=4)
-//   bf16       1.01x  (n=4)    0.83x  (n=8)    1.01x  (n=3)
-//
-// Two things fall out of that table, and the thresholds below are just those
-// two things written down.
+// Key tiles a split must walk before splitting is worth doing at all: the guard
+// against the failure mode split-KV shares with shrinking BLOCK_M, that both
+// buy blocks by replicating work. Not one number, because causal and dense are
+// buying different things.
 template <MathMode MATH>
 constexpr int min_tiles_per_split(bool causal) {
-    // Causal is not buying grid occupancy at all -- it is buying load balance.
-    // Block m walks m+1 key tiles, so the makespan is set by the largest block
-    // no matter how full the grid is, and cutting every block's own range into
-    // equal pieces evens that out. It pays at two splits over a short range,
-    // which is why this bar is low: the worst causal case measured was 0.90x
-    // and the best 1.65x.
+    // Causal buys load balance, not occupancy: the makespan is set by the
+    // largest block however full the grid is, and splitting evens that out. It
+    // pays at two splits over a short range, hence the low bar.
     if (causal) return 4;
 
-    // Dense and explicit have no imbalance to fix, so all a split buys is idle
-    // SMs -- against a full extra pass over [B,H,SPLITS,S,HEAD_DIM]. At four
-    // tiles per split that trade is a loss (0.57x, 0.65x, 0.72x, 0.74x were all
-    // four-tile cases); at eight and above it turns over (1.05x-1.19x).
-    //
-    // bf16 is held out further still. The combine pass costs the same bytes in
-    // every math mode, but bf16's main kernel is the fastest of the three --
-    // 0.44 ms where fp32 takes 1.39 on b2 h2 s2048 d64 -- so the same fixed
-    // pass is a much larger fraction of it, and bf16 dense measured 0.83x
-    // overall with nothing above 1.07x. Sixteen puts it past every dense shape
-    // that reaches this code, which is the intended effect: dense split-KV is
-    // off for bf16 until something measures otherwise.
+    // Dense and explicit have no imbalance to fix, so a split buys only idle
+    // SMs against a full extra pass -- a loss at four tiles per split, a win at
+    // eight. bf16's main kernel is the fastest of the three, so the same fixed
+    // pass is a much larger fraction of it; 16 puts dense split-KV out of reach
+    // for bf16 entirely, which is the intended effect.
     return (MATH == MathMode::Bf16) ? 16 : 8;
 }
 
-// Scratch cap. Split-KV only fires on grids too small to fill the device, so
-// this is a backstop against a pathological shape rather than a real
+// Scratch cap. A backstop against a pathological shape rather than a real
 // constraint: batch 8, heads 8, seq 512, head_dim 64 at 4 splits is 34 MB.
 constexpr size_t kMaxWorkspace = static_cast<size_t>(96) << 20;
 
-// Runtime off switch, so split-KV can be A/B'd inside a single process --
-// see the note on set_split_kv() in the header for why that matters here.
-// The environment variable only supplies the initial value.
-//
-// Deliberately a plain bool with no synchronisation: it is a benchmarking
-// knob, flipped between timed runs from one thread, not something to change
-// while launches are in flight.
+// Runtime off switch, so split-KV can be A/B'd inside a single process; see
+// set_split_kv() in the header. The environment variable supplies only the
+// initial value. Deliberately unsynchronised: it is a benchmarking knob flipped
+// between timed runs from one thread, not while launches are in flight.
 bool& split_flag() {
     static bool on = [] {
         const char* e = std::getenv("TILE_SPLIT_KV");
@@ -741,7 +566,7 @@ bool& split_flag() {
 inline bool split_enabled() { return split_flag(); }
 
 // Bytes of scratch `splits` ways needs. part_o is [B,H,SPLITS,S,HEAD_DIM] and
-// part_m / part_l are one float per row each, hence head_dim + 2.
+// part_m / part_l are one float per row each: hence head_dim + 2.
 size_t split_bytes(int splits, int B, int H, int S, int head_dim) {
     if (splits < 2) return 0;
     const size_t rows = static_cast<size_t>(splits) *
@@ -762,9 +587,9 @@ int choose_splits(int B, int H, int S, int head_dim, bool causal) {
     // more blocks, and a combine pass to lose by taking them.
     if (blocks >= target) return 1;
 
-    // Key tiles the average block walks. Under causal, block m walks m+1 of
-    // them rather than S/BLOCK_N, so the mean is half the dense count; taking
-    // the dense count would over-split and leave the tail splits empty.
+    // Key tiles the average block walks. Under causal that is half the dense
+    // count; taking the dense count would over-split and leave tail splits
+    // empty.
     const int keys = causal ? ((S + 1) / 2) : S;
     const int n_kt = (keys + BLOCK_N - 1) / BLOCK_N;
 
@@ -778,8 +603,7 @@ int choose_splits(int B, int H, int S, int head_dim, bool causal) {
 
 // The split count for a (head_dim, math mode, causal), resolved through the
 // same BlockCfg the launch will use. workspace_bytes() and launch() both come
-// through here, so the size the caller allocates and the size the kernel writes
-// cannot disagree.
+// through here, so the size allocated and the size written cannot disagree.
 template <int HEAD_DIM, MathMode MATH>
 int splits_for(int B, int H, int S, bool is_causal) {
     if constexpr (!mode_compiled<MATH>) {
@@ -804,9 +628,8 @@ int splits_for_head_dim(int B, int H, int S, int head_dim, bool is_causal) {
     }
 }
 
-// One (block shape, mask mode) launch -- single-pass, or the split pair.
-// Everything above decides which shape and how many splits; this is the only
-// place that talks to the kernels.
+// One (block shape, mask mode) launch -- single-pass, or the split pair. The
+// only place that talks to the kernels.
 template <int BLOCK_M, int BLOCK_N, int HEAD_DIM, MaskMode MODE, MathMode MATH>
 void launch_one(const float* q, const float* k, const float* v,
                 const bool* mask, const long long* ms,
@@ -830,9 +653,9 @@ void launch_one(const float* q, const float* k, const float* v,
         return;
     }
 
-    // Carve the caller's buffer into the three partial arrays. This layout is
-    // the one split_bytes() sizes and the kernel indexes; all three derive the
-    // same `rows`, so there is one definition of it to get wrong.
+    // Carve the caller's buffer into the three partial arrays. split_bytes()
+    // sizes this same layout and the kernel indexes it; all three derive `rows`
+    // the same way, so there is one definition of it to get wrong.
     const size_t rows = static_cast<size_t>(splits) *
                         static_cast<size_t>(B) * static_cast<size_t>(H) *
                         static_cast<size_t>(S);
@@ -856,8 +679,7 @@ void launch_one(const float* q, const float* k, const float* v,
 }
 
 // The two dense mask modes at a fixed block shape. Factored out because the
-// shape is chosen at run time now, so this pair of launches is needed twice and
-// must not drift apart.
+// shape is a run-time choice, so this pair is needed twice.
 template <int BLOCK_M, int BLOCK_N, int HEAD_DIM, MathMode MATH>
 void launch_dense(const float* q, const float* k, const float* v,
                   const bool* mask, const long long* ms,
@@ -879,11 +701,10 @@ void launch_for_head_dim(const float* q, const float* k, const float* v,
                          int B, int H, int S,
                          bool is_causal, float scale, cudaStream_t stream) {
     if (is_causal) {
-        // The causal kernel already runs a smaller BLOCK_M (see TF32_CM_*), so
-        // its grid is twice as long to begin with and the short-grid test below
-        // would almost never fire. It keeps one shape -- but it does take the
-        // split path, which slices each block's own causal range rather than
-        // the dense one and so stays balanced across splits.
+        // The causal kernel already runs a smaller BLOCK_M, so its grid is
+        // twice as long and the short-grid test below would rarely fire. One
+        // shape -- but it does take the split path, which slices each block's
+        // own causal range and so stays balanced across splits.
         using Cfg = BlockCfg<HEAD_DIM, MATH, true>;
         launch_one<Cfg::M, Cfg::N, HEAD_DIM, MaskMode::Causal, MATH>(
             q, k, v, nullptr, ms, out, ws, splits, B, H, S, scale, stream);
@@ -897,10 +718,9 @@ void launch_for_head_dim(const float* q, const float* k, const float* v,
     constexpr bool have_short_shape = (Short::M != Long::M) || (Short::N != Long::N);
 
     // Split-KV and ShortCfg attack the same starved grid, so they are
-    // alternatives rather than a stack, and splits was computed against Long's
-    // shape -- taking it means keeping Long. ShortCfg stays the answer where
-    // there is too little key work to split (choose_splits returns 1), which is
-    // the seq_len 128 regime it was measured in.
+    // alternatives rather than a stack -- and splits was computed against
+    // Long's shape, so taking it means keeping Long. ShortCfg is the answer
+    // where there is too little key work to split.
     if (splits >= 2) {
         launch_dense<Long::M, Long::N, HEAD_DIM, MATH>(
             q, k, v, mask, ms, out, ws, splits, B, H, S, scale, stream);
@@ -909,10 +729,8 @@ void launch_for_head_dim(const float* q, const float* k, const float* v,
 
     if constexpr (have_short_shape) {
         // Two waves is the threshold: below it the tail wave runs a partial
-        // grid, and the SMs it leaves idle cost more than the extra blocks do.
-        // 64 blocks (batch 8, heads 8, seq 128) falls under 2*46 and takes the
-        // short shape; 128 blocks (seq 512 and up) does not -- which is exactly
-        // where the two shapes swapped places when measured.
+        // grid, and the idle SMs cost more than the extra blocks do. That is
+        // also where the two shapes swapped places when measured.
         const long long blocks =
             static_cast<long long>((S + Long::M - 1) / Long::M) * H * B;
         if (blocks < 2LL * sm_count()) {
@@ -942,9 +760,8 @@ bool supports(MathMode mode) {
 
 namespace {
 
-// MATH is resolved before head_dim so a mode that was not compiled costs no
-// instantiations at all -- head_dim is a template parameter, so every
-// (head_dim, mode) pair that reaches here becomes its own compiled kernel.
+// MATH is resolved before head_dim so an uncompiled mode costs no
+// instantiations: every (head_dim, mode) pair reaching here is its own kernel.
 template <MathMode MATH>
 bool launch_mode(const float* q, const float* k, const float* v,
                  const bool* mask, const long long* ms,
@@ -954,10 +771,9 @@ bool launch_mode(const float* q, const float* k, const float* v,
     if constexpr (!mode_compiled<MATH>) {
         return false;
     } else {
-        // Degrade to the single-pass kernel rather than failing when the caller
-        // passed no scratch, or less than this shape asks for. The split path
-        // is a performance choice; a caller that skipped workspace_bytes() has
-        // made a slower call, not an incorrect one.
+        // No scratch, or too little, degrades to the single-pass kernel rather
+        // than failing: the split path is a performance choice, so a caller
+        // that skipped workspace_bytes() made a slower call, not a wrong one.
         const int want = splits_for_head_dim<MATH>(B, H, S, head_dim, is_causal);
         const int splits =
             (ws != nullptr && ws_bytes >= split_bytes(want, B, H, S, head_dim))

@@ -14,6 +14,7 @@ the detail of how the kernel was moved onto the tensor cores.
 - [Why the harness number looks small](#why-the-harness-number-looks-small)
 - [Accuracy](#accuracy)
 - [Coverage and limits](#coverage-and-limits)
+- [CUDA graphs](#cuda-graphs)
 - [What's left](#whats-left)
 - [Reproducing](#reproducing)
 
@@ -497,6 +498,167 @@ Both were worth real speed, not just coverage — at `head_dim=128` the tensor-c
 runs 0.041 ms against the scalar fallback's 0.142 ms, turning a 0.40x loss to SDPA into a
 1.40x win.
 
+## CUDA graphs
+
+Candidate 1 from the section below is now implemented, so this records what it was actually
+worth rather than what it looked like it would be worth.
+
+A CUDA graph records a forward pass's kernel launches once and resubmits them as a single
+driver call. Nothing about the arithmetic changes — the same kernels run in the same order on
+the same addresses — so the interesting question is entirely about launch overhead, and the
+accuracy question does not arise. `--cuda-graph {off,auto,always}`; `auto` is the default.
+
+### What it is worth
+
+Harness speedup against `BaselineTransformer`, fp32, custom wmma kernel:
+
+| Configuration | vs. baseline, graphs auto | graph vs. eager, interleaved |
+| --- | --- | --- |
+| small (B1 S32) | 11.0x – 14.1x | **4.2x – 6.8x** |
+| default (B8 S128 D512 L6) | 1.35x – 2.08x | 1.01x – 1.03x |
+| causal | 1.54x – 1.94x | not measured |
+| padded (30%) | 1.30x – 1.53x | not measured |
+| deep 12L | 1.32x – 1.58x | 1.040x |
+| seq512 B4 | 1.60x – 1.70x | 1.009x (eager, over gate) |
+| seq2048 B1 | 2.33x – 2.39x | 1.007x (eager, over gate) |
+| wide (d_model 1024) | 1.20x – 1.24x | not measured (eager, over gate) |
+
+Ranges over repeated runs rather than single readings; the section below on host contention is
+why the spread is this wide. Only the right-hand column is trustworthy below ~10%. At the default
+config, repeated off-vs-on pairs gave 1.263x/1.353x and then 1.352x/1.349x, so the harness's own
+median cannot resolve a 3% effect at all. The interleaved `default` figure held at 1.01–1.03x
+across every machine state tested, which makes it the one number here worth quoting flat.
+
+And on the op itself, interleaved best-of-5 with an eager-vs-eager control row giving a
+±1.2% noise floor (`scripts/ab_graph.py`):
+
+| batch × seq | eager | graph | ratio |
+| --- | --- | --- | --- |
+| 1 × 32 | 1.973 ms | 0.466 ms | **4.23x** |
+| 1 × 128 | 1.961 ms | 0.815 ms | 2.41x |
+| 8 × 32 | 1.966 ms | 0.967 ms | 2.03x |
+| 8 × 128 | 3.746 ms | 3.641 ms | 1.029x |
+| 8 × 256 | 6.870 ms | 6.800 ms | 1.010x |
+| 8 × 1024 | 33.840 ms | 33.917 ms | 0.998x |
+
+Replay at `small` lands on 0.466 ms against the 0.474 ms the kernels themselves take — the
+launch gap is essentially all recovered. **Nothing measured was ever slower than eager**; the
+worst case, 0.998x, is inside the control's spread. So the size gate is not protecting against
+a slowdown, it is protecting memory.
+
+### The gate is on activation volume, and it is a measured constant
+
+`_GRAPH_MAX_ACTIVATION = 524288`, i.e. `batch*seq*d_model`. Two findings shaped it.
+
+**Tokens are the wrong axis.** `batch*seq` mispredicts badly: at 512 tokens, `d_model` 256 gave
+**2.708x** and `d_model` 512 gave 1.036x — same token count, 2.6x difference in payoff. What
+decides it is work *per kernel*, which scales with the activation tensor rather than with its
+rows. Holding `batch*seq*d_model` constant in pairs while moving tokens and width in opposite
+directions gave 1.038x and 1.030x at 524288, agreeing inside the noise floor.
+
+**Depth is not an axis at all.** At fixed activation volume, 3, 6, 12 and 24 layers gave 1.031x,
+1.037x, 1.040x, 1.040x. Eager and replay scale with depth together, so `num_layers` does not
+belong in the gate even though launch *count* doubles across that range.
+
+The threshold caps the pinned pool at about 84 MiB, measured. An earlier estimate in this document
+guessed "gigabytes"; the real range across everything swept is 22–360 MiB, because the caching
+allocator reuses freed blocks *inside* a private pool, so the pool tracks the eager peak rather
+than the sum over layers — which is also why 6 and 12 layers both reserved 62 MiB at the same
+shape.
+
+**The honest caveat: 524288 is a property of this machine, not of the model.** The crossover is
+where the GPU stops starving, which depends on the card's throughput against how fast the host can
+feed it, so a faster GPU starves at larger shapes and wants a larger value — and a busier host
+wants one too. A memory-relative budget was tried as a portable alternative and reverted: at 8% of
+an 8 GiB card it captured five shapes that gain ~1% or nothing, pinning 148–360 MiB apiece,
+which is a poor trade for portability nobody on this machine benefits from. The constant stays, made
+portable enough by two things instead. `scripts/ab_graph.py --recommend` re-derives it on whatever
+machine it runs on: it sweeps activation volume in powers of two with two shapes at each level,
+takes the worse of the pair so the answer errs toward capturing less, derives the noise floor from
+its own eager-vs-eager control rows, and **refuses to answer at all** when that floor is wider than
+the effects being measured — the alternative being to hand back a number derived from noise, which
+is exactly the mistake the game caught me making. And the harness prints which path it took, why,
+and how to re-measure, on every run. On this machine `--recommend` independently returns 524288,
+which is how the hand-read value was checked.
+
+Nothing swept was ever *slower* than eager — worst case 0.998x, inside the control's spread — so
+this gate is not protecting against a slowdown. Set it too low and it costs latency; too high and
+it costs memory; neither can produce a wrong answer.
+
+A generous safety net sits behind it regardless: a captured pool over 25% of the card is released
+rather than held for the run. At the default threshold it should never fire, which is the point —
+it exists so that a much larger constant set on unfamiliar hardware degrades to eager instead of
+quietly eating the card.
+
+### Absolute speedups are unusually sensitive to host contention
+
+Worth recording because it caught me out mid-measurement: one run reported 2.083x at the default
+config against 1.37x earlier the same day with no code change between them. The machine had a
+game running.
+
+The mechanism is clean once seen. The graph path issues one launch per forward pass, eager issues
+79, and the baseline issues more still — so anything that makes a launch more expensive penalises
+the three unevenly:
+
+| path | game closed | game running | degradation |
+| --- | --- | --- | --- |
+| baseline | 5.0 ms | 9.2 ms | 1.84x |
+| optimized, eager | 3.6 ms | 6.0 ms | 1.67x |
+| optimized, graphed | 3.6 ms | 4.65 ms | 1.29x |
+
+Degradation ordered exactly by launch count, which is what says the added cost is host-side rather
+than a throttled GPU — a throttled card would slow all three together.
+
+The consequence is that the *ratio* inflates on a busy machine: `b1 s32` moved across 4.23x, 5.29x
+and 6.80x on three different states. Those numbers are all real for their state, not artefacts —
+removing launches is worth more when launches cost more — but none of them is *the* number, which
+is why the tables above give ranges.
+
+The interleaved default-config figure is the exception, reading 1.029x, 1.033x and 1.013x across
+those same three states. That split is not a coincidence: **the shapes where graphs barely matter
+are the stable ones, and the shapes where they matter enormously are the volatile ones**, which
+follows directly from the mechanism. A number quoted for a launch-bound shape is a statement about
+two machines, not one.
+
+This is also what the control row in `ab_graph.py` is for, and it earned its place here. With the
+game closed it read 0.961–1.015x; with it running, 0.849–1.340x, at which point several rows had a
+control larger than the effect they claimed to measure and nothing in them meant anything. Any
+table out of that script should be discarded unless its control column is read alongside it.
+
+### Bit-exactness, measured against the accuracy gate
+
+`verify_graph.py` compares replay to eager directly. The stronger check is whether the two ever
+disagree about the *verdict*, so 6 configs x 8 seeds were graded against the baseline twice on
+the same inputs, once with capture off and once on:
+
+| | pairs | failed the gate | identical to eager, bit for bit |
+| --- | --- | --- | --- |
+| eager | 48 | 2 | — |
+| graphed | 48 | 2 | **48/48** |
+
+Same two rows fail on both sides, with `max_abs` agreeing to the last digit and a gap of exactly
+`0.0e+00` on every pair. Both failures are `causal+padded` (seeds 2 and 4), one element of
+2,621,440 each — which is the pre-existing margin described under [Accuracy](#accuracy), not
+anything graphs introduced. `causal+padded` fails on roughly a quarter of seeds either way.
+
+The useful conclusion is the negative one: **a graph cannot rescue an accuracy failure and
+cannot cause one.** It is a latency switch, and the accuracy discussion elsewhere in this
+document applies to it unchanged.
+
+**Bit-exactness is asserted, not assumed.** Capture replays once against an eager reference and
+refuses to install a graph whose output differs by anything at all. Nothing should ever trip
+this — and nothing has — but a graph that computes something slightly different is the one
+failure mode a benchmark would happily report as a *win*, which makes it worth one extra eager
+forward per shape to rule out.
+
+### Unrelated bug found on the way
+
+The cuTile kernels crash the interpreter at shutdown with an access violation (`0xC0000005` on
+Windows), *after* `main()` has returned its exit code. This has nothing to do with graphs — it
+reproduces with `--cuda-graph off`, and `scripts/verify_split_kv.py` already exits the same way.
+`scripts/verify_graph.py` therefore checks `scalar` and `wmma` by default, with `--include-tile`
+opting in; the tile kernels are bit-exact under capture, it is their teardown that is broken.
+
 ## What's left
 
 Everything above is attention. This section is the other direction: given a kernel that is
@@ -563,36 +725,11 @@ optimizing a fixed one, and neither can appear in this project.
 
 ### Ranked candidates
 
-**1. CUDA graphs — measured 4.20x at `small`, and bit-exact.**
+**Done: CUDA graphs.** Was candidate 1 here. Worth 4.23x on the forward pass at `small` and
+1.029x at default, bit-exact. See [CUDA graphs](#cuda-graphs) for what it measured and for
+the three things this section originally got wrong about it.
 
-```
-small (B1 S32):  eager 2.048 ms -> graph 0.488 ms   (2.49x -> 10.46x vs baseline)
-default:         eager 3.944 ms -> graph 3.809 ms   (1.32x -> 1.37x)
-deep 12L:        eager 7.881 ms -> graph 7.673 ms   (1.27x -> 1.30x)
-seq2048:         eager 93.5 ms  -> graph 95.5 ms    (no gain)
-graph output vs eager output: max_abs = 0.000e+00 on all four
-```
-
-The replay time at `small`, 0.488 ms, lands almost exactly on the sum of the kernels
-themselves (0.474 ms) — the rest was pure launch gap, and collapsing 79 submissions into one
-recovers essentially all of it. The payoff tracks the idle column above exactly, which is
-why it is 4.20x at one shape and nothing at another. This is also the only remaining
-candidate with no accuracy question attached, because a replay runs the identical kernels in
-the identical order.
-
-A graph does not *need* many nodes to be legal — a single-node capture replays fine — but it
-needs them to be worth anything: `cudaGraphLaunch` costs about what one `cudaLaunchKernel`
-costs, so a one-kernel graph saves nothing.
-
-What it needs: capture on a side stream under `torch.no_grad()` — capture from inside
-`inference_mode` did not work — with a graph cache keyed on
-`(shape, dtype, causal, mask_is_trivial)` and inputs `copy_()`d into a static buffer, since
-every accuracy trial passes a fresh `x`. It should be gated off above some `batch*seq`: the
-graph pool pins every intermediate, and `seq2048` gains nothing for that memory. The
-`mask_is_trivial` caching in `UserOptimizedTransformer` already removed the `.item()` sync
-that would make capture illegal outright.
-
-**2. The q/k/v `.contiguous()` copies — 5.6% at default, bit-exact.**
+**1. The q/k/v `.contiguous()` copies — 5.6% at default, bit-exact.**
 
 [`fused_attention.cu`](csrc/fused_attention.cu) materializes contiguous copies of q, k and v
 because the fused QKV projection hands the kernel permuted views of one packed tensor. That
@@ -600,7 +737,7 @@ is 18 clone kernels per forward pass for a layout change the kernel could absorb
 strides — or avoid entirely by taking the packed `qkv` tensor and indexing it directly,
 since `MySelfAttention` produced that layout itself.
 
-**3. Fused Linear+GELU — ~5% available, and the cheap route collects 2% of it at a price.**
+**2. Fused Linear+GELU — ~5% available, and the cheap route collects 2% of it at a price.**
 
 PyTorch exposes cuBLASLt's bias+GELU epilogue as `torch._addmm_activation`. Measured at the
 default FFN shape:
@@ -616,30 +753,35 @@ tanh to three digits. Against end-to-end `max_abs` that already peaks at 8.7e-4 
 gate, that is most of the remaining margin for 2%. Collecting the full 5% means hand-writing
 a TF32 tensor-core GEMM with a GELU epilogue that beats cuBLAS.
 
-**4. INT8 / W8A8 — available on this hardware, dead on accuracy.** SM 8.6 has INT8 tensor
+**3. INT8 / W8A8 — available on this hardware, dead on accuracy.** SM 8.6 has INT8 tensor
 cores. But the gate is `abs <= 1e-3` against an fp32 reference, and bf16 — far finer than
 INT8 — already fails it for 29% of elements.
 
-**5. RMSNorm — disqualified above, and it would not pay.** The argument for it is one fewer
+**4. RMSNorm — disqualified above, and it would not pay.** The argument for it is one fewer
 pass over memory; `fused_add_layernorm` already removed that pass. The mean subtraction is
 arithmetic on data that is already in registers, competing for a fraction of 6.5%.
 
-**6. SwiGLU — disqualified above.**
+**5. SwiGLU — disqualified above.**
 
-**7. FP8 — impossible here.** FP8 tensor cores start at Ada (SM 89). This card is SM 8.6.
+**6. FP8 — impossible here.** FP8 tensor cores start at Ada (SM 89). This card is SM 8.6.
 
 ### What that adds up to
 
-At the default configuration: graphs 3.5%, plus the q/k/v copies 5.6%, plus GELU 5% if it is
-written by hand — roughly 1.32x to 1.50x. The other two thirds of the forward pass is
+Graphs are collected: default went 1.263x -> 1.353x and `small` went 2.49x -> 11.23x. What
+remains at the default configuration is the q/k/v copies at 5.6%, plus GELU at ~5% if it is
+written by hand — so roughly 1.35x to 1.50x. The other two thirds of the forward pass is
 cuBLAS, and beating cuBLAS is not a weekend.
 
-The honest summary is that **CUDA graphs and the q/k/v copies are the whole remaining
-opportunity**, and graphs pay most at exactly the shapes where the attention kernel pays
-least. The usual caveat from [Performance](#performance) applies to the small numbers here:
-these are single-run medians, and differences under ~10% are not evidence. The 4.20x at
-`small` and the 5.6% of copies are well outside that band; the 3.5% graph gain at default is
-not.
+So **the q/k/v copies are now the whole remaining opportunity worth having** at default
+shapes. Note that graphs paid most at exactly the shapes where the attention kernel paid
+least, which is the useful shape of this result: the two cover different regimes rather than
+competing for the same time.
+
+The usual caveat from [Performance](#performance) applies to the small numbers here. The
+graph figures are the exception — `scripts/ab_graph.py` times both sides interleaved in one
+process and prints an eager-vs-eager control row, which put the noise floor at ±1.2%, so the
+1.029x at default sits just above it rather than inside it. The harness's own single-run
+median cannot see that effect at all.
 
 ## Reproducing
 

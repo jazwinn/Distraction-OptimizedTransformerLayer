@@ -82,6 +82,49 @@ same configuration was measured at 1.401x and 0.958x on two runs of `deep 12L`. 
 under about 10% here are not evidence of anything; `seq_len 2048` and `seq_len 2048 causal`
 are outside that band and agree with the attention-op table above.
 
+**What CUDA graphs add on top.** Kept as a separate table on purpose: these are a later run,
+and dropping them into the columns above would invite exactly the cross-run comparison the
+error bars rule out. Same methodology as that table — one harness process per row, graphs
+`auto`, custom wmma:
+
+| Configuration | vs. baseline, graphs auto | graph vs. eager, interleaved | path |
+| --- | --- | --- | --- |
+| small (B1 S32) | 11.0x - 14.1x | **4.2x - 6.8x** | graph, 44 MiB |
+| causal | 1.54x - 1.94x | not measured | graph, 104 MiB |
+| causal + padded | 1.45x - 1.68x | not measured | graph, 104 MiB |
+| default (B8 S128 D512 H8 L6) | 1.39x - 2.08x | 1.01x - 1.03x | graph, 104 MiB |
+| padded (30%) | 1.30x - 1.53x | not measured | graph, 104 MiB |
+| deep (12 layers) | 1.32x - 1.58x | 1.040x | graph, 104 MiB |
+| seq_len 2048 (B1) causal | 3.78x - 3.97x | not measured | eager, over gate |
+| seq_len 2048 (B1) | 2.33x - 2.39x | 1.007x | eager, over gate |
+| seq_len 512 (B4) | 1.60x - 1.70x | 1.009x | eager, over gate |
+| wide (d_model 1024) | 1.20x - 1.24x | not measured | eager, over gate |
+
+The `path` column is what `auto` chose. Above `batch*seq*d_model = 524288` it declines, because
+replay measured no gain there - those rows are the long-sequence shapes where the attention kernel
+is already doing the work. The harness prints which path it took and why on every run, so an eager
+run is never a mystery; `--cuda-graph always` overrides it.
+
+**Ranges, not single numbers, because the absolute speedup is unusually sensitive to what else the
+machine is doing.** The graph path issues one launch per forward pass, eager issues 79, and the
+baseline issues more still - so anything that makes a launch expensive penalises the three
+unevenly and moves the ratio. Measured with a game running versus closed: baseline 5.0 -> 9.2 ms,
+optimized eager 3.6 -> 6.0 ms, optimized graphed 3.6 -> 4.65 ms, degradation ordered exactly by
+launch count. The default config read 1.39x in one state and 2.08x in another with no code change
+in between.
+
+So read the two speedup columns differently. The middle one comes from `scripts/ab_graph.py`,
+which times both sides interleaved in one process and prints an eager-vs-eager **control row** -
+when that row reads 1.00x the measurement is sound, and while the game was running it read
+0.849-1.340x, at which point several rows had a control larger than the effect they claimed to
+measure and were thrown away. `default` at 1.01-1.03x held across every state tested, which makes
+it the one figure here worth quoting without a range. `small` is inherently volatile, because it
+is exactly the regime where host launch cost dominates: removing launches is worth more when
+launches cost more.
+
+Replay is bit-identical to eager - `scripts/verify_graph.py` asserts that at tolerance exactly
+zero - so none of this is a precision trade.
+
 **Where the tensor cores show up.** At `seq_len=2048` the custom backend goes from 1.678x
 with the scalar kernel to 2.270x with the tensor-core one, overtaking SDPA's 1.816x; with
 causal masking, 2.915x to 3.785x against SDPA's 3.124x. Those are the configurations where
@@ -245,6 +288,13 @@ python torch_transformer_benchmark.py --seq-len 2048 --batch-size 1 --causal
 `--batch-size --seq-len --d-model --heads --ffn-dim --layers --causal --dtype
 --padding-ratio --input-scale --atol --rtol`
 
+`--cuda-graph {off,auto,always}` controls CUDA graph capture, `auto` by default. `auto`
+captures when `batch*seq*d_model <= 524288`, which is where replay stopped measuring a gain on
+this hardware; `always` ignores that gate and exists for `scripts/ab_graph.py`. Replay is bit-identical to eager, so
+this is a pure latency switch — at `--batch-size 1 --seq-len 32` it is the difference between
+2.5x and 11.2x. At the default config it is worth about 3%, which is real but below what a
+single harness run can resolve.
+
 To use the CUDA kernel, run through `devenv.bat` so the build can find `cl.exe`:
 
 ```bash
@@ -305,8 +355,12 @@ and the slowest; `tile-tf32` trades that for the tensor cores at wmma's ~1e-3 �
 | `scripts/verify_kernel.py` | Kernel vs. reference vs. SDPA across 12 shapes. Fails fast and names the shape that broke. |
 | `scripts/bench_attention.py` | Times the attention op alone — scalar vs. tensor-core vs. SDPA — with accuracy alongside, so a speed win bought with precision is visible. |
 | `scripts/compare_backends.py` | Runs the full harness once per backend and prints the comparison table above. Set `COMPARE_FULL=1` for the harness's own accuracy-trial count instead of the trimmed one. |
+| `scripts/verify_split_kv.py` | Checks the tile kernel's split-KV path against its own single-pass path, and asserts the split actually fired. |
+| `scripts/tune_tile_tf32.py` | Sweeps the tile kernel's block shapes per mask mode. |
+| `scripts/verify_graph.py` | Checks that CUDA graph replay is *bit-identical* to eager — tolerance exactly zero — and that the graph actually fired rather than silently declining. `--test-failure` also exercises the capture-failure path. |
+| `scripts/ab_graph.py` | A/Bs eager against replay, interleaved with an eager-vs-eager control row for the noise floor. `--recommend` measures the crossover on the machine it runs on and prints the `_GRAPH_MAX_ACTIVATION` to set, refusing to answer if the control rows say the machine is too noisy to trust. |
 
-All three want `devenv.bat` in front of them:
+All of them want `devenv.bat` in front of them:
 
 ```bash
 cmd.exe /c scripts\devenv.bat python scripts\compare_backends.py
@@ -413,6 +467,7 @@ torch_transformer_benchmark.py   harness + baseline + the optimized implementati
 csrc/fused_attention.cu          custom fused attention CUDA kernels (tensor-core + scalar)
 csrc/tile_attention.cu           the same attention on the CUDA tile programming model
 csrc/tile_attention.h            plain-pointer boundary between the two translation units
+csrc/TUNING.md                   measurements behind the kernels' block shapes and thresholds
 kernel_ext.py                    JIT loader; returns None instead of raising if unavailable
 scripts/devenv.bat               runs a command with MSVC on PATH
 scripts/build_ext.bat            one-shot build + load check
@@ -426,6 +481,52 @@ scripts/compare_backends.py      full-harness comparison across backends
 ---
 
 ## Notes and known limits
+
+**A CUDA graph freezes more than the kernels.** Capture bakes in the kernel chosen for each
+op, the cuBLAS algorithm, `allow_tf32` / matmul precision, and the extension's own runtime
+knobs — `tile_set_split_kv` among them. `ATTENTION_BACKEND` and `ATTENTION_IMPL` are part of
+the graph cache key so changing those re-captures, but the rest are invisible to a key, so
+changing them after the first forward pass is silently ignored by a captured model. In
+particular `verify_split_kv.py`'s trick of flipping the split flag in-process would do nothing
+against one.
+
+**The size gate is a measured constant, and it was measured on this machine.**
+`_GRAPH_MAX_ACTIVATION = 524288` is where replay stopped beating eager on an RTX 3070. The
+crossover is really the point where the GPU stops starving, which depends on the card's throughput
+relative to how fast the host can feed it - so a faster GPU starves at larger shapes and wants a
+*larger* value. On different hardware, re-derive it in one command:
+
+```bash
+cmd.exe /c scripts\devenv.bat python scripts\ab_graph.py --recommend
+```
+
+That sweeps activation volume, derives this machine's noise floor from its own eager-vs-eager
+control rows, and prints the value to set — or refuses to answer and tells you to close whatever is
+making the machine noisy, rather than handing back a number derived from noise. On the 3070 it
+independently returns 524288, which is how the current value was checked.
+
+Getting it wrong is cheap either way: too low leaves latency on the table, too high pins memory for
+nothing, and neither can produce a wrong answer, because replay is bit-identical to eager at any
+setting. The gate is on
+activation volume rather than tokens because tokens mispredict - at 512 tokens, `d_model` 256
+measured 2.708x and `d_model` 512 measured 1.036x - and not on `num_layers` at all, since 3/6/12/24
+layers measured 1.031x/1.037x/1.040x/1.040x at fixed activation volume.
+
+**Static graph inputs have to be normal tensors, not inference tensors.** The harness calls the
+model inside `torch.inference_mode()`, and an inference tensor cannot be updated in place from
+outside inference mode — so a static input buffer allocated there could never be refilled. The
+buffers are allocated under `torch.inference_mode(False)` for that reason, and the capture body
+additionally runs under `torch.no_grad()`: parameters have `requires_grad=True` and the model is
+only `.eval()`ed, so escaping inference mode without it would build an autograd graph during
+capture. Capture itself works fine from inside `inference_mode`; an earlier note here claiming
+otherwise was wrong.
+
+**The cuTile kernels crash the interpreter at shutdown.** An access violation (`0xC0000005`),
+raised *after* `main()` has returned its exit code, so a run looks like it passed and then
+reports a nonzero status. It is unrelated to CUDA graphs — it reproduces with `--cuda-graph
+off` — and `scripts/verify_split_kv.py` already exits this way. `scripts/verify_graph.py`
+therefore leaves the tile impls behind `--include-tile` so its own exit code stays meaningful.
+Not yet diagnosed.
 
 **The accuracy budget is tighter than it looks.** The baseline's *own* TF32 rounding sits
 9.8e-4 (non-causal) to 1.2e-3 (causal) away from an exact fp32 result — at or above
