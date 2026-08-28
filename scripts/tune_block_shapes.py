@@ -1,27 +1,49 @@
-"""Sweep the tf32 block shapes in csrc/tile_attention.cu and print the winners.
+"""Sweep the compiled-in block shapes of every attention backend and print the winners.
 
-The shapes are compiled in, so each candidate needs its own build. TF32_M_*/
-TF32_N_* are -D overrides precisely so this can search without editing the
-source; the numbers it prints go back into BlockCfg<HEAD_DIM, MathMode::Tf32>.
+Shapes are template parameters, so each candidate needs its own build. Every
+backend exposes `-D` overrides for exactly that reason -- TF32_M_*/TF32_N_* in
+tile_attention.cu, FP32_*/BF16_* beside them, WMMA_M_*/WMMA_N_* in
+fused_attention.cu -- so this can search without editing the sources. The
+numbers it prints go back into those macro defaults.
 
-tf32 is the mode where the two pressures pull apart: it costs the same 32 bits
-per element as fp32 (so the spill cliff sits where fp32's does) but runs on the
-MMA units (which the narrow fp32 shapes starve). Neither mode's swept shapes
-transfer, hence this.
+    python scripts/tune_block_shapes.py                      # every backend, dense
+    python scripts/tune_block_shapes.py --backend wmma       # just one
+    python scripts/tune_block_shapes.py --backend wmma 64    # one backend, one head_dim
+    python scripts/tune_block_shapes.py --causal             # the causal shapes instead
+    python scripts/tune_block_shapes.py --backend wmma --dtype float16
 
-    python scripts/tune_tile_tf32.py            # dense shapes, all head_dims
-    python scripts/tune_tile_tf32.py 32 64      # just these head_dims
-    python scripts/tune_tile_tf32.py --causal   # the causal shapes instead
+Four backends, and they are not interchangeable:
 
-The causal kernel is swept separately because its grid is triangular: block m
-walks m+1 key tiles rather than S/BLOCK_N, so BLOCK_M sets both how many blocks
-there are and how uneven they are. The two mask modes do not want the same
-shape -- at head_dim 64 the dense winner loses by 12-25% on causal cases.
-Results go into TF32_M_*/TF32_N_* (dense) or TF32_CM_*/TF32_CN_* (causal).
+  tile-fp32   cuTile, CUDA cores.       Spill cliff dominates; wants narrow N.
+  tile-bf16   cuTile, tensor cores.     Half the operand width moves the cliff.
+  tile-tf32   cuTile, tensor cores.     fp32's 32 bits, bf16's MMA units -- the
+                                        one mode where the two pressures pull
+                                        apart, so it inherits neither's shapes.
+  wmma        nvcuda::wmma fragments.   The shipping default for every dtype.
+
+Two structural differences the flags have to respect:
+
+* The tile kernels take a compile-time MaskMode, so dense and causal can carry
+  different shapes and `--causal` sweeps them separately. The wmma kernel takes
+  `is_causal` as a *runtime* argument, so one shape must serve both; wmma is
+  therefore always scored on dense and causal cases together and rejects
+  `--causal`. Making it mask-tunable means templating the kernel on the mask,
+  which is a kernel change, not a macro.
+
+* cuTile requires every tile extent to be a power of two (`is_pow2` in
+  crt/cuda_tile.h:749). wmma does not: BLOCK_M only has to be a multiple of 16
+  (it *is* the warp count times 16) and BLOCK_N a multiple of
+  FragTraits<scalar_t>::K. So the wmma candidate set includes 48/80/96/112, and
+  FlashAttention-2's kBlockN=112 -- inexpressible in the tile kernel -- is
+  reachable for the 16-bit types.
+
+Read csrc/TUNING.md's two rules before trusting any number here: never compare
+timings across runs, and score short and long sequences together.
 """
 
 from __future__ import annotations
 
+import argparse
 import itertools
 import os
 import shutil
@@ -35,23 +57,121 @@ import torch  # noqa: E402
 
 import kernel_ext  # noqa: E402
 
-HEAD_DIMS = (8, 16, 32, 64)
+# ---------------------------------------------------------------------------
+# Candidate sets
+# ---------------------------------------------------------------------------
 
-# cuTile requires every tile extent to be a power of two (`is_pow2` in
-# crt/cuda_tile.h:749), so the candidate set is {16,32,64,128} and FlashAttention's
-# tuned kBlockN values of 112 and 96 are not expressible here -- 64 and 128 are
-# the legal neighbours. FA2 returns kBlockM=128 unconditionally on every arch and
-# head_dim, which is why 128 is in the M set; its kBlockN for the headdim<=64
-# bucket that all four of our head_dims fall into is 112, which is why 128 must
-# be in the N set even though a first pass capped N at 64.
-# Override with TUNE_CANDIDATES="128x64,128x128" to search a focused region.
-_DEFAULT_CANDIDATES = tuple(itertools.product((16, 32, 64, 128), (16, 32, 64, 128)))
-_env = os.environ.get("TUNE_CANDIDATES", "").strip()
-CANDIDATES = (tuple(tuple(int(x) for x in c.split("x")) for c in _env.split(","))
-              if _env else _DEFAULT_CANDIDATES)
+# cuTile: every extent a power of two. FA2 returns kBlockM=128 unconditionally
+# for every arch and head_dim, which is why 128 is in the M set; its kBlockN for
+# the headdim<=64 bucket all four of our head_dims fall into is 112, which is
+# not expressible here at all -- 64 and 128 are the legal neighbours.
+_TILE_CANDIDATES = tuple(itertools.product((16, 32, 64, 128), (16, 32, 64, 128)))
 
-# Shapes the kernel is actually used at. Timed together so a shape is chosen for
-# aggregate behaviour rather than for one lucky sequence length.
+# wmma: BLOCK_M % 16 == 0 (and it is the warp count times 16, so 256 is 8 warps
+# and the practical ceiling), BLOCK_N % WK == 0. Illegal shapes are pruned by
+# _wmma_legal below rather than discovered by a failed build.
+_WMMA_M = (16, 32, 64, 128)
+_WMMA_N = (16, 32, 48, 64, 80, 96, 112, 128)
+
+# Bytes per element and fragment K/pad, keyed by the dtype the sweep runs at.
+# Mirrors FragTraits in csrc/fused_attention.cu.
+_FRAG = {
+    torch.float32:  (4, 8, 4),    # tf32 fragments: 16x16x8, ldm % 4 == 0
+    torch.float16:  (2, 16, 8),   # ldm % 8 == 0
+    torch.bfloat16: (2, 16, 8),
+}
+
+
+def _wmma_smem(dtype, head_dim: int, m: int, n: int):
+    """(total, scratch) shared bytes WmmaCfg<scalar_t, HEAD_DIM> asks for here.
+
+    `scratch` is the QO/K/V/S span the accumulator probe borrows before the
+    first key tile is staged; SUPPORTED requires it to cover PROBE_BYTES.
+
+    Kept in step with csrc/fused_attention.cu by hand. If the two drift, the
+    only cost is a wasted build or a shape skipped that would have compiled --
+    the kernel's own SUPPORTED check is still what decides, and a shape that
+    slips through anyway declines at run time and scores as `inf`.
+    """
+    esz, _, pad = _FRAG[dtype]
+    pdim = 16 if head_dim < 16 else head_dim
+    kv_ld, o_ld, s_ld = pdim + pad, pdim + 4, n + pad
+    qo = max(esz * m * kv_ld, 4 * m * o_ld)
+    kv = esz * n * kv_ld
+    s_bytes = 4 * m * s_ld
+    p_bytes = 0 if dtype is torch.float32 else esz * m * s_ld   # p aliases s for tf32
+    scratch = qo + 2 * kv + s_bytes
+    return scratch + p_bytes + 3 * (4 * m), scratch
+
+
+def _wmma_legal(dtype, head_dim: int, m: int, n: int) -> bool:
+    _, wk, _ = _FRAG[dtype]
+    pdim = 16 if head_dim < 16 else head_dim
+    if pdim % wk or pdim % 16 or n % wk or m % 16:
+        return False
+    total, scratch = _wmma_smem(dtype, head_dim, m, n)
+    if scratch < 4 * (m // 16) * 512:        # the accumulator probe needs this much
+        return False
+    # 48 KB is the cap that keeps two blocks resident without opting in to the
+    # larger dynamic shared-memory carveout.
+    return total <= 48 * 1024
+
+
+def _wmma_candidates(dtype, head_dim: int):
+    return tuple((m, n) for m in _WMMA_M for n in _WMMA_N
+                 if _wmma_legal(dtype, head_dim, m, n))
+
+
+# ---------------------------------------------------------------------------
+# Backends
+# ---------------------------------------------------------------------------
+
+class Backend:
+    """One sweepable kernel: its impl code, macro prefix, and shape space.
+
+    `mask_split` is False for wmma, whose kernel takes is_causal at run time and
+    so cannot carry a per-mask shape. That is not a gap in the macros; it is a
+    property of the kernel, and scoring wmma on dense cases alone would tune it
+    for half of what it actually runs.
+    """
+
+    def __init__(self, name, impl, prefix, head_dims, mask_split, dtypes):
+        self.name = name
+        self.impl = impl
+        self.prefix = prefix
+        self.head_dims = head_dims
+        self.mask_split = mask_split
+        self.dtypes = dtypes
+
+    def candidates(self, dtype, head_dim):
+        if self.name == "wmma":
+            return _wmma_candidates(dtype, head_dim)
+        return _TILE_CANDIDATES
+
+    def macros(self, dtype, head_dim: int, m: int, n: int, causal: bool) -> dict:
+        """-D overrides pinning `head_dim` to (m, n) and every other head_dim to
+        a shape known to compile, so one bad candidate cannot fail the build for
+        reasons unrelated to the shape under test."""
+        mp = f"{self.prefix}_{'CM' if causal else 'M'}"
+        np_ = f"{self.prefix}_{'CN' if causal else 'N'}"
+        safe_m, safe_n = (32, 16) if self.name == "wmma" else (64, 64)
+        out = {}
+        for d in self.head_dims:
+            out[f"{mp}_{d}"] = m if d == head_dim else safe_m
+            out[f"{np_}_{d}"] = n if d == head_dim else safe_n
+        return out
+
+
+BACKENDS = {
+    "tile-fp32": Backend("tile-fp32", 3, "FP32", (8, 16, 32, 64), True,  (torch.float32,)),
+    "tile-bf16": Backend("tile-bf16", 4, "BF16", (8, 16, 32, 64), True,  (torch.float32,)),
+    "tile-tf32": Backend("tile-tf32", 5, "TF32", (8, 16, 32, 64), True,  (torch.float32,)),
+    "wmma":      Backend("wmma",      2, "WMMA", (8, 16, 32, 64, 128), False,
+                         (torch.float32, torch.float16, torch.bfloat16)),
+}
+
+# Shapes the kernels are actually used at. Timed together so a shape is chosen
+# for aggregate behaviour rather than for one lucky sequence length.
 #
 # The short case is not optional. A first pass swept only 512 and 2048 and chose
 # BLOCK_M=128 at head_dim 64; at seq_len 128 that is a single query tile, so the
@@ -69,18 +189,8 @@ ALL_CASES = (
     (1, 8, 2048, True),
 )
 
-# --causal scores only the causal cases and writes the TF32_CM_*/TF32_CN_*
-# macros; the default scores only the dense ones. Scoring a shape on cases it
-# will never run is how a single shape ended up serving both mask modes.
-CAUSAL = "--causal" in sys.argv
-CASES = tuple(c for c in ALL_CASES if c[3] == CAUSAL)
-PREFIX = "TF32_CM" if CAUSAL else "TF32_M"
-NPREFIX = "TF32_CN" if CAUSAL else "TF32_N"
 
-TILE_TF32 = 5
-
-
-def build(name: str, defines: dict[str, int], workdir: str):
+def build(name: str, defines: dict, workdir: str):
     """Build the extension with these -D overrides into a private directory.
 
     The module name must be unique per candidate: load() imports by name and
@@ -123,30 +233,31 @@ def time_ms(fn, iters: int = 30) -> float:
     return statistics.median(s.elapsed_time(e) for s, e in zip(starts, ends))
 
 
-def make_cases(head_dim: int):
+def make_cases(head_dim: int, dtype, cases):
     """Materialise inputs once, so timing does not include allocation."""
     dev = torch.device("cuda")
     out = []
-    for b, h, sl, causal in CASES:
-        q, k, v = (torch.randn(b, h, sl, head_dim, device=dev) for _ in range(3))
+    for b, h, sl, causal in cases:
+        q, k, v = (torch.randn(b, h, sl, head_dim, device=dev, dtype=dtype)
+                   for _ in range(3))
         out.append(((q, k, v), causal, head_dim ** -0.5))
     return out
 
 
-def time_round(mod, cases) -> float:
+def time_round(mod, cases, impl: int) -> float:
     """One pass over every case; total ms, or inf if this build declines them."""
     total = 0.0
     try:
         with torch.inference_mode():
             for (q, k, v), causal, scale in cases:
                 total += time_ms(lambda: mod.fused_attention_forward(
-                    q, k, v, None, causal, scale, TILE_TF32), iters=15)
+                    q, k, v, None, causal, scale, impl), iters=15)
     except RuntimeError:
         return float("inf")
     return total
 
 
-def score_all(mods: dict, head_dim: int, rounds: int = 5) -> dict:
+def score_all(mods: dict, head_dim: int, dtype, cases, impl: int, rounds: int = 5) -> dict:
     """Time every candidate round-robin; return each one's best round.
 
     Timing candidate A to completion and then candidate B measures whatever
@@ -158,51 +269,48 @@ def score_all(mods: dict, head_dim: int, rounds: int = 5) -> dict:
     Corollary: numbers from two separate runs of this script are NOT
     comparable. Any candidate you want to rank must be in the same run.
     """
-    cases = make_cases(head_dim)
+    materialised = make_cases(head_dim, dtype, cases)
     best = {name: float("inf") for name in mods}
     for _ in range(rounds):
         for name, mod in mods.items():
-            best[name] = min(best[name], time_round(mod, cases))
+            best[name] = min(best[name], time_round(mod, materialised, impl))
     return best
 
 
-def main() -> int:
-    if not torch.cuda.is_available():
-        print("CUDA unavailable")
-        return 1
-    kernel_ext._ensure_msvc_on_path()
-    tile_home = kernel_ext._find_tile_cuda_home()
-    if tile_home is None:
-        print("no CUDA toolkit with <cuda_tile.h> (needs 13.3+)")
-        return 1
-    os.environ["CUDA_HOME"] = tile_home
-    os.environ["PATH"] = os.path.join(tile_home, "bin") + os.pathsep + os.environ["PATH"]
+def sweep_backend(be: Backend, dtype, head_dims, causal: bool, rounds: int) -> dict:
+    """Sweep one backend over the requested head_dims; return {head_dim: (ms, m, n)}."""
+    # A mask-split backend is scored only on the cases its shape will serve.
+    # Scoring a shape on cases it never runs is how one shape ended up serving
+    # both mask modes. wmma's shape serves both, so it is scored on both.
+    cases = tuple(c for c in ALL_CASES if c[3] == causal) if be.mask_split else ALL_CASES
 
-    wanted = [int(a) for a in sys.argv[1:] if not a.startswith("-")] or list(HEAD_DIMS)
-    print(f"{torch.cuda.get_device_name(0)}  "
-          f"sm_{''.join(map(str, torch.cuda.get_device_capability()))}  "
-          f"{'causal' if CAUSAL else 'dense'} shapes")
+    label = f"{be.name}  {str(dtype).replace('torch.', '')}  "
+    label += ("causal" if causal else "dense") if be.mask_split else "dense+causal"
+    print(f"\n=== {label} ===")
 
     winners = {}
-    for hd in wanted:
-        print(f"\nhead_dim {hd}")
+    for hd in head_dims:
+        cands = be.candidates(dtype, hd)
+        if not cands:
+            print(f"\nhead_dim {hd}: no legal shape")
+            continue
+        print(f"\nhead_dim {hd}  ({len(cands)} candidates)")
+
         # Build every candidate before timing any of them, so the measurement
         # phase is not interrupted by minute-long nvcc runs.
         mods, workdirs = {}, []
-        for m, n in CANDIDATES:
-            # Only the head_dim under test varies; the others stay at a shape
-            # known to compile so the build stays valid.
-            defines = {f"{PREFIX}_{d}": (m if d == hd else 64) for d in HEAD_DIMS}
-            defines.update({f"{NPREFIX}_{d}": (n if d == hd else 64) for d in HEAD_DIMS})
-            workdir = tempfile.mkdtemp(prefix=f"tf32_{hd}_{m}x{n}_")
+        for m, n in cands:
+            defines = be.macros(dtype, hd, m, n, causal)
+            workdir = tempfile.mkdtemp(prefix=f"{be.prefix}_{hd}_{m}x{n}_")
             workdirs.append(workdir)
             try:
-                mods[f"{m}x{n}"] = build(f"tile_tf32_{hd}_{m}x{n}", defines, workdir)
+                mods[f"{m}x{n}"] = build(
+                    f"tune_{be.prefix.lower()}_{hd}_{m}x{n}", defines, workdir)
             except Exception as exc:                       # compile failure
                 print(f"  {f'{m}x{n}':>10}  build failed: {str(exc)[:60]}")
 
         if mods:
-            scores = score_all(mods, hd)
+            scores = score_all(mods, hd, dtype, cases, be.impl, rounds)
             print(f"  {'M x N':>10}{'best ms':>12}")
             for name, t in sorted(scores.items(), key=lambda kv: kv[1]):
                 shown = f"{t:.3f}" if t != float("inf") else "declined"
@@ -216,18 +324,81 @@ def main() -> int:
                 print(f"  -> best {best_name} at {scores[best_name]:.3f} ms{margin}")
         for w in workdirs:
             shutil.rmtree(w, ignore_errors=True)
+    return winners
 
 
-    print("\nPaste into BlockCfg<HEAD_DIM, MathMode::Tf32>:")
-    for hd in wanted:
-        if hd in winners:
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        description="Sweep attention block shapes.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("head_dims", nargs="*", type=int,
+                   help="head_dims to sweep (default: all the backend supports)")
+    p.add_argument("--backend", action="append", choices=sorted(BACKENDS),
+                   help="repeatable; default is every backend")
+    p.add_argument("--causal", action="store_true",
+                   help="sweep the causal shapes (tile backends only)")
+    p.add_argument("--dtype", default="float32",
+                   choices=("float32", "float16", "bfloat16"),
+                   help="input dtype; only wmma accepts anything but float32")
+    p.add_argument("--rounds", type=int, default=5,
+                   help="interleaved timing rounds per candidate")
+    return p.parse_args(argv)
+
+
+def main(argv) -> int:
+    args = parse_args(argv)
+    if not torch.cuda.is_available():
+        print("CUDA unavailable")
+        return 1
+    kernel_ext._ensure_msvc_on_path()
+    tile_home = kernel_ext._find_tile_cuda_home()
+    if tile_home is None:
+        print("no CUDA toolkit with <cuda_tile.h> (needs 13.3+)")
+        return 1
+    os.environ["CUDA_HOME"] = tile_home
+    os.environ["PATH"] = os.path.join(tile_home, "bin") + os.pathsep + os.environ["PATH"]
+
+    dtype = getattr(torch, args.dtype)
+    names = args.backend or sorted(BACKENDS)
+
+    print(f"{torch.cuda.get_device_name(0)}  "
+          f"sm_{''.join(map(str, torch.cuda.get_device_capability()))}  "
+          f"dtype={args.dtype}")
+
+    results = {}
+    for name in names:
+        be = BACKENDS[name]
+        if dtype not in be.dtypes:
+            takes = ", ".join(str(d).replace("torch.", "") for d in be.dtypes)
+            print(f"\n=== {name} === skipped: takes {takes}, not {args.dtype}")
+            continue
+        if args.causal and not be.mask_split:
+            print(f"\n=== {name} === skipped: its kernel takes is_causal at run "
+                  f"time, so one shape serves both mask modes. Run without "
+                  f"--causal; it is scored on dense and causal cases together.")
+            continue
+        head_dims = [h for h in (args.head_dims or be.head_dims) if h in be.head_dims]
+        if not head_dims:
+            have = ", ".join(map(str, be.head_dims))
+            print(f"\n=== {name} === skipped: supports head_dim {{{have}}}")
+            continue
+        results[name] = sweep_backend(be, dtype, head_dims, args.causal, args.rounds)
+
+    print("\n" + "=" * 60)
+    print("Winners. Paste into the macro defaults these override.")
+    for name, winners in results.items():
+        be = BACKENDS[name]
+        mp = f"{be.prefix}_{'CM' if args.causal and be.mask_split else 'M'}"
+        np_ = f"{be.prefix}_{'CN' if args.causal and be.mask_split else 'N'}"
+        print(f"\n{name}:")
+        for hd in sorted(winners):
             _, m, n = winners[hd]
-            print(f"  head_dim {hd:<3} M = {m:<4} N = {n}")
+            print(f"  #define {mp}_{hd:<4} {m:<4}   #define {np_}_{hd:<4} {n}")
     return 0
 
 
 if __name__ == "__main__":
-    rc = main()
+    rc = main(sys.argv[1:])
     # A sweep loads a few dozen CUDA extension modules into one interpreter and
     # Windows reliably faults during their teardown, long after the results are
     # printed and returned. Exiting hard skips the teardown so the exit status

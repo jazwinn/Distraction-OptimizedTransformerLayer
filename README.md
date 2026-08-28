@@ -414,7 +414,7 @@ scripts/ab_split_kv.py                    timings: split-KV against single-pass,
 scripts/ab_layout.py                      timings: strided q/k/v against contiguous, interleaved
 scripts/ab_graph.py                       timings: replay against eager, interleaved;
                                           --recommend tunes _GRAPH_MAX_ACTIVATION
-scripts/tune_tile_tf32.py                 block-shape sweep for the tile kernel
+scripts/tune_block_shapes.py             block-shape sweep for every attention backend
 scripts/sass_mix.py                       SASS instruction mix and occupancy, head_dim 64
 
 REPORT.md                                 results, running instructions, and the engineering record

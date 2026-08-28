@@ -1116,7 +1116,7 @@ and the slowest kernel here.
 | `scripts/ab_split_kv.py` | A/Bs the split-KV path against single-pass, interleaved in one process with a control group. |
 | `scripts/ab_layout.py` | A/Bs contiguous q/k/v against the packed views the model produces, alternating call by call, with a contiguous-vs-contiguous control row. Measures what reading strides costs, not what skipping the clones saves. |
 | `scripts/ab_graph.py` | A/Bs eager against graph replay, interleaved with an eager-vs-eager control row for the noise floor. `--recommend` measures the crossover on the machine it runs on and prints the `_GRAPH_MAX_ACTIVATION` to set, refusing to answer if the control rows say the machine is too noisy to trust. |
-| `scripts/tune_tile_tf32.py` | Sweeps the tile kernel's block shapes per mask mode. |
+| `scripts/tune_block_shapes.py` | Sweeps block shapes for every attention backend (wmma and the three tile math modes), per mask mode where the kernel can carry one. |
 | `scripts/sass_mix.py` | SASS instruction mix and occupancy for the head_dim 64 kernels. |
 
 `kernel_ext.py` puts MSVC on `PATH` itself, so these do not strictly need the `devenv.bat`

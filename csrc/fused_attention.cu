@@ -38,6 +38,7 @@
 #include <cuda_bf16.h>
 #include <mma.h>
 
+#include <cstdlib>
 #include <type_traits>
 #include <vector>
 
@@ -364,7 +365,7 @@ __device__ __forceinline__ void dev_from_float(__nv_bfloat16& d, float s) { d = 
 #endif
 #ifndef WMMA_M_64
 #define WMMA_M_64  64
-#define WMMA_N_64  32
+#define WMMA_N_64  16
 #endif
 #ifndef WMMA_M_128
 #define WMMA_M_128 32
@@ -432,6 +433,15 @@ struct WmmaCfg {
     static constexpr size_t PROBE_BYTES = sizeof(float) * WARPS * 512;
     static constexpr size_t SCRATCH_BYTES = QO_BYTES + 2 * KV_BYTES + S_BYTES;
 
+    // Whether causal blocks are worth dispatching longest-first. Per head_dim
+    // for the same reason WmmaShape is: head_dim 128 runs a 32x16 block of two
+    // warps at ~36 KB, so only two blocks and 128 threads land on an SM. With
+    // that little in flight the kernel is bound by K/V locality rather than by
+    // makespan, and reordering the dispatch costs more L2 reuse than it saves
+    // tail -- measured 0.889x-0.966x over five shapes, against 1.02x-1.09x at
+    // head_dim 16 through 64. scripts/ab_causal_reverse.py has the table.
+    static constexpr bool REVERSE_CAUSAL = (HEAD_DIM <= 64);
+
     // GEMM1 contracts over the padded head_dim, GEMM2 over the key tile; both
     // must be a whole number of fragments. Staying under 48 KB keeps two blocks
     // resident per SM without having to opt in to the larger dynamic
@@ -442,6 +452,20 @@ struct WmmaCfg {
         (BLOCK_N % WK == 0) && (BLOCK_M % 16 == 0) &&
         (SCRATCH_BYTES >= PROBE_BYTES) && (SMEM <= 48 * 1024);
 };
+
+// Runtime off switch for the causal block-index reversal below, so the two
+// mappings can be A/B'd inside a single process; see wmma_set_causal_reverse in
+// the module. The environment variable supplies only the initial value.
+// Deliberately unsynchronised, on the same contract as tile_attention's split
+// flag: a benchmarking knob flipped between timed runs from one thread, never
+// while launches are in flight.
+bool& causal_reverse_flag() {
+    static bool on = [] {
+        const char* e = std::getenv("WMMA_CAUSAL_REVERSE");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    return on;
+}
 
 template <typename scalar_t, int HEAD_DIM>
 __global__ __launch_bounds__(WmmaCfg<scalar_t, HEAD_DIM>::NTHREADS)
@@ -455,7 +479,7 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
                                  scalar_t* __restrict__ out,
                                  int B, int H, int S,
                                  bool is_causal, float scale,
-                                 bool out_bshd) {
+                                 bool out_bshd, bool reverse_m) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using Cfg = WmmaCfg<scalar_t, HEAD_DIM>;
     using frag_elem = typename FragTraits<scalar_t>::elem;
@@ -498,7 +522,17 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
     const int tid    = threadIdx.x;
     const int warp   = tid >> 5;
     const int lane   = tid & 31;
-    const int m_tile = blockIdx.x;
+    // Longest-processing-time-first for causal. Blocks are dispatched in
+    // roughly increasing linear index with grid.x varying fastest, and under
+    // causal masking block m walks m+1 key tiles -- so the identity mapping
+    // hands out the cheapest tiles first and leaves the most expensive for the
+    // final wave, where they alone set the makespan. Reversing grid.x issues
+    // the long ones first. grid.x *is* n_m here (unlike the tile kernel, whose
+    // grid.x is n_m * splits), so gridDim.x needs no rederivation. Dense has no
+    // such spread and keeps the identity mapping -- see csrc/TUNING.md.
+    const int m_tile = reverse_m ? (static_cast<int>(gridDim.x) - 1 -
+                                    static_cast<int>(blockIdx.x))
+                                 : static_cast<int>(blockIdx.x);
     const int h      = blockIdx.y;
     const int b      = blockIdx.z;
 
@@ -810,6 +844,32 @@ void launch_wmma_kernel(const torch::Tensor& q, const torch::Tensor& k,
 
     const bool out_bshd = (out.dim() == 3);
 
+    // Reversal only pays when there is a queue to reorder. Measured on 13
+    // causal shapes (scripts/ab_causal_reverse.py): below one wave every block
+    // is already resident, so dispatch order decides nothing and reversing only
+    // scatters L2 locality -- b2 h2 s2048 d64, 128 blocks against 138 resident,
+    // measured 0.933x. Above one wave the late blocks are the expensive ones
+    // and LPT bites: b1 h8 s2048 d64 at 256 blocks measured 1.101x.
+    //
+    // The capacity comes from the occupancy API rather than from dividing
+    // 100 KB by Cfg::SMEM, because registers can bind before shared memory does
+    // and only the driver knows which. It is a property of (kernel, threads,
+    // smem) -- all three compile-time constants here -- so it is queried once
+    // per instantiation, not per launch.
+    static const int resident = [] {
+        int per_sm = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &per_sm, fused_attention_wmma_kernel<scalar_t, HEAD_DIM>,
+                Cfg::NTHREADS, Cfg::SMEM) != cudaSuccess) {
+            return 0;   // unknown -> never reverse, i.e. keep today's mapping
+        }
+        return per_sm * at::cuda::getCurrentDeviceProperties()
+                            ->multiProcessorCount;
+    }();
+    const int blocks = static_cast<int>(grid.x) * H * B;
+    const bool reverse_m = Cfg::REVERSE_CAUSAL && is_causal &&
+                           causal_reverse_flag() && blocks > resident;
+
     fused_attention_wmma_kernel<scalar_t, HEAD_DIM>
         <<<grid, block, Cfg::SMEM, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const scalar_t*>(q.const_data_ptr()),
@@ -818,7 +878,8 @@ void launch_wmma_kernel(const torch::Tensor& q, const torch::Tensor& k,
             qs[0], qs[1], qs[2],
             mask_ptr, ms[0], ms[1], ms[2], ms[3],
             reinterpret_cast<scalar_t*>(out.data_ptr()),
-            B, H, S, is_causal, static_cast<float>(scale), out_bshd);
+            B, H, S, is_causal, static_cast<float>(scale), out_bshd,
+            reverse_m);
 }
 
 // Returns false when this (dtype, head_dim) pair has no tensor-core
@@ -1737,6 +1798,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("enabled"));
     m.def("tile_split_kv_enabled", &tile_attn::split_kv_enabled,
           "Whether the tile kernel's split-KV path is currently enabled");
+    m.def("wmma_set_causal_reverse",
+          [](bool enabled) { causal_reverse_flag() = enabled; },
+          "Enable/disable the wmma kernel's causal block-index reversal "
+          "(longest-processing-time-first). Runtime-settable so both mappings "
+          "can be timed in one process. No effect on dense shapes.",
+          pybind11::arg("enabled"));
+    m.def("wmma_causal_reverse_enabled",
+          []() { return causal_reverse_flag(); },
+          "Whether the wmma kernel's causal block-index reversal is on");
     m.def("fused_attention_forward", &fused_attention_forward,
           "Fused scaled-dot-product attention",
           pybind11::arg("q"),

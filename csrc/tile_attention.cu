@@ -395,11 +395,11 @@ __global__ void split_combine_kernel(const float* __restrict__ part_o,
 // and the two ways this measurement goes wrong. On a part with working TMA the
 // cliff sits elsewhere; re-measure rather than trusting these.
 
-// tf32, dense. Overridable from the build line so scripts/tune_tile_tf32.py can
+// tf32, dense. Overridable from the build line so scripts/tune_block_shapes.py can
 // search shapes without editing this file.
 #ifndef TF32_M_8
 #define TF32_M_8  128
-#define TF32_N_8  64
+#define TF32_N_8  16
 #endif
 #ifndef TF32_M_16
 #define TF32_M_16 128
@@ -417,14 +417,14 @@ __global__ void split_combine_kernel(const float* __restrict__ part_o,
 // tf32, causal. Block m walks m+1 key tiles, so a 128-row block both halves
 // the block count and doubles the spread between cheapest and most expensive
 // block; the optimum sits at a smaller BLOCK_M than dense wants. Swept by
-// scripts/tune_tile_tf32.py --causal.
+// scripts/tune_block_shapes.py --backend tile-tf32 --causal.
 #ifndef TF32_CM_8
-#define TF32_CM_8  128
+#define TF32_CM_8  64
 #define TF32_CN_8  64
 #endif
 #ifndef TF32_CM_16
-#define TF32_CM_16 128
-#define TF32_CN_16 32
+#define TF32_CM_16 64
+#define TF32_CN_16 64
 #endif
 #ifndef TF32_CM_32
 #define TF32_CM_32 128
@@ -466,7 +466,7 @@ __global__ void split_combine_kernel(const float* __restrict__ part_o,
 // alone reproduces exactly what was measured.
 #ifndef FP32_M_8
 #define FP32_M_8  64
-#define FP32_N_8  64
+#define FP32_N_8  32
 #endif
 #ifndef FP32_M_16
 #define FP32_M_16 32
@@ -511,8 +511,11 @@ __global__ void split_combine_kernel(const float* __restrict__ part_o,
 #define FP32_CN_16 FP32_N_16
 #endif
 #ifndef FP32_CM_32
-#define FP32_CM_32 FP32_M_32
-#define FP32_CN_32 FP32_N_32
+// Measured, not inherited: causal wants half the dense BLOCK_M here.
+// 32x16 = 1.054 ms against the dense shape 64x16 at 1.237 (1.17x), one
+// interleaved run. Dense at head_dim 32 still prefers 64x16 and is unchanged.
+#define FP32_CM_32 32
+#define FP32_CN_32 16
 #endif
 #ifndef FP32_CM_64
 #define FP32_CM_64 FP32_M_64

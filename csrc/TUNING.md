@@ -53,11 +53,11 @@ Inheriting either mode's shapes is wrong, so tf32 was swept separately.
 ### Dense, tf32
 
 Best-of-5 interleaved rounds over six shapes spanning seq_len 128/512/2048,
-causal and dense. Swept by `scripts/tune_tile_tf32.py`.
+causal and dense. Swept by `scripts/tune_block_shapes.py --backend tile-tf32`.
 
 | head_dim | best   | ms    | runner-up            |
 |---------:|:-------|------:|:---------------------|
-| 8        | 128x64 | 0.585 | 64x64 0.587 (noise)  |
+| 8        | 128x64 | 0.585 | 64x64 0.587 (noise)  |  <!-- superseded: see re-sweep below -->
 | 16       | 128x32 | 0.751 | 64x64 0.779 (1.04x)  |
 | 32       | 128x64 | 1.419 | 128x32 1.469 (1.04x) |
 | 64       | 128x32 | 2.855 | 64x64 3.151 (1.10x)  |
@@ -83,8 +83,65 @@ dense kernel wants. At head_dim 64: seq_len 2048 causal runs 0.867 ms at 64x64
 where the dense winner 128x32 runs 0.981; at seq_len 128 causal it is 0.082
 against 0.110. Tuning one shape across both mask modes gave up that much.
 
-Swept by `scripts/tune_tile_tf32.py --causal`, which scores only causal cases.
-Only head_dim 64 differs from dense (64x64 rather than 128x32).
+Swept by `scripts/tune_block_shapes.py --backend tile-tf32 --causal`, which
+scores only causal cases.
+Only head_dim 64 differed from dense (64x64 rather than 128x32) when this
+was written; the re-sweep below moved head_dim 8 and 16 as well.
+
+### 2026-08-28 re-sweep: what changed and what did not
+
+`scripts/tune_block_shapes.py` replaced `tune_tile_tf32.py` and now covers wmma
+and all three tile math modes. Re-running every cell against the current kernels
+moved five of them. Each margin below is candidate against incumbent **within one
+interleaved run**, which is the only comparison this file's first rule allows:
+
+| backend | mask | head_dim | was    | now    | margin |
+|:--------|:-----|---------:|:-------|:-------|:-------|
+| tile-fp32 | dense  | 8  | 64x64  | 64x32  | 1.34x  |
+| tile-tf32 | causal | 8  | 128x64 | 64x64  | 1.31x  |
+| tile-tf32 | dense  | 8  | 128x64 | 128x16 | 1.13x  |
+| tile-fp32 | causal | 32 | 64x16  | 32x16  | 1.17x  |
+| tile-tf32 | causal | 16 | 128x32 | 64x64  | 1.12x  |
+| wmma      | both   | 64 | 64x32  | 64x16  | 1.07x  |
+
+tile-fp32 causal head_dim 32 is the one cell where the two mask modes genuinely
+want different fp32 shapes: dense keeps 64x16, causal wants 32x16. Before the
+`FP32_CM_*` macros existed that was not expressible -- fp32 and bf16 had no
+causal shape axis at all, and the causal kernel silently ran the dense shape.
+The other three fp32 causal cells measured out identical to their dense values
+and still inherit them.
+
+bf16 (both mask modes) and wmma at float16/bfloat16 were **not swept** -- the run
+was stopped before them. bf16 still carries 64x64 at every head_dim, which given
+how fp32 and tf32 behaved at head_dim 8 and 16 is where the next win most likely
+sits.
+
+Every other cell held, or moved by less than the noise floor and was left alone.
+Four of the five sit at head_dim 8 or 16 -- the cells this file records as
+*inherited* rather than measured. The two that got real attention at the time
+(tf32 causal 32 and 64) both survived re-measurement unchanged. Inheriting a
+shape is what cost the 12-31% here, exactly as the tf32-vs-fp32 argument above
+predicts; the fix is to measure the small head_dims, not to find a better rule.
+
+**The noise floor is about 4.3%.** Two runs of the same shape (wmma head_dim
+128, 32x16) on an idle machine read 9.397 and 9.010 ms. Treat anything under
+that as a tie and keep the incumbent -- several cells nominally changed winner
+at 1.00-1.03x and were deliberately not touched.
+
+**The absolute milliseconds in the tables above no longer reproduce.** The same
+script, same case filter, same iters and rounds, measures roughly 1.9x faster
+across every tf32 cell than the numbers recorded here. The rankings are mostly
+intact and every qualitative claim still holds -- 128x128 is still worst at
+head_dim 64, the fp32 BLOCK_N=16 cliff is still there -- so this is a systematic
+shift, not a reordering. It is unexplained. Do not use the recorded ms as a
+baseline for anything; re-measure the incumbent alongside the challenger, which
+rule one already requires.
+
+**wmma carries one shape for all three dtypes.** `WmmaShape` is not parameterised
+on `scalar_t`, so the head_dim 64 change above was chosen on float32 -- the dtype
+the benchmark defaults to -- and applies to float16 and bfloat16 whether or not
+it suits them. A float16 sweep is the outstanding check; if it disagrees, that is
+the evidence for adding the parameter.
 
 ### Short dense grid, tf32
 
@@ -130,6 +187,73 @@ About 1% on the geometric mean, positive on absolute milliseconds because the
 wins land on the long cases. Kept for that, not for the theory; three lines to
 drop if the seq 512 regression ever matters more. The dense kernel has no such
 spread and keeps the identity mapping.
+
+## wmma kernel: causal block-index reversal, gated on one wave
+
+The same idea as the tile kernel's reversal above, ported to the hand-written
+kernel and measured by `scripts/ab_causal_reverse.py`. It does not port
+unconditionally: ungated it is a wash, and the reason it is a wash is the useful
+part.
+
+Ungated, over 13 causal shapes: geometric mean **1.002x**, with individual
+shapes from 0.933x to 1.101x. Both extremes reproduce to within 1% across runs,
+so that spread is not noise -- the dense control rows read 0.2%, and a
+`--self-control` run (the reversed mapping timed against itself, so every true
+ratio is exactly 1.000) puts the causal noise floor at 1.2%. Sorting by how many
+waves the grid fills explains it:
+
+| blocks | vs ~138 resident | ratio |
+|:-------|:-----------------|------:|
+| 64     | 0.5 wave         | 0.988x |
+| 128    | 0.9 wave         | 0.933x - 1.005x |
+| 256    | 1.9 waves        | **1.101x** |
+| 512    | 3.7 waves        | 1.018x - 1.029x |
+| 1024   | 7.4 waves        | 0.995x |
+
+Reversal reorders a *queue*. Below one wave there is no queue -- every block is
+already resident, dispatch order decides nothing, and all the reordering can do
+is scatter K/V locality between the blocks running side by side. Above one wave
+LPT bites, and it bites hardest at about two waves, where the tail is a large
+fraction of the makespan. By eight waves the tail is amortised and it washes out
+again.
+
+So the mapping is gated on `blocks > resident`. `resident` comes from
+`cudaOccupancyMaxActiveBlocksPerMultiprocessor` rather than from dividing the
+SM's shared memory by `Cfg::SMEM`: registers can bind before shared memory does,
+and only the driver knows which did. It is a property of (kernel, threads,
+smem), all compile-time constants here, so it is queried once per instantiation
+rather than per launch.
+
+**head_dim 128 is excluded outright.** It runs a 32x16 block of two warps at
+~36 KB, so an SM holds two blocks and 128 threads. With that little in flight
+the kernel is bound by K/V locality rather than by makespan, and the reordering
+costs more L2 reuse than it saves tail. Five shapes, none of them positive:
+
+| case                    | blocks | ratio |
+|:------------------------|-------:|------:|
+| b1 h8 s2048 d128 causal |    512 | 0.889x |
+| b1 h4 s2048 d128 causal |    256 | 0.903x |
+| b4 h8 s1024 d128 causal |   1024 | 0.948x |
+| b2 h8 s1024 d128 causal |    512 | 0.952x |
+| b2 h4 s1024 d128 causal |    256 | 0.966x |
+
+Gated and with head_dim 128 out, over 17 causal shapes: geometric mean
+**1.009x**, worst case 0.996x against a 0.3% control -- no shape regresses, and
+`b1 h8 s2048 d64 causal` keeps its 1.096x. End to end at that shape
+(`--seq-len 2048 --batch-size 1 --causal`) the harness min goes 9.24 -> 8.96 ms,
+about 3%, reproduced over two process pairs.
+
+Two limits worth knowing:
+
+- **The padded-causal path never reaches it.** `MySelfAttention` folds causal
+  into an explicit `[B,1,S,S]` mask whenever there is real padding to combine
+  with, which arrives as `is_causal=false`. The kernel cannot tell that mask is
+  triangular, so the imbalance is there and the fix is not. Those rows show up
+  as controls in the A/B table rather than as measurements.
+- **`WMMA_CAUSAL_REVERSE=0` disables it**, and `wmma_set_causal_reverse()` flips
+  it at run time so both mappings can be timed in one process. Like
+  `tile_set_split_kv`, it is invisible to the CUDA-graph cache key -- flipping
+  it after capture does nothing to a captured model.
 
 ## Tile kernel: split-KV (Flash-Decoding)
 
