@@ -16,13 +16,17 @@ from __future__ import annotations
 import os
 import sys
 
-import torch
-import torch.nn.functional as F
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Above torch on purpose: importing kernel_ext preloads the driver's GPU
+# compiler, which stops a cuTile run from exiting 0xC0000005 only if it happens
+# before torch pulls the NVIDIA DLLs in. See kernel_ext.preload_tile_compiler().
 import kernel_ext  # noqa: E402
+
+import torch  # noqa: E402
+import torch.nn.functional as F  # noqa: E402
+
 from verify_kernel import CASES, build_case, reference_attention  # noqa: E402
 
 
@@ -72,6 +76,11 @@ def main() -> int:
     # tile kernel is absent from builds that found no CUDA 13.3+. Both show as
     # n/a. Kept as a list so a new math mode is one entry, not another set of
     # hand-written column branches.
+    #
+    # The scalar column is optional for the same reason: it covers every
+    # head_dim in this table now, but it declines rather than falling through
+    # to ATen on ones it does not, which is what used to put ATen's time in
+    # this table under the scalar kernel's name.
     TILE_COLS = (("tile", 3), ("tile-tf32", 5), ("tile-bf16", 4))
 
     head = (f"{'case':<18}{'sdpa':>10}{'scalar':>10}{'wmma':>10}"
@@ -93,16 +102,19 @@ def main() -> int:
 
         with torch.inference_mode():
             ref = reference_attention(q, k, v, am, ic, scale).float()
-            err_scalar = (run(1).float() - ref).abs().max().item()
             err_wmma = (run(0).float() - ref).abs().max().item()
 
             timed = {
                 "sdpa": lambda: F.scaled_dot_product_attention(
                     q, k, v, attn_mask=am, is_causal=ic, scale=scale),
-                "scalar": lambda: run(1),
                 "wmma": lambda: run(0),
             }
             errs = {}
+            try:
+                errs["scalar"] = (run(1).float() - ref).abs().max().item()
+                timed["scalar"] = lambda: run(1)
+            except RuntimeError:
+                errs["scalar"] = None
             for name, impl in TILE_COLS:
                 try:
                     errs[name] = (run(impl).float() - ref).abs().max().item()
@@ -118,7 +130,9 @@ def main() -> int:
             return (f"{fmt(name):>{width}}" if errs[name] is not None
                     else f"{'n/a':>{width}}")
 
-        print(f"{label:<18}{t['sdpa']:>10.3f}{t['scalar']:>10.3f}{t['wmma']:>10.3f}"
+        print(f"{label:<18}{t['sdpa']:>10.3f}"
+              + cell("scalar", 10, lambda n: f"{t[n]:.3f}")
+              + f"{t['wmma']:>10.3f}"
               + "".join(cell(n, 10, lambda n=n: f"{t[n]:.3f}") for n, _ in TILE_COLS)
               + f"{t['sdpa'] / t['wmma']:>10.2f}x"
               + "".join(cell(n, 16, lambda n=n: f"{t['sdpa'] / t[n]:.2f}x")
@@ -128,13 +142,14 @@ def main() -> int:
                         for n, _ in TILE_COLS))
 
     print("-" * len(head))
-    print("ratios >1 mean the custom kernel is faster than sdpa. wmma now "
-          "covers every")
-    print("head_dim in the table; the tile columns report n/a at head_dim 128, "
-          "which they")
-    print("do not specialize. tile runs on the CUDA cores; tile-tf32 and "
-          "tile-bf16 are the")
-    print("same kernel with its GEMM operands narrowed onto the tensor cores.")
+    print("ratios >1 mean the custom kernel is faster than sdpa. scalar and "
+          "wmma now cover")
+    print("every head_dim in the table; the tile columns report n/a at head_dim "
+          "128, which")
+    print("they do not specialize. tile runs on the CUDA cores; tile-tf32 and "
+          "tile-bf16 are")
+    print("the same kernel with its GEMM operands narrowed onto the tensor "
+          "cores.")
     return 0
 
 

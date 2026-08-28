@@ -498,6 +498,27 @@ whether a few near-zero-reference elements happen to land inside `atol`.
 Tensor cores need compute capability **8.0+**; below that the scalar kernel runs. Selection
 is automatic — `--attn-impl` only exists to force a path for measurement.
 
+The scalar kernel now covers the same five head_dims, so that fallback is real at every
+column rather than four of five. It used to stop at 64, because a thread holds q and the
+output accumulator for its row in registers and `q_reg[128] + acc[128]` is 256 registers
+against a hardware ceiling of 255 — a wall, not a tuning problem. Past 64 the row is split
+between two adjacent lanes instead: 64 dims of each array per thread, one `__shfl_xor_sync`
+per key to make the partial dot products whole, and everything after that — running max,
+rescale, accumulate, normalise — done identically by both partners on their own half. One
+shuffle per key, no other communication, and the same total shared-memory traffic, since the
+two threads read disjoint halves of the key row. Measured `REG:168, LOCAL:0` at head_dim 128
+float32: no spill. It also doubles the block to 128 threads, which lifts occupancy from two
+warps per SM to twelve.
+
+At `wide head_dim` (B2·H4·S64·D128) it runs 0.059 ms against SDPA's 0.054 and wmma's 0.037,
+and lands 8.9e-7 from an fp32 reference where wmma lands 6.2e-4 — which is the point of
+having it. It is a correctness reference and a pre-Ampere fallback, not a competitor.
+
+A side effect of routing every head_dim through one `ScalarCfg`: the launcher now declines
+when a (dtype, head_dim) pair wants more shared memory than a block gets, instead of
+launching and failing. float64 past head_dim 16 asks for 64 KB against a 48 KB budget and
+used to do exactly that.
+
 **The two former gaps are closed, and both were block-shape problems.**
 
 `head_dim=8` is narrower than the 16-wide wmma fragment, so GEMM2's N dimension could not
@@ -511,8 +532,11 @@ brings the same head_dim down to 35.9 KB. `WmmaShape` now picks the block per he
 `WARPS` follows from `BLOCK_M` so the warp/lane mapping stays consistent.
 
 Both were worth real speed, not just coverage — at `head_dim=128` the tensor-core kernel
-runs 0.041 ms against the scalar fallback's 0.142 ms, turning a 0.40x loss to SDPA into a
-1.40x win.
+runs 0.041 ms against the 0.142 ms that shape used to cost, turning a 0.40x loss to SDPA into
+a 1.40x win. (That 0.142 ms was ATen, not the scalar kernel, which has no head_dim 128
+specialisation. It reads as "the scalar fallback" in older revisions of this file for the
+reason worked through in [The one
+regression](#the-one-regression-and-why-it-was-not-the-kernel-it-was-blamed-on).)
 
 ## Notes and known limits
 
@@ -548,12 +572,32 @@ only `.eval()`ed, so escaping inference mode without it would build an autograd 
 capture. Capture itself works fine from inside `inference_mode`; an earlier note claiming
 otherwise was wrong.
 
-**The cuTile kernels crash the interpreter at shutdown.** An access violation (`0xC0000005`),
-raised *after* `main()` has returned its exit code, so a run looks like it passed and then
-reports a nonzero status. It is unrelated to CUDA graphs — it reproduces with `--cuda-graph
-off` — and `scripts/verify_split_kv.py` already exits this way. `scripts/verify_graph.py`
-therefore leaves the tile impls behind `--include-tile` so its own exit code stays meaningful.
-Not yet diagnosed.
+**The cuTile shutdown crash was a DLL detach order problem, and it is fixed.** An access
+violation (`0xC0000005`) raised *after* `main()` had returned its exit code, so a run looked
+like it passed and then reported a nonzero status. Windows Error Reporting named the faulting
+module every time, at the same offset — `nvgpucomp64.dll`, fault offset `0x53ad3e` — which is
+the GPU compiler that ships with the display driver, not anything in CUDA or in this repo. It
+is involved at all because a tile object carries a *tile IR* fatbin section alongside the SASS
+(`cuobjdump -elf build/tile_attention.cuda.o` prints `Fatbin tile ir code: arch = sm_86`) that
+the driver finalises when the module loads. That is also why `CUDA_MODULE_LOADING=EAGER` with
+`--attn-impl wmma` faulted: loading the tile module was enough, launching a tile kernel was
+never required.
+
+Four things it was *not*, each ruled out by measurement: not context teardown
+(`cudaDeviceReset()`, `cuDevicePrimaryCtxReset()` and freeing every tensor first all still
+faulted); not a premature `FreeLibrary` (pinning with `GET_MODULE_HANDLE_EX_FLAG_PIN` did not
+help); not an `atexit` handler (`os._exit()` did not dodge it, though `TerminateProcess` did,
+which placed the fault after every line of Python); and not cuTile itself (a standalone `.exe`
+linking `tile_attention.cu` directly, launching the same kernel, exits cleanly). That leaves
+DLL detach order inside `python.exe`, and loading `nvgpucomp64.dll` *first* — so that it is
+detached last — is what fixes it. Measured 5/5 clean exits with the preload against 0/5
+without.
+
+`kernel_ext.preload_tile_compiler()` does the load, and it runs at `kernel_ext` import
+because it only works before `torch` is imported — preloading afterwards measures as no fix
+at all. Every entry point that can reach a tile kernel therefore imports `kernel_ext` above
+`torch`, `torch_transformer_benchmark.py` included, since `--attn-impl tile` is reachable
+from it. `kernel_ext.tile_compiler_status()` reports whether the preload landed in time.
 
 **The accuracy budget is tighter than it looks.** The baseline's *own* TF32 rounding sits
 9.8e-4 (non-causal) to 1.2e-3 (causal) away from an exact fp32 result — at or above
@@ -775,11 +819,13 @@ forward per shape to rule out.
 
 ### Unrelated bug found on the way
 
-The cuTile kernels crash the interpreter at shutdown with an access violation (`0xC0000005` on
-Windows), *after* `main()` has returned its exit code. This has nothing to do with graphs — it
-reproduces with `--cuda-graph off`, and `scripts/verify_split_kv.py` already exits the same way.
-`scripts/verify_graph.py` therefore checks `scalar` and `wmma` by default, with `--include-tile`
-opting in; the tile kernels are bit-exact under capture, it is their teardown that is broken.
+The cuTile kernels used to crash the interpreter at shutdown with an access violation
+(`0xC0000005` on Windows), *after* `main()` had returned its exit code. This had nothing to do
+with graphs — it reproduced with `--cuda-graph off`, and `scripts/verify_split_kv.py` exited
+the same way. It is fixed; the diagnosis is under [Notes and known
+limits](#notes-and-known-limits). `scripts/verify_graph.py` still checks `scalar` and `wmma`
+by default with `--include-tile` opting in, now because those are the two impls `auto` can
+select rather than because the tile exit code could not be trusted.
 
 ## Reading q/k/v in place
 
@@ -862,28 +908,47 @@ buffer carrying *q's* strides — which every kernel would then have written as 
 packed, scattering the result into the wrong rows. It is spelled out as `torch::empty` now.
 Nothing about that failure would have looked like a layout bug.
 
-### The one regression
+### The one regression, and why it was not the kernel it was blamed on
 
 `scripts/ab_layout.py` times contiguous against packed inputs alternating call by call, with
-a contiguous-vs-contiguous control row for the noise floor. At the default shape every impl
-lands in 1.000–1.016 against controls of 0.992–1.016 — free, as predicted. At `long seq`,
-likewise inside the control.
+a contiguous-vs-contiguous control row for the noise floor. Every custom kernel lands inside
+its control at every shape — 0.97–1.05 against controls of 0.97–1.05 — free, as predicted.
 
-The exception is the scalar kernel at head_dim 128: **1.41x slower on strided input**, with
-the control at 1.006, reproducible. The cause is memory-level parallelism rather than index
-arithmetic. That kernel holds `q_reg[128]` and `acc[128]` — 256 registers before anything
-else — and asks for 64 KB of shared memory, so it runs one block, two warps, per SM. Two
-warps have nothing queued up to hide a longer latency behind, so the access pattern shows up
-directly in the time.
+One row was not: `wide hd` / `scalar`, at head_dim 128, which read **1.41x slower on strided
+input** with a control of 1.006, and was written up here as the scalar kernel running out of
+memory-level parallelism — `q_reg[128]` and `acc[128]`, 256 registers, two warps per SM,
+nothing queued to hide a longer latency behind.
+
+**That explanation described a kernel that did not exist.** `dispatch_head_dim` stopped at
+head_dim 64 and always had (`git log -S "launch_kernel<scalar_t, 128>"` found nothing), for
+the reason the register count itself gives away: 256 registers per thread is one more than
+the hardware's 255-register ceiling. What the row was actually timing is ATen. Every forced
+impl except `scalar` declined loudly on a shape it did not cover; `scalar` fell through to
+`attention_aten` instead, so `impl=scalar` at head_dim 128 timed ATen and printed it under
+the scalar kernel's name. The code comment beside the exemption had already named this exact
+failure — "it can time ATen and label it 'scalar'" — and then deferred it as "a behaviour
+change, not a cleanup".
+
+The fix is to stop exempting it: forcing any impl now means that kernel or an error, and
+`auto` is the only mode that reaches ATen. The scalar kernel has since grown a real head_dim
+128 — see [Coverage and limits](#coverage-and-limits) for the lane-pair split that fits it
+under the register ceiling — so that row carries a genuine measurement again, and it reads
+**1.000 against a 1.000 control**. The regression that was attributed to memory-level
+parallelism at head_dim 128 does not exist in the kernel it was attributed to.
+
+The 1.41x itself is real, and it is ATen's. Measured directly, with a contiguous-vs-contiguous
+control at 1.007–1.021: ATen costs 1.41x on strided input at B8·H8·S128·D64, 1.42x at
+B2·H4·S64·D128 and 1.50x at head_dim 96 — the uncovered head_dim that `auto` really does route
+there — falling to 1.01x by seq 2048, where the matmuls are large enough to swamp the pitch.
+
+Handing ATen `.contiguous()` copies instead does *not* collect that back: the clone measures
+1.32–1.54x on the same three shapes, within noise of just passing the strided views and worse
+at head_dim 96. The copy costs what the strided reads cost. The fallback keeps the views, and
+that is now a measured tie rather than an oversight.
 
 Restructuring the staging loop row-outer, so the 64-bit row offset is computed once per row
-instead of once per element, more than halved that path in absolute terms. It made the
-*ratio* worse, because it sped the contiguous side up further still. The loop is kept in that
-shape for the absolute win; the ratio is not the thing to optimize.
-
-This is narrow. `auto` picks wmma at head_dim 128, which measures 1.000, so reaching the
-regression means forcing `impl=scalar` on a kernel that is already 0.26x of SDPA at that
-shape and exists as a correctness reference. It is recorded rather than fixed.
+instead of once per element, is kept: it is an absolute win at the head_dims the scalar kernel
+actually has. Its comment claimed head_dim 128 too, and has been corrected.
 
 ### The measurement that had to be thrown away
 
@@ -892,11 +957,17 @@ runs of the **unchanged** build reported 1.217x, 1.525x and 1.554x. Its `min` co
 those same runs, held to within 0.5% — 3.609, 3.611, 3.625 ms — and resolved the 6% cleanly
 against 3.403, 3.406, 3.407 after.
 
-Two earlier readings of the head_dim 128 regression, taken while the card was throttled, said
-2.23x and 2.28x; their control rows read 1.148 and 1.026, which should have been enough to
-discard them on the spot. The 1.41x above comes from runs whose control is 1.000. The control
-row is not decoration — see also [Absolute speedups are unusually sensitive to host
-contention](#absolute-speedups-are-unusually-sensitive-to-host-contention).
+Two earlier readings of the head_dim 128 row, taken while the card was throttled, said 2.23x
+and 2.28x; their control rows read 1.148 and 1.026, which should have been enough to discard
+them on the spot. A later one, on a card that had been busy for an hour, read **17.1x** with
+a control of 1.000 — and that one is the warning worth keeping, because the control row does
+*not* catch it. A ratio taken on a downclocked card stays honest about the ratio; what moves
+is which side of the comparison the clocks favour, and a control that compares two *identical*
+contiguous buffers cannot see that at all. The absolute times were the tell: `scalar` at
+`long seq` read 8.19 ms in that run and 2.76 ms once the card was cool, on an unchanged
+binary. On a quiet card the same row reads 1.42x, three times over. The control row is not
+decoration, but it is not sufficient either — see also [Absolute speedups are unusually
+sensitive to host contention](#absolute-speedups-are-unusually-sensitive-to-host-contention).
 
 ## What's left
 
@@ -1088,7 +1159,7 @@ attention:
 | Value | Behavior |
 | --- | --- |
 | `auto` | Tensor-core kernel where it applies, scalar kernel otherwise. |
-| `scalar` | Force the scalar kernel. No tensor cores, no TF32 rounding. |
+| `scalar` | Force the scalar kernel. No tensor cores, no TF32 rounding. `head_dim` in {8,16,32,64,128}; raises on anything else, so ATen cannot be timed under its name. |
 | `wmma` | Force the tensor-core kernel; raises on shapes it does not cover, so a silent fallback cannot be mistaken for a slow kernel. |
 | `tile` | Force the cuTile kernel — the same math written against the CUDA tile programming model instead of per-thread. float32, `head_dim` in {8,16,32,64}. Raises rather than falling back. |
 | `tile-tf32` | The same cuTile kernel with its two GEMMs narrowed to TF32, which is what puts them on the tensor cores. Same arithmetic `wmma` uses for fp32 inputs and the same ~1e-3 accuracy, so it clears the harness gate wherever `wmma` does. The tensor-core tile mode to reach for first. |

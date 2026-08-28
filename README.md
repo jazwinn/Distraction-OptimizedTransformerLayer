@@ -222,10 +222,12 @@ build succeeds regardless.
 actually ran. With `"auto"`, a silent fallback means you may be timing SDPA rather than the
 kernel; `"custom"` raises instead of falling back.
 
-**A run prints a passing verdict and then exits non-zero** — with a cuTile impl selected,
-the interpreter dies with an access violation (`0xC0000005`) *after* `main()` has returned.
-It is a teardown bug in the tile path, unrelated to anything the run measured; the printed
-verdict is the real one. See the known limits in [REPORT.md](REPORT.md).
+**A run prints a passing verdict and then exits non-zero** — this was a cuTile teardown
+fault (`0xC0000005` *after* `main()` returned) and it is fixed: importing `kernel_ext`
+before `torch` preloads the display driver's GPU compiler, which is what the fault was in.
+If you see it again, check that whatever you ran imports `kernel_ext` above `import torch`
+— `kernel_ext.tile_compiler_status()` says whether the preload landed in time. The
+diagnosis is in `preload_tile_compiler()`'s docstring and in [REPORT.md](REPORT.md).
 
 ### Toolset selection
 
@@ -318,6 +320,17 @@ and discarded.
 cores and so no TF32 rounding at all. It covers what wmma cannot (pre-Ampere cards) and
 stays selectable through `--attn-impl scalar` so the tensor-core win can be measured rather
 than assumed.
+
+Past head_dim 64 it is *half* a row per thread. A thread keeps q and the output accumulator
+for its row in registers — that is what makes the key loop a register FMA rather than a
+reload — and at head_dim 128 those two arrays want 256 registers against a hardware ceiling
+of 255. So two adjacent lanes share the row: 64 dims of each array apiece, one
+`__shfl_xor_sync` per key to add their partial dot products together, and the softmax
+bookkeeping repeated identically on both halves rather than communicated. Nothing else
+crosses between them, the two threads read disjoint halves of the key row so shared-memory
+traffic is unchanged, and the doubled block lifts occupancy from two warps per SM to twelve.
+Both partners share a row index, so they take every branch together — the `i < S` guard, the
+causal break, the mask skip — which is what makes a two-lane shuffle mask safe.
 
 **Fused residual add + LayerNorm.** Every LayerNorm in the model consumes the output of a
 residual add, so the two are one kernel: the sum is held on chip rather than written to

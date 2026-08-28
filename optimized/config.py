@@ -24,7 +24,11 @@ ATTENTION_BACKEND = "auto"
 # custom backend is in play. --attn-impl overrides this for a single run.
 #
 #   "auto"       tensor-core kernel where it applies, scalar kernel otherwise
-#   "scalar"     force the scalar kernel (no tensor cores, no TF32 rounding)
+#   "scalar"     force the scalar kernel (no tensor cores, no TF32 rounding);
+#                head_dim in {8,16,32,64,128}, and raises on anything else. It
+#                used to fall through to ATen instead, which meant --attn-impl
+#                scalar at a head_dim it did not cover timed ATen and called it
+#                the scalar kernel.
 #   "wmma"       force the tensor-core kernel; raises on shapes it misses
 #   "tile"       force the cuTile kernel, fp32 operands: exact, CUDA cores.
 #                float32 and head_dim in {8,16,32,64}, and needs a build that

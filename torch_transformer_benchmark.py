@@ -21,6 +21,13 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+# Above torch on purpose: importing kernel_ext preloads the driver's GPU
+# compiler, which stops --attn-impl tile from exiting 0xC0000005 only if it
+# happens before torch pulls the NVIDIA DLLs in. It builds nothing here -- the
+# extension is still built lazily on first use. See
+# kernel_ext.preload_tile_compiler().
+import kernel_ext  # noqa: F401
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

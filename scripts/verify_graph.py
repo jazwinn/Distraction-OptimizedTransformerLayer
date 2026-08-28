@@ -27,13 +27,12 @@ as a wrong shape or a NaN:
     trivial -> padded -> trivial sequence is asserted to capture twice and then
     *reuse*, not re-capture.
 
-One thing this script cannot be blamed for: with a cuTile impl selected
-(--include-tile), the process exits with an access violation *after* the verdict
-is printed. That is pre-existing and has nothing to do with graphs -- the same
-crash happens with CUDA_GRAPH="off", and scripts/verify_split_kv.py already exits
-the same way on this machine. The cuTile kernels are bit-exact under capture; it
-is their teardown that is broken. They are therefore off by default here so that
-this script's exit code stays meaningful.
+--include-tile used to make this script exit with an access violation *after*
+printing its verdict. That was never about graphs -- it happened with
+CUDA_GRAPH="off" too -- and it is fixed: see kernel_ext.preload_tile_compiler(),
+imported above torch at the top of this file. The tile impls stay off by default
+because they are not what the graph machinery is for, not because their exit code
+cannot be trusted any more.
 
     cmd.exe /c scripts\\devenv.bat python scripts\\verify_graph.py
     cmd.exe /c scripts\\devenv.bat python scripts\\verify_graph.py --test-failure
@@ -46,10 +45,16 @@ import argparse
 import os
 import sys
 
-import torch
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Above torch on purpose: importing kernel_ext preloads the driver's GPU
+# compiler, which stops a cuTile run from exiting 0xC0000005 only if it happens
+# before torch pulls the NVIDIA DLLs in. See kernel_ext.preload_tile_compiler().
+# It is what makes --include-tile safe to use without the exit code lying.
+import kernel_ext  # noqa: E402,F401
+
+import torch  # noqa: E402
 
 import torch_transformer_benchmark as bench  # noqa: E402
 from optimized import config, graphs  # noqa: E402
@@ -116,9 +121,9 @@ def main() -> int:
                          "result printed after it.")
     ap.add_argument("--include-tile", action="store_true",
                     help="also check the cuTile impls. Correct under capture, "
-                         "but they crash the interpreter at shutdown -- see the "
-                         "note in the source -- so this run's process exit code "
-                         "becomes meaningless and only the printed verdict counts.")
+                         "and the shutdown crash that used to make this run's "
+                         "exit code meaningless is fixed -- see the note in the "
+                         "source.")
     args = ap.parse_args()
 
     torch.set_float32_matmul_precision("high")
@@ -297,9 +302,9 @@ def main() -> int:
     print("\n=== per attention impl ===\n")
     saved_impl = config.ATTENTION_IMPL
     # scalar and wmma are the two impls "auto" can actually select, so they are
-    # the ones that matter by default. The cuTile impls are opt-in only because
-    # of the shutdown crash noted at the top of this file -- not because they
-    # are wrong under capture; they are bit-exact, and --include-tile shows it.
+    # the ones that matter by default. The cuTile impls are opt-in because they
+    # are never selected automatically, not because anything is wrong with them
+    # under capture; they are bit-exact, and --include-tile shows it.
     impls = ["scalar", "wmma"]
     if args.include_tile:
         impls += ["tile", "tile-tf32"]

@@ -31,6 +31,44 @@ cuobjdump -sass build/tile_attention.cuda.o | grep HMMA
 Fp32 kernels contain no HMMA; Tf32 emits `HMMA.1688.F32.TF32` and Bf16
 `HMMA.16816.F32.BF16`.
 
+## Scalar kernel: the register ceiling, and head_dim 128
+
+A thread holds `q_reg[HEAD_DIM]` and `acc[HEAD_DIM]` for its query row, which is
+what makes the key loop a register FMA instead of a reload. At head_dim 128 that
+is 256 registers per thread against a hardware ceiling of 255 — which is why the
+kernel stopped at 64, and why any measurement labelled "scalar at head_dim 128"
+before this was ATen (see REPORT.md).
+
+`ScalarCfg` fits it by capping `DIMS` — the dims one thread owns — at 64 and
+splitting the row across `TPR = HEAD_DIM / DIMS` adjacent lanes. Measured with
+`cuobjdump -res-usage build/fused_attention.cuda.o`:
+
+| dtype, head_dim | threads/block | shared | REG | LOCAL |
+|:----------------|--------------:|-------:|----:|------:|
+| float32, 8      | 64            | 8 KB   | 48  | 0     |
+| float32, 16     | 64            | 16 KB  | 63  | 0     |
+| float32, 32     | 64            | 32 KB  | 96  | 0     |
+| float32, 64     | 64            | 32 KB  | 165 | 0     |
+| float32, 128    | 128           | 32 KB  | 168 | 0     |
+
+`LOCAL:0` at head_dim 128 is the whole point: the naive shape does not compile
+to a slow kernel, it compiles to a spilling one.
+
+`BLOCK_N` is chosen to hold `k_s + v_s` at 32 KB from head_dim 64 up — 128, 64
+and 32 keys per tile at head_dim 32, 64 and 128 — which keeps two blocks
+resident against the 48 KB budget. At head_dim 128 float32 that is 3 blocks per
+SM by both shared memory and registers, so 12 warps against the 2 the
+one-thread-per-row shape would have managed.
+
+Costs one `__shfl_xor_sync` per key when `TPR == 2`, and nothing at all when
+`TPR == 1` — `if constexpr` deletes it, so the existing head_dims compile
+unchanged. Shared-memory traffic is identical either way: the two partners read
+disjoint halves of the key row.
+
+`SUPPORTED` is `SMEM <= 48 KB`, and the launcher returns false rather than
+launching when it fails. float64 past head_dim 16 wants 64 KB and used to launch
+and fail; it now reports a coverage gap like every other impl does.
+
 ## Tile kernel: block shapes
 
 The kernel holds Q, O, K, V and the score tile live at once, so the footprint

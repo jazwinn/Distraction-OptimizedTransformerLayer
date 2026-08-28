@@ -15,15 +15,23 @@ process. That makes a plain
 
 work from any shell. scripts/devenv.bat still exists for cases that need the
 compiler on PATH before Python even starts (e.g. invoking cl.exe directly).
+
+Importing this module also preloads the display driver's GPU compiler, which is
+what stops a run that touched a cuTile kernel from exiting 0xC0000005 after
+printing its results. That only works if it happens before torch is imported,
+so every entry point that can reach a tile kernel imports this module first --
+see preload_tile_compiler() for the diagnosis and the evidence.
 """
 
 from __future__ import annotations
 
+import ctypes
+import glob
 import os
 import shutil
 import subprocess
 import sys
-from typing import Optional
+from typing import List, Optional
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _BUILD_DIR = os.path.join(_THIS_DIR, "build")
@@ -40,6 +48,107 @@ _kernels = None
 _load_attempted = False
 _load_error: Optional[BaseException] = None
 _tile_enabled = False
+
+# Handle to nvgpucomp64.dll, held for the life of the process. See
+# preload_tile_compiler().
+_tile_compiler = None
+_tile_compiler_status = "not attempted"
+
+
+def _nvgpucomp_candidates() -> List[str]:
+    """Paths that might hold the driver's GPU compiler, newest first.
+
+    Not resolvable by name: it lives in the DriverStore, which is not on the
+    DLL search path, so ctypes.CDLL("nvgpucomp64.dll") fails. The folder name
+    carries a per-install hash (nv_dispi.inf_amd64_<hash>) and changes with
+    every driver update, so it is globbed rather than written down.
+    """
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    system32 = os.path.join(system_root, "System32")
+    patterns = [
+        os.path.join(system32, "DriverStore", "FileRepository", "nv_disp*",
+                     "nvgpucomp64.dll"),
+        os.path.join(system32, "nvgpucomp64.dll"),
+    ]
+    found = []
+    for pattern in patterns:
+        found.extend(glob.glob(pattern))
+    found.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return found
+
+
+def preload_tile_compiler() -> str:
+    """Load the driver's GPU compiler before torch does, and keep it loaded.
+
+    Works around an access violation (0xC0000005) raised *after* the
+    interpreter has finished, in any process that has run a cuTile kernel. A
+    run prints its results, reports success, and then exits 0xC0000005, so a
+    passing run looks like a failing one to any caller that reads the exit
+    code.
+
+    The fault is not in this repo's kernels and not in CUDA. Windows Error
+    Reporting names the faulting module every time, at the same offset:
+
+        Faulting module name: nvgpucomp64.dll
+        Exception code: 0xc0000005   Fault offset: 0x53ad3e
+
+    -- the GPU compiler that ships with the display driver, pulled in because a
+    tile object carries a *tile IR* fatbin section the driver finalises at
+    module load. Loading nvgpucomp64.dll first, so that it is detached last,
+    fixes it: 5/5 clean exits with the preload, 0/5 without. REPORT.md, under
+    "Notes and known limits", has the full diagnosis and the four hypotheses
+    that were ruled out on the way -- do not re-try those.
+
+    Must run before ``import torch``, which is what puts the NVIDIA DLLs in the
+    loader's list; preloading afterwards measures as no fix at all. That is why
+    every entry point that can reach a tile kernel imports this module above
+    torch, and why this runs at import rather than from get_kernels().
+
+    Returns a short status string, also available from tile_compiler_status().
+    Every failure is silent and harmless: without the preload the kernels still
+    build, still run and still give the same numbers -- only the exit code of a
+    tile run is wrong.
+    """
+    global _tile_compiler, _tile_compiler_status
+
+    if _tile_compiler is not None:
+        return _tile_compiler_status
+    if sys.platform != "win32":
+        _tile_compiler_status = "not needed (not windows)"
+        return _tile_compiler_status
+
+    # Late is not harmful, but it is not a fix either, and a caller staring at
+    # a 0xC0000005 exit deserves to be told which of the two happened.
+    late = "torch" in sys.modules
+
+    candidates = _nvgpucomp_candidates()
+    if not candidates:
+        _tile_compiler_status = "not found"
+        return _tile_compiler_status
+
+    for path in candidates:
+        try:
+            _tile_compiler = ctypes.CDLL(path)
+        except OSError:
+            continue
+        _tile_compiler_status = (
+            f"loaded too late to help (torch was already imported): {path}"
+            if late else f"loaded: {path}"
+        )
+        return _tile_compiler_status
+
+    _tile_compiler_status = f"found but would not load: {candidates[0]}"
+    return _tile_compiler_status
+
+
+def tile_compiler_status() -> str:
+    """What preload_tile_compiler() did, for diagnostics."""
+    return _tile_compiler_status
+
+
+# At import, not from get_kernels(): by the time anything calls get_kernels()
+# torch is long since imported, which is too late for this to do anything.
+preload_tile_compiler()
 
 
 def _ensure_msvc_on_path() -> None:

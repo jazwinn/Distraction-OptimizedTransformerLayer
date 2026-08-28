@@ -11,8 +11,11 @@ run. It measures the price paid for it.
 """
 import os, statistics, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import torch
+# Above torch on purpose: importing kernel_ext preloads the driver's GPU
+# compiler, which stops a cuTile run from exiting 0xC0000005 only if it happens
+# before torch pulls the NVIDIA DLLs in. See kernel_ext.preload_tile_compiler().
 import kernel_ext
+import torch
 
 K = kernel_ext.get_kernels(verbose=False)
 
@@ -42,13 +45,19 @@ def ab(fns, iters=200):
     return [statistics.median(a.elapsed_time(b) for a, b in col) for col in ev]
 
 
+# "uncovered hd" is head_dim 96, which no kernel specialises, so auto lands on
+# the ATen fallback -- the one consumer that pays for a row pitch it did not
+# ask for. Without it this table only ever measured paths that read strides
+# natively and reported the fallback as free. It is not: ATen measured 1.447x
+# on strided input here before the fallback was given contiguous tensors.
 CASES = [("default", 8, 8, 128, 64), ("long seq", 1, 8, 2048, 64),
-         ("small", 1, 8, 32, 64), ("wide hd", 2, 4, 64, 128)]
+         ("small", 1, 8, 32, 64), ("wide hd", 2, 4, 64, 128),
+         ("uncovered hd", 8, 8, 128, 96)]
 IMPLS = [(0, "auto"), (1, "scalar"), (2, "wmma"), (3, "tile"), (5, "tile-tf32")]
 
-print(f"{'case':<10}{'impl':>10}{'contig_ms':>11}{'packed_ms':>11}"
+print(f"{'case':<14}{'impl':>10}{'contig_ms':>11}{'packed_ms':>11}"
       f"{'ratio':>8}{'control':>9}")
-print("-" * 59)
+print("-" * 63)
 dev = torch.device("cuda")
 for label, b, h, s, d in CASES:
     g = torch.Generator(device=dev).manual_seed(0)
@@ -61,7 +70,7 @@ for label, b, h, s, d in CASES:
             try:
                 K.fused_attention_forward(q, k, v, None, False, scale, impl)
             except RuntimeError:
-                print(f"{label:<10}{name:>10}{'n/a':>11}")
+                print(f"{label:<14}{name:>10}{'n/a':>11}")
                 continue
 
             def call(a, bb, c, impl=impl):
@@ -69,5 +78,5 @@ for label, b, h, s, d in CASES:
                     a, bb, c, None, False, scale, impl)
 
             tc, tp, tc2 = ab([call(q, k, v), call(qp, kp, vp), call(q2, k2, v2)])
-            print(f"{label:<10}{name:>10}{tc:>11.4f}{tp:>11.4f}"
+            print(f"{label:<14}{name:>10}{tc:>11.4f}{tp:>11.4f}"
                   f"{tp / tc:>8.3f}{tc2 / tc:>9.3f}")

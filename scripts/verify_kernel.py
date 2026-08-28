@@ -25,12 +25,15 @@ import os
 import statistics
 import sys
 
-import torch
-import torch.nn.functional as F
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Above torch on purpose: importing kernel_ext preloads the driver's GPU
+# compiler, which stops a cuTile run from exiting 0xC0000005 only if it happens
+# before torch pulls the NVIDIA DLLs in. See kernel_ext.preload_tile_compiler().
 import kernel_ext  # noqa: E402
+
+import torch  # noqa: E402
+import torch.nn.functional as F  # noqa: E402
 
 # (label, batch, heads, seq_len, head_dim, causal, padded)
 CASES = [
@@ -132,9 +135,10 @@ def timed(fn, iters=30):
 # tile-bf16 narrows both GEMM operands to bfloat16 (8 significand bits), so
 # its budget is an order of magnitude looser than the tf32 paths', not tighter.
 # Impls that raise on a case they do not cover rather than falling back, so a
-# raise from one of these is coverage rather than a failure. Everything in
-# IMPLS except the scalar kernel, which has always fallen back silently.
-DECLINING_IMPLS = frozenset({2, 3, 4, 5})
+# raise from one of these is coverage rather than a failure. That is now every
+# forced impl: the scalar kernel used to fall through to ATen silently at
+# head_dim 128, which reported ATen's time under the scalar kernel's name.
+DECLINING_IMPLS = frozenset({1, 2, 3, 4, 5})
 
 IMPLS = (
     (1, "scalar", 5e-6),

@@ -54,10 +54,15 @@ import math
 import os
 import sys
 
-import torch
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Above torch on purpose: importing kernel_ext preloads the driver's GPU
+# compiler, which stops a cuTile run from exiting 0xC0000005 only if it happens
+# before torch pulls the NVIDIA DLLs in. See kernel_ext.preload_tile_compiler().
+import kernel_ext  # noqa: E402,F401
+
+import torch  # noqa: E402
 
 import torch_transformer_benchmark as bench  # noqa: E402
 from optimized import config  # noqa: E402
