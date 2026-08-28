@@ -532,6 +532,87 @@ mma-per-fragment-load ratio from 1.33 to 2.0 (needs 128 accumulator registers,
 so it may spill); and swizzled block scheduling for L2 reuse. That is a
 GEMM-tuning project, not a step in this one.
 
+## fused_add_layernorm: two block reductions instead of three
+
+The block-per-row kernel reduced `sum(c)` and `sum(c*c)` separately, though both
+are produced in one loop and consumed at the same point -- so it walked the whole
+two-stage block reduction twice. `block_reduce_sum2` does both at once: same
+shuffle count (two values still have to move), one shared round trip instead of
+two, and **two `__syncthreads()` instead of four**.
+
+Bit-identical to the split form -- same values summed in the same order -- and
+verified as such rather than to a tolerance, across fp32/fp16/bf16, D from 1 to
+4096, and the large-mean cases the corrected two-pass form exists for.
+
+### The prize was bounded before the code was written
+
+Since the warp kernel took D <= 256, this only serves D > 256. The bound comes
+from the warp kernel itself, which has *no* shared reduction and *no* barriers at
+all -- so at matched traffic its margin over the block kernel is everything
+reduction restructuring could ever buy:
+
+| rows x 256 | block | warp (zero reductions) | warp ahead by |
+|---|---|---|---|
+| 4096 | 50.00 us | 49.10 | 1.8% |
+| 16384 | 195.24 | 193.48 | 0.9% |
+| 65536 | 772.48 | 776.29 | -0.5% |
+
+At the row counts the model runs, removing *all* reduction overhead is worth
+0-2%. This change captures part of that.
+
+### Measured, control +/-1.6%
+
+| shape | warps/blk | split | fused | ratio | control |
+|---|---|---|---|---|---|
+| 1024 x 64 | 2 | 4.18 us | **3.67** | **1.139x** | 1.002 |
+| 64 x 512 | 8 | 2.66 | **2.47** | **1.073x** | 0.994 |
+| 1024 x 320 | 8 | 14.70 | **14.06** | **1.045x** | 0.995 |
+| 1024 x 512 | 8 | 22.97 | 22.62 | 1.015x | 1.014 |
+| 1024 x 2048 | 8 | 88.80 | 87.40 | 1.016x | 1.016 |
+| 1024 x 1024 | 8 | 45.00 | 44.96 | 1.001x | 1.009 |
+| 4096-16384 rows | 8 | - | - | 0.998-1.009x | ~1.00 |
+
+The pattern is clean: **it wins where the kernel is latency-bound and warps are
+few, and ties where DRAM saturates.** 1024 x 64 at two warps is the largest win
+because the barrier is proportionally largest there -- and it is also the least
+useful, since D=64 goes to the warp kernel in a default run.
+
+### End to end: no measurable effect
+
+| shape | split | fused | ratio |
+|---|---|---|---|
+| hd64 B8 S128 d512 | 2.1849 ms | 2.1832 | 1.0008x |
+| hd128 B8 S128 d1024 | 6.2242 | 6.0279 | 1.0326x (unresolved) |
+| hd256 B8 S128 d2048 | 18.4931 | 18.2236 | 1.0148x (unresolved) |
+
+d512 is stable to 0.1% across runs and says **tie**. d1024 and d2048 carry 5-11%
+run-to-run spread within a single variant, which cannot resolve a 1% effect --
+their ratios are noise, not results.
+
+**So this is kept for being strictly less work at identical output, not for a
+number.** The honest summary is: a real 4-14% win in the latency-bound regime, a
+tie everywhere the model actually operates.
+
+### Measurement notes
+
+Two things moved the control from +/-12% to +/-1.6%, and both were method, not
+hardware:
+
+- **Round-robin, not batched.** Timing every round of A and then every round of B
+  lets drift over the run appear as a difference between them. Racing
+  pre-captured graphs alternately within each round cancels it: +/-12% -> +/-4.7%.
+- **A quiet machine.** A game running in the background cost ~15% absolute (1024
+  x 512: 26.15 -> 22.97 us) and tripled the control: +/-4.7% -> +/-1.6%. Nothing
+  in this file was measured against a busy GPU on purpose; check before trusting
+  a marginal row.
+
+The control here is the split form raced against *itself* on the same shape at
+the same moment -- identical code, so its ratio is that shape's noise, rather
+than a noise figure borrowed from a separate pass.
+
+Knob: `layernorm_set_fused_reduce(bool)` / `LAYERNORM_FUSED_REDUCE`. Both forms
+stay compiled so the table above can be re-derived on other hardware.
+
 ## fused_add_layernorm: warp per row, several rows per block
 
 ### What was measured first, and what it got wrong

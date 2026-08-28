@@ -1290,7 +1290,57 @@ __device__ __forceinline__ float block_reduce_sum(float v, float* scratch) {
     return scratch[0];
 }
 
-template <typename scalar_t>
+// Two sums across the block in one pass, broadcast back to every thread.
+//
+// The pair of sums the second statistics pass produces -- sum(c) and sum(c*c)
+// -- are computed in the same loop and consumed at the same point, so reducing
+// them separately walks the whole two-stage structure twice: two shared-memory
+// round trips and four __syncthreads() where one of each will do. Reducing them
+// together halves that. The shuffle count is unchanged (two values still have
+// to move), which is the point -- what this removes is barriers and shared
+// traffic, not arithmetic.
+//
+// scratch needs two floats per warp, laid out as [warp] and [nwarps + warp] so
+// each stage's stores stay coalesced within a warp.
+__device__ __forceinline__ float2 block_reduce_sum2(float a, float b,
+                                                    float* scratch) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int nwarps = (blockDim.x + 31) >> 5;
+
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        a += __shfl_down_sync(0xffffffffu, a, off);
+        b += __shfl_down_sync(0xffffffffu, b, off);
+    }
+    if (lane == 0) {
+        scratch[warp] = a;
+        scratch[nwarps + warp] = b;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        a = (lane < nwarps) ? scratch[lane] : 0.0f;
+        b = (lane < nwarps) ? scratch[nwarps + lane] : 0.0f;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            a += __shfl_down_sync(0xffffffffu, a, off);
+            b += __shfl_down_sync(0xffffffffu, b, off);
+        }
+        if (lane == 0) {
+            scratch[0] = a;
+            scratch[1] = b;
+        }
+    }
+    __syncthreads();
+    return make_float2(scratch[0], scratch[1]);
+}
+
+// FUSED selects whether the two second-pass sums share a reduction. Both forms
+// are kept and both are instantiated so they can be A/B'd inside one process --
+// see layernorm_set_fused_reduce. The arithmetic is identical either way; only
+// the barrier and shared-traffic count differs.
+template <typename scalar_t, bool FUSED>
 __global__ void fused_add_layernorm_kernel(const scalar_t* __restrict__ x,
                                            const scalar_t* __restrict__ sub,
                                            const scalar_t* __restrict__ w,
@@ -1300,7 +1350,7 @@ __global__ void fused_add_layernorm_kernel(const scalar_t* __restrict__ x,
                                            int D, float eps) {
     extern __shared__ __align__(16) char smem_raw[];
     float* s_row = reinterpret_cast<float*>(smem_raw);   // D floats
-    float* scratch = s_row + D;                          // one float per warp
+    float* scratch = s_row + D;                          // 2 floats per warp
 
     const int tid = threadIdx.x;
     const int64_t base = static_cast<int64_t>(blockIdx.x) * D;
@@ -1345,9 +1395,18 @@ __global__ void fused_add_layernorm_kernel(const scalar_t* __restrict__ x,
     }
     __syncthreads();
 
-    const float delta = block_reduce_sum(local_c, scratch) / static_cast<float>(D);
-    __syncthreads();  // scratch is reused by the next reduction
-    const float mean_sq = block_reduce_sum(local_cc, scratch) / static_cast<float>(D);
+    float delta, mean_sq;
+    if constexpr (FUSED) {
+        // Both sums in one pass: one shared round trip and two __syncthreads()
+        // instead of two and four.
+        const float2 r = block_reduce_sum2(local_c, local_cc, scratch);
+        delta = r.x / static_cast<float>(D);
+        mean_sq = r.y / static_cast<float>(D);
+    } else {
+        delta = block_reduce_sum(local_c, scratch) / static_cast<float>(D);
+        __syncthreads();  // scratch is reused by the next reduction
+        mean_sq = block_reduce_sum(local_cc, scratch) / static_cast<float>(D);
+    }
 
     const float mean = mean_est + delta;
     // delta is the small correction, so subtracting its square cannot cancel
@@ -1522,6 +1581,17 @@ int layernorm_block_threads(int64_t D) {
     return threads;
 }
 
+// Whether the block-per-row kernel folds its two second-pass sums into one
+// reduction. Runtime-settable so both forms are timeable in one process; the
+// arithmetic is identical either way, so this only ever moves timings.
+bool& layernorm_fused_reduce_flag() {
+    static bool on = [] {
+        const char* e = std::getenv("LAYERNORM_FUSED_REDUCE");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    return on;
+}
+
 // Widest row the warp-per-row kernel is used for, and how many rows share a
 // block. Both are runtime-settable for the same reason every other knob in this
 // file is -- candidates have to be timed interleaved in one process -- and both
@@ -1604,10 +1674,10 @@ int layernorm_warp_rows() {
 int layernorm_blocks_per_sm(int64_t D) {
     const int threads = layernorm_block_threads(D);
     const int nwarps = (threads + 31) / 32;
-    const size_t smem = sizeof(float) * static_cast<size_t>(D + nwarps);
+    const size_t smem = sizeof(float) * static_cast<size_t>(D + 2 * nwarps);
     int per_sm = 0;
     if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &per_sm, fused_add_layernorm_kernel<float>, threads, smem)
+            &per_sm, fused_add_layernorm_kernel<float, true>, threads, smem)
         != cudaSuccess) {
         return 0;
     }
@@ -1991,8 +2061,10 @@ std::vector<torch::Tensor> fused_add_layernorm(torch::Tensor x,
     // Scaled to the row width rather than fixed, so narrow rows do not run
     // eight warps over one element each. See layernorm_block_threads.
     const int threads = layernorm_block_threads(D);
+    // Two scratch floats per warp, not one: block_reduce_sum2 stages both sums
+    // at once. The unfused path uses only the first half.
     const int nwarps = (threads + 31) / 32;
-    const size_t smem = sizeof(float) * static_cast<size_t>(D + nwarps);
+    const size_t smem = sizeof(float) * static_cast<size_t>(D + 2 * nwarps);
 
     // The row has to fit in shared memory. 48 KB is the limit that needs no
     // opt-in carveout, which covers d_model up to 12280 -- far past anything
@@ -2034,12 +2106,22 @@ std::vector<torch::Tensor> fused_add_layernorm(torch::Tensor x,
                 else if (D <= 128) launch(std::integral_constant<int, 4>{});
                 else               launch(std::integral_constant<int, 8>{});
             } else {
-                fused_add_layernorm_kernel<scalar_t>
-                    <<<static_cast<int>(rows), threads, smem, stream>>>(
-                        xc.const_data_ptr<scalar_t>(), sc.const_data_ptr<scalar_t>(),
-                        wc.const_data_ptr<scalar_t>(), bc.const_data_ptr<scalar_t>(),
-                        x_new.data_ptr<scalar_t>(), normed.data_ptr<scalar_t>(),
-                        static_cast<int>(D), static_cast<float>(eps));
+                auto launch_block = [&](auto fused) {
+                    fused_add_layernorm_kernel<scalar_t, decltype(fused)::value>
+                        <<<static_cast<int>(rows), threads, smem, stream>>>(
+                            xc.const_data_ptr<scalar_t>(),
+                            sc.const_data_ptr<scalar_t>(),
+                            wc.const_data_ptr<scalar_t>(),
+                            bc.const_data_ptr<scalar_t>(),
+                            x_new.data_ptr<scalar_t>(),
+                            normed.data_ptr<scalar_t>(),
+                            static_cast<int>(D), static_cast<float>(eps));
+                };
+                if (layernorm_fused_reduce_flag()) {
+                    launch_block(std::true_type{});
+                } else {
+                    launch_block(std::false_type{});
+                }
             }
         });
 
@@ -2285,6 +2367,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("layernorm_warp_rows",
           []() { return layernorm_warp_rows(); },
           "The current rows-per-block for the warp-per-row kernel");
+    m.def("layernorm_set_fused_reduce",
+          [](bool enabled) { layernorm_fused_reduce_flag() = enabled; },
+          "Whether the block-per-row add+LayerNorm folds its two second-pass "
+          "sums into one reduction. Identical arithmetic either way; "
+          "runtime-settable so both can be timed in one process.",
+          pybind11::arg("enabled"));
+    m.def("layernorm_fused_reduce_enabled",
+          []() { return layernorm_fused_reduce_flag(); },
+          "Whether the fused second-pass reduction is currently on");
     m.def("layernorm_blocks_per_sm",
           [](int64_t D) { return layernorm_blocks_per_sm(D); },
           "Blocks of the float32 fused_add_layernorm kernel one SM can hold at "
