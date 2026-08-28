@@ -15,6 +15,20 @@ from . import config
 
 _fallback_warned = False
 
+# Last value pushed into the extension's wmma_set_fp16 knob. The knob is a
+# process-global in the extension rather than a per-call argument, so it is
+# pushed on change only -- six attention calls per forward pass would otherwise
+# be six pybind round trips to set a flag that almost never moves.
+_fp16_pushed = None
+
+
+def _sync_attention_precision(kernels) -> None:
+    global _fp16_pushed
+    want = config.ATTENTION_FP16 == "auto"
+    if _fp16_pushed != want:
+        kernels.wmma_set_fp16(want)
+        _fp16_pushed = want
+
 
 def _custom_kernels():
     """The extension module, or None when unavailable or switched off.
@@ -107,6 +121,7 @@ def _attention_dispatch(
 
         kernels = kernel_ext.get_kernels()
         if kernels is not None:
+            _sync_attention_precision(kernels)
             return kernels.fused_attention_forward(
                 q, k, v, attn_mask, is_causal, scale,
                 config._IMPL_CODE[config.ATTENTION_IMPL],

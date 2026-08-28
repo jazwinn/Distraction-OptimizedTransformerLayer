@@ -28,6 +28,7 @@
 // tile of one. Pulling in the defining header is the *only* thing standing
 // between a narrow mode and the MMA units.
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 // <cuda_tf32.h> defines __nv_tf32 and has shipped since CUDA 13.3 -- the same
 // toolkit that first ships <cuda_tile.h> -- but it was added separately, so it
@@ -66,13 +67,14 @@ enum class MaskMode { None, Causal, Explicit };
 template <MathMode MODE> struct Operand;
 template <> struct Operand<MathMode::Fp32> { using type = float; };
 template <> struct Operand<MathMode::Bf16> { using type = __nv_bfloat16; };
+template <> struct Operand<MathMode::Fp16> { using type = __half; };
 #ifdef TILE_HAVE_TF32
 template <> struct Operand<MathMode::Tf32> { using type = __nv_tf32; };
 #endif
 
 template <MathMode MODE>
 constexpr bool mode_compiled =
-    MODE == MathMode::Fp32 || MODE == MathMode::Bf16
+    MODE == MathMode::Fp32 || MODE == MathMode::Bf16 || MODE == MathMode::Fp16
 #ifdef TILE_HAVE_TF32
     || MODE == MathMode::Tf32
 #endif
@@ -242,8 +244,21 @@ __tile_global__ void tile_attention_kernel(const float* __restrict__ q,
         // the operands on the tensor cores. log2(e) is folded into the scale
         // because the softmax below is exp2, which saves one multiply per
         // score element per key tile.
-        auto s = ct::matmul(q_op, as_operand<MATH, HEAD_DIM, BLOCK_N>(ktt))
-                 * (scale * 1.4426950408889634f);
+        //
+        // ct::matmul would return a __half tile under MATH == Fp16 --
+        // matmul_element_result<__half> is __half, and summing HEAD_DIM
+        // products into 10 bits is not good enough. ct::mma against a zeroed
+        // fp32 tile is the same multiply with the accumulator named, which is
+        // what low_precision_mma_v permits. The other modes keep matmul so
+        // their codegen is untouched.
+        auto k_op = as_operand<MATH, HEAD_DIM, BLOCK_N>(ktt);
+        auto s = [&] {
+            if constexpr (MATH == MathMode::Fp16) {
+                return ct::mma(q_op, k_op, ct::zeros<STile>());
+            } else {
+                return ct::matmul(q_op, k_op);
+            }
+        }() * (scale * 1.4426950408889634f);
 
         // The bounds test alone is [1, BLOCK_N]. AND-ing an all-true column
         // widens it to [BLOCK_M, BLOCK_N] up front, so the causal/explicit
@@ -554,6 +569,39 @@ template <> struct BlockCfg<32, MathMode::Fp32, true>  { static constexpr int M 
 template <> struct BlockCfg<64, MathMode::Fp32, false> { static constexpr int M = FP32_M_64;  static constexpr int N = FP32_N_64;  };
 template <> struct BlockCfg<64, MathMode::Fp32, true>  { static constexpr int M = FP32_CM_64; static constexpr int N = FP32_CN_64; };
 
+// fp16 starts from bf16's shapes: same 16-bit operand, same tile geometry, so
+// the sweep that tuned those is the best available prior. Overridable the same
+// way if scripts/tune_block_shapes.py is ever pointed at this mode.
+#ifndef FP16_M_8
+#define FP16_M_8  BF16_M_8
+#define FP16_N_8  BF16_N_8
+#define FP16_M_16 BF16_M_16
+#define FP16_N_16 BF16_N_16
+#define FP16_M_32 BF16_M_32
+#define FP16_N_32 BF16_N_32
+#define FP16_M_64 BF16_M_64
+#define FP16_N_64 BF16_N_64
+#endif
+#ifndef FP16_CM_8
+#define FP16_CM_8  BF16_CM_8
+#define FP16_CN_8  BF16_CN_8
+#define FP16_CM_16 BF16_CM_16
+#define FP16_CN_16 BF16_CN_16
+#define FP16_CM_32 BF16_CM_32
+#define FP16_CN_32 BF16_CN_32
+#define FP16_CM_64 BF16_CM_64
+#define FP16_CN_64 BF16_CN_64
+#endif
+
+template <> struct BlockCfg<8,  MathMode::Fp16, false> { static constexpr int M = FP16_M_8;   static constexpr int N = FP16_N_8;   };
+template <> struct BlockCfg<8,  MathMode::Fp16, true>  { static constexpr int M = FP16_CM_8;  static constexpr int N = FP16_CN_8;  };
+template <> struct BlockCfg<16, MathMode::Fp16, false> { static constexpr int M = FP16_M_16;  static constexpr int N = FP16_N_16;  };
+template <> struct BlockCfg<16, MathMode::Fp16, true>  { static constexpr int M = FP16_CM_16; static constexpr int N = FP16_CN_16; };
+template <> struct BlockCfg<32, MathMode::Fp16, false> { static constexpr int M = FP16_M_32;  static constexpr int N = FP16_N_32;  };
+template <> struct BlockCfg<32, MathMode::Fp16, true>  { static constexpr int M = FP16_CM_32; static constexpr int N = FP16_CN_32; };
+template <> struct BlockCfg<64, MathMode::Fp16, false> { static constexpr int M = FP16_M_64;  static constexpr int N = FP16_N_64;  };
+template <> struct BlockCfg<64, MathMode::Fp16, true>  { static constexpr int M = FP16_CM_64; static constexpr int N = FP16_CN_64; };
+
 template <> struct BlockCfg<8,  MathMode::Bf16, false> { static constexpr int M = BF16_M_8;   static constexpr int N = BF16_N_8;   };
 template <> struct BlockCfg<8,  MathMode::Bf16, true>  { static constexpr int M = BF16_CM_8;  static constexpr int N = BF16_CN_8;  };
 template <> struct BlockCfg<16, MathMode::Bf16, false> { static constexpr int M = BF16_M_16;  static constexpr int N = BF16_N_16;  };
@@ -650,7 +698,7 @@ constexpr int min_tiles_per_split(bool causal) {
     // eight. bf16's main kernel is the fastest of the three, so the same fixed
     // pass is a much larger fraction of it; 16 puts dense split-KV out of reach
     // for bf16 entirely, which is the intended effect.
-    return (MATH == MathMode::Bf16) ? 16 : 8;
+    return (MATH == MathMode::Bf16 || MATH == MathMode::Fp16) ? 16 : 8;
 }
 
 // Scratch cap. A backstop against a pathological shape rather than a real
@@ -860,6 +908,7 @@ bool supports(MathMode mode) {
         case MathMode::Fp32: return mode_compiled<MathMode::Fp32>;
         case MathMode::Bf16: return mode_compiled<MathMode::Bf16>;
         case MathMode::Tf32: return mode_compiled<MathMode::Tf32>;
+        case MathMode::Fp16: return mode_compiled<MathMode::Fp16>;
     }
     return false;
 }
@@ -920,6 +969,9 @@ size_t workspace_bytes(int B, int H, int S, int head_dim,
         case MathMode::Bf16:
             splits = splits_for_head_dim<MathMode::Bf16>(B, H, S, head_dim, is_causal);
             break;
+        case MathMode::Fp16:
+            splits = splits_for_head_dim<MathMode::Fp16>(B, H, S, head_dim, is_causal);
+            break;
         case MathMode::Tf32:
             splits = splits_for_head_dim<MathMode::Tf32>(B, H, S, head_dim, is_causal);
             break;
@@ -939,6 +991,10 @@ bool launch(const float* q, const float* k, const float* v,
         case MathMode::Bf16:
             return launch_mode<MathMode::Bf16>(q, k, v, mask, ms, qs, out, ws, ws_bytes,
                                                B, H, S, head_dim, is_causal, scale, stream);
+        case MathMode::Fp16:
+            return launch_mode<MathMode::Fp16>(q, k, v, mask, ms, qs, out, ws, ws_bytes,
+                                               B, H, S, head_dim, is_causal, scale,
+                                               stream);
         case MathMode::Tf32:
             return launch_mode<MathMode::Tf32>(q, k, v, mask, ms, qs, out, ws, ws_bytes,
                                                B, H, S, head_dim, is_causal, scale, stream);

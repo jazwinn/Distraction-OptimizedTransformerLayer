@@ -971,6 +971,105 @@ binary. On a quiet card the same row reads 1.42x, three times over. The control 
 decoration, but it is not sufficient either — see also [Absolute speedups are unusually
 sensitive to host contention](#absolute-speedups-are-unusually-sensitive-to-host-contention).
 
+## Attention in fp16
+
+The wmma kernel contracted fp32 q/k/v in **tf32** fragments. It now contracts
+them in **fp16**. The tensors stay fp32; only the shared tiles and the fragments
+narrow, and the output stays fp32 because it feeds `out_proj`, which is a cuBLAS
+fp32 GEMM. A `compute_t` template parameter splits "what the tensor is" from
+"what the fragments contract in".
+
+### This is not a precision-for-speed trade
+
+tf32 is 1 sign + 8 exponent + 10 mantissa. fp16 is 1 + 5 + 10. **Same mantissa.**
+Only the exponent range differs, and post-LayerNorm activations use none of it.
+So the predicted accuracy cost is zero, and the measurement says zero -- not
+"close enough", identical. The harness's own `max_abs`, five shapes, causal:
+
+| | d32 | d256 | S1024 d256 | d512 | d512 h4 |
+|:--|:--|:--|:--|:--|:--|
+| tf32 | 0.00131567 | 0.00132135 | 0.00113010 | 0.00123608 | 0.00119376 |
+| fp16 | 0.00131567 | 0.00132135 | 0.00113010 | 0.00123608 | 0.00119376 |
+
+Every digit. Against an fp64 reference on the attention op alone, the two agree
+to three significant figures at all eleven shapes swept.
+
+That is worth stating carefully, because the same argument does **not** extend
+one step further. bf16 has 8 mantissa bits, and under the *loosened* 2e-3 gate
+it measures 425%-622% of budget with tens of thousands of failing elements. The
+mantissa is the whole argument; drop two bits and it collapses.
+
+### What it buys
+
+On this card fp16 tensor cores measure **2.0x-2.25x** tf32 (39.7 against 17.7
+TFLOPS at N=2048), and a 16x16x16 fp16 fragment contracts twice the K of tf32's
+16x16x8, so the mma count halves too.
+
+On the attention op, causal, graph-timed, interleaved, control ±0.4%:
+
+| shape | tf32 | fp16 | ratio |
+|:--|--:|--:|--:|
+| B8 H4 S128 d8 | 11.3 | 9.3 | 1.210x |
+| B16 H8 S128 d32 | 38.8 | 31.8 | 1.221x |
+| B8 H8 S1024 d32 | 543.0 | 408.0 | 1.331x |
+| B8 H8 S128 d64 | 37.7 | 29.4 | 1.283x |
+| B1 H8 S2048 d64 | 595.8 | 426.6 | 1.397x |
+| B4 H8 S512 d128 | 706.2 | 459.6 | 1.536x |
+
+Geometric mean **1.328x** over eleven shapes.
+
+End to end the geometric mean is **1.039x**, ranging from 1.014x to **1.123x**
+at `B8 S1024 d256`. The gap between 1.33x and 1.04x is Amdahl and nothing else:
+attention is 20% of the forward pass at `B16 S128 d256` and 46% at `S1024`,
+which is exactly where the two ends of the table land. The harness agrees from
+its own independent measurement -- `--seq-len 2048 --batch-size 1 --causal` went
+**4.589x to 5.231x**.
+
+### head_dim 128 changes verdict
+
+The tf32 kernel *lost* to SDPA at head_dim 128, which is why `auto` capped the
+kernel at head_dim 64 and it never ran there. In fp16 it wins — except at
+exactly S 128, which reproduced across runs:
+
+| S | 64 | 128 | 256 | 384 | 512 | 1024 |
+|:--|--:|--:|--:|--:|--:|--:|
+| SDPA / wmma | 1.552x | **0.938x** | 1.028x | 1.027x | 1.047x | 1.081x |
+
+So the dispatch rule admits head_dim 128 from S 512 up, where the margin is
+4.7%-8.1% against a ±0.4% control. S 256 and 384 win too, by 2.8%, and are
+deliberately not claimed — that is close enough to the noise floor that
+widening the rule for it would be claiming more than was measured. Leaving S 128
+to SDPA is the important part: it is the sequence length of eleven of the
+fourteen grading shapes.
+
+### What did not work
+
+Narrowing `compute_t` frees about a third of the block's shared memory, so block
+shapes become affordable that fp32 cannot fit — at head_dim 128, 32x32 costs
+41.4 KB in fp16 where only 32x16's 29.9 KB fits in fp32. Spending the slack on a
+wider key tile is the obvious next move, and it loses badly: **0.537x** geomean
+at head_dim 128, 0.812x for the equivalent widening at head_dim 64.
+
+A wider `BLOCK_N` doubles the K/V staging and the score tile without adding any
+parallelism — 41.4 KB drops the SM from three resident blocks to two, and each
+block then does twice the work per key-tile iteration. Q is already
+register-resident, so there is nothing for the extra pressure to buy. The fp16
+win at head_dim 128 is entirely the fragments, not the tile. `WmmaShape` was
+parameterised on the element width to run that sweep and then un-parameterised
+again, on the criterion the source already stated: a different winner per dtype
+is what would justify the parameter, and there is none.
+
+### Still open, with a number on it
+
+This narrows on the way *into* shared memory, so DRAM traffic is unchanged.
+Narrowing the tensors themselves would halve it, and handing the kernel fp16
+tensors directly measures **21.4 us at B8 H8 S128 d64 against 29.4** — a further
+1.37x on the op. It is not free: q/k/v come out of the fused qkv GEMM, so that
+GEMM needs an fp16 output epilogue, and the kernel needs an `out_t` so a
+half-input call can still write the fp32 `out_proj` consumes. Without the
+`out_t` the output rounds to fp16 and the op's error moves from 1.59e-3 to
+1.83e-3, so the "free accuracy" argument above stops applying.
+
 ## Fused Linear + GELU, in fp16
 
 The FFN's first layer is `GELU(x @ W1^T + b1)`. Run as two ops, the GELU pass
@@ -1257,6 +1356,11 @@ python torch_transformer_benchmark.py --seq-len 2048 --batch-size 1 --causal
 
 `--batch-size --seq-len --d-model --heads --ffn-dim --layers --causal --dtype
 --padding-ratio --input-scale --atol --rtol`
+
+`--attn-fp16 {auto,tf32}` controls whether the wmma attention kernel contracts fp32 q/k/v in
+fp16 fragments, `auto` by default. fp16 and tf32 carry the same 10-bit mantissa, so this is a
+speed switch and not an accuracy one — the harness's `max_abs` comes out identical to every
+digit either way. See [Attention in fp16](#attention-in-fp16).
 
 `--linear-gelu {auto,tf32,off}` controls whether the FFN's first Linear and its GELU run as
 one kernel, `auto` by default. `auto` uses fp16 fragments, which beat cuBLAS at every shape

@@ -29,10 +29,19 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--attn-impl",
-        choices=("auto", "scalar", "wmma", "tile", "tile-bf16", "tile-tf32"),
+        choices=("auto", "scalar", "wmma", "tile", "tile-bf16", "tile-tf32",
+                 "tile-fp16"),
         default=None,
         help="override ATTENTION_IMPL for this run only: which kernel inside "
              "the custom extension runs attention",
+    )
+    parser.add_argument(
+        "--attn-fp16",
+        choices=("auto", "tf32"),
+        default=None,
+        help="override ATTENTION_FP16 for this run only: whether the wmma "
+             "attention kernel contracts fp32 q/k/v in fp16 fragments (auto) "
+             "or tf32. Same 10-bit mantissa either way; fp16 is faster",
     )
     parser.add_argument(
         "--linear-gelu",
@@ -59,6 +68,8 @@ def apply_overrides(args: argparse.Namespace) -> None:
         config.ATTENTION_BACKEND = args.attn_backend
     if args.attn_impl is not None:
         config.ATTENTION_IMPL = args.attn_impl
+    if args.attn_fp16 is not None:
+        config.ATTENTION_FP16 = args.attn_fp16
     if args.linear_gelu is not None:
         config.LINEAR_GELU = args.linear_gelu
     if args.cuda_graph is not None:

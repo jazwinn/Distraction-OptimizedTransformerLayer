@@ -105,7 +105,8 @@ def _graph_key(x: torch.Tensor, use_mask: bool) -> Tuple:
     for every layout of x.
     """
     return (x.shape, x.dtype, x.device.index, use_mask,
-            config.ATTENTION_BACKEND, config.ATTENTION_IMPL, config.LINEAR_GELU)
+            config.ATTENTION_BACKEND, config.ATTENTION_IMPL, config.LINEAR_GELU,
+            config.ATTENTION_FP16)
 
 
 def _graph_pool_cap_bytes(device: torch.device) -> int:

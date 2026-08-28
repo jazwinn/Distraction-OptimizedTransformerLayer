@@ -414,9 +414,27 @@ template <> struct FragTraits<__nv_bfloat16> {
     static constexpr bool supported = true;
 };
 
+// Narrowing and widening both go through an explicit helper. torch's build
+// passes -D__CUDA_NO_HALF_CONVERSIONS__ and -D__CUDA_NO_BFLOAT16_CONVERSIONS__,
+// which delete the implicit operators, so a static_cast<float> on a
+// __nv_bfloat16 is a compile error rather than a conversion.
+__device__ __forceinline__ float dev_to_float(float s)         { return s; }
+__device__ __forceinline__ float dev_to_float(__half s)        { return __half2float(s); }
+__device__ __forceinline__ float dev_to_float(__nv_bfloat16 s) { return __bfloat162float(s); }
+
 __device__ __forceinline__ void dev_from_float(float& d, float s)         { d = s; }
 __device__ __forceinline__ void dev_from_float(__half& d, float s)        { d = __float2half(s); }
 __device__ __forceinline__ void dev_from_float(__nv_bfloat16& d, float s) { d = __float2bfloat16(s); }
+
+// Value-returning form, so a staging store stays a ternary. Spelling it as an
+// if/else instead cost 1.3x-2.1x on the tf32 path: the ternary compiles to a
+// predicated select, and the branch does not.
+template <typename T>
+__device__ __forceinline__ T dev_of_float(float s) {
+    T d;
+    dev_from_float(d, s);
+    return d;
+}
 
 // Shared-memory plan. Q is staged into the same bytes that later hold the O
 // spill area: Q is read into registers once, up front, and is dead after that,
@@ -437,9 +455,32 @@ __device__ __forceinline__ void dev_from_float(__nv_bfloat16& d, float s) { d = 
 // BLOCK_N a multiple of FragTraits<scalar_t>::K, so 48/80/96/112 are reachable
 // here and FlashAttention-2's kBlockN=112 is expressible for the 16-bit types.
 //
-// One shape serves all three dtypes: WmmaShape is not parameterised on
-// scalar_t, so a sweep that finds different winners per dtype is evidence for
-// adding that parameter, not something these macros can express.
+// One shape serves every compute type, and that is a MEASURED result, not an
+// assumption. Narrowing the compute type to fp16 frees about a third of the
+// block's shared memory, which makes shapes affordable that fp32 cannot fit --
+// at head_dim 128, 32x32 costs 41.4 KB in fp16 against 29.9 KB for 32x16, and
+// only the latter fits in fp32. So the obvious move is to spend the freed
+// memory on a wider key tile. It loses, and not narrowly
+// (scripts/ab_attention_shapes.py, one build per candidate):
+//
+//   head_dim 128, fp16   32x16 (incumbent)   32x32     16x32
+//     B8 H8 S32                    1.000x   0.192x    0.689x
+//     B8 H8 S128                   1.000x   0.765x    0.378x
+//     B4 H8 S512                   1.000x   0.738x    0.346x
+//     B2 H8 S1024                  1.000x   0.765x    0.357x
+//   head_dim 64, fp16    64x16 (incumbent)   64x32     32x32
+//     geomean over 3 shapes        1.000x   0.812x    0.552x
+//
+// A wider BLOCK_N doubles the K/V staging and the score tile without adding any
+// parallelism -- 41.4 KB drops the SM from three resident blocks to two, and
+// each block then does twice the work per key-tile iteration. Q is already
+// register-resident, so there is nothing for the extra occupancy pressure to
+// buy. The fp16 win at head_dim 128 comes entirely from the fragments, not from
+// a bigger tile.
+//
+// So WmmaShape stays unparameterised on the element width. If a future sweep
+// does find a different winner per dtype, that is the evidence for adding the
+// parameter; this one did not.
 #ifndef WMMA_M_8
 #define WMMA_M_8   64
 #define WMMA_N_8   32
@@ -556,8 +597,18 @@ bool& causal_reverse_flag() {
     return on;
 }
 
-template <typename scalar_t, int HEAD_DIM>
-__global__ __launch_bounds__(WmmaCfg<scalar_t, HEAD_DIM>::NTHREADS)
+// `scalar_t` is what q/k/v/out are in GLOBAL memory; `compute_t` is what the
+// shared tiles hold and the fragments contract in. They were one type until
+// fp16 was measured against tf32: both carry a 10-bit mantissa, so an fp32
+// tensor can be narrowed to fp16 on its way into shared memory at no cost in
+// precision, and buy two things for it -- fp16 tensor cores run 2.0x-2.25x tf32
+// on this card, and a 16x16x16 fragment contracts twice the K of tf32's
+// 16x16x8, so the mma count halves too. Narrowing also halves every staged
+// tile, which is what decides the block shape at head_dim 128.
+//
+// The output stays `scalar_t`: it feeds out_proj, which is a cuBLAS fp32 GEMM.
+template <typename scalar_t, typename compute_t, int HEAD_DIM>
+__global__ __launch_bounds__(WmmaCfg<compute_t, HEAD_DIM>::NTHREADS)
 void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
                                  const scalar_t* __restrict__ k,
                                  const scalar_t* __restrict__ v,
@@ -570,8 +621,8 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
                                  bool is_causal, float scale,
                                  bool out_bshd, bool reverse_m) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    using Cfg = WmmaCfg<scalar_t, HEAD_DIM>;
-    using frag_elem = typename FragTraits<scalar_t>::elem;
+    using Cfg = WmmaCfg<compute_t, HEAD_DIM>;
+    using frag_elem = typename FragTraits<compute_t>::elem;
     using acc_frag_t = wm::fragment<wm::accumulator, 16, 16, Cfg::WK, float>;
     constexpr int BLOCK_M = Cfg::BLOCK_M;
     constexpr int BLOCK_N = Cfg::BLOCK_N;
@@ -592,12 +643,12 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
     constexpr int COLS_PER_LANE = BLOCK_N / LANES_PER_ROW;
     static_assert(RPW <= 32 && 32 % RPW == 0, "warp must split evenly over rows");
     static_assert(BLOCK_N % LANES_PER_ROW == 0, "key tile must split evenly over lanes");
-    constexpr bool IS_TF32 = std::is_same<scalar_t, float>::value;
+    constexpr bool IS_TF32 = std::is_same<compute_t, float>::value;
 
     extern __shared__ __align__(16) char smem_raw[];
     float*    o_s = reinterpret_cast<float*>(smem_raw + Cfg::O_OFF);
-    scalar_t* k_s = reinterpret_cast<scalar_t*>(smem_raw + Cfg::K_OFF);
-    scalar_t* v_s = reinterpret_cast<scalar_t*>(smem_raw + Cfg::V_OFF);
+    compute_t* k_s = reinterpret_cast<compute_t*>(smem_raw + Cfg::K_OFF);
+    compute_t* v_s = reinterpret_cast<compute_t*>(smem_raw + Cfg::V_OFF);
     float*    s_s = reinterpret_cast<float*>(smem_raw + Cfg::S_OFF);
     float*    m_s = reinterpret_cast<float*>(smem_raw + Cfg::M_OFF);
     float*    l_s = reinterpret_cast<float*>(smem_raw + Cfg::L_OFF);
@@ -605,8 +656,8 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
     // P feeds the second GEMM as a matrix_a fragment, so it has to be in the
     // operand type. For fp32 that is the same type the scores were stored in,
     // so the softmax can overwrite the score tile in place.
-    scalar_t* p_s = Cfg::P_ALIASES_S ? reinterpret_cast<scalar_t*>(s_s)
-                                     : reinterpret_cast<scalar_t*>(smem_raw + Cfg::P_OFF);
+    compute_t* p_s = Cfg::P_ALIASES_S ? reinterpret_cast<compute_t*>(s_s)
+                                      : reinterpret_cast<compute_t*>(smem_raw + Cfg::P_OFF);
 
     const int tid    = threadIdx.x;
     const int warp   = tid >> 5;
@@ -630,12 +681,12 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
     const int row_base = warp * RPW;                  // this warp stripe in the block
     const int q_base   = m_tile * BLOCK_M + row_base; // ... and in the sequence
 
-    scalar_t zero_v;
+    compute_t zero_v;
     dev_from_float(zero_v, 0.0f);
 
     // --- stage Q, then hoist it into registers for the whole key loop -------
     {
-        scalar_t* q_s = reinterpret_cast<scalar_t*>(smem_raw + Cfg::O_OFF);
+        compute_t* q_s = reinterpret_cast<compute_t*>(smem_raw + Cfg::O_OFF);
         // Walk the padded width so columns past DIM are explicitly zeroed:
         // they feed GEMM1's contraction, where a stale value would corrupt the
         // score rather than contribute nothing.
@@ -645,7 +696,8 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
             const int gr = m_tile * BLOCK_M + r;
             q_s[r * KV_LD + c] =
                 (gr < S && c < DIM)
-                    ? q[bh_off + static_cast<int64_t>(gr) * qs2 + c]
+                    ? dev_of_float<compute_t>(dev_to_float(
+                          q[bh_off + static_cast<int64_t>(gr) * qs2 + c]))
                     : zero_v;
         }
         __syncthreads();
@@ -653,7 +705,7 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
 
     wm::fragment<wm::matrix_a, 16, 16, WK, frag_elem, wm::row_major> q_frag[PDIM / WK];
     {
-        const scalar_t* q_s = reinterpret_cast<const scalar_t*>(smem_raw + Cfg::O_OFF);
+        const compute_t* q_s = reinterpret_cast<const compute_t*>(smem_raw + Cfg::O_OFF);
         #pragma unroll
         for (int kk = 0; kk < PDIM / WK; ++kk) {
             wm::load_matrix_sync(q_frag[kk],
@@ -741,8 +793,10 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
             const int c = idx - r * PDIM;
             const bool inb = ((kt + r) < S) && (c < DIM);
             const int64_t g = static_cast<int64_t>(r) * qs2 + c;
-            k_s[r * KV_LD + c] = inb ? k_base[g] : zero_v;
-            v_s[r * KV_LD + c] = inb ? v_base[g] : zero_v;
+            k_s[r * KV_LD + c] =
+                inb ? dev_of_float<compute_t>(dev_to_float(k_base[g])) : zero_v;
+            v_s[r * KV_LD + c] =
+                inb ? dev_of_float<compute_t>(dev_to_float(v_base[g])) : zero_v;
         }
         __syncthreads();
 
@@ -922,12 +976,12 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
 #endif
 }
 
-template <typename scalar_t, int HEAD_DIM>
+template <typename scalar_t, typename compute_t, int HEAD_DIM>
 void launch_wmma_kernel(const torch::Tensor& q, const torch::Tensor& k,
                         const torch::Tensor& v, const bool* mask_ptr,
                         const int64_t* ms, const int64_t* qs, torch::Tensor& out,
                         int B, int H, int S, bool is_causal, double scale) {
-    using Cfg = WmmaCfg<scalar_t, HEAD_DIM>;
+    using Cfg = WmmaCfg<compute_t, HEAD_DIM>;
     const dim3 block(Cfg::NTHREADS);
     const dim3 grid((S + Cfg::BLOCK_M - 1) / Cfg::BLOCK_M, H, B);
 
@@ -948,7 +1002,7 @@ void launch_wmma_kernel(const torch::Tensor& q, const torch::Tensor& k,
     static const int resident = [] {
         int per_sm = 0;
         if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &per_sm, fused_attention_wmma_kernel<scalar_t, HEAD_DIM>,
+                &per_sm, fused_attention_wmma_kernel<scalar_t, compute_t, HEAD_DIM>,
                 Cfg::NTHREADS, Cfg::SMEM) != cudaSuccess) {
             return 0;   // unknown -> never reverse, i.e. keep today's mapping
         }
@@ -959,7 +1013,7 @@ void launch_wmma_kernel(const torch::Tensor& q, const torch::Tensor& k,
     const bool reverse_m = Cfg::REVERSE_CAUSAL && is_causal &&
                            causal_reverse_flag() && blocks > resident;
 
-    fused_attention_wmma_kernel<scalar_t, HEAD_DIM>
+    fused_attention_wmma_kernel<scalar_t, compute_t, HEAD_DIM>
         <<<grid, block, Cfg::SMEM, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const scalar_t*>(q.const_data_ptr()),
             reinterpret_cast<const scalar_t*>(k.const_data_ptr()),
@@ -973,13 +1027,52 @@ void launch_wmma_kernel(const torch::Tensor& q, const torch::Tensor& k,
 
 // Returns false when this (dtype, head_dim) pair has no tensor-core
 // specialization, so the caller can fall back to the scalar kernel.
+// Which compute_t an fp32 tensor is contracted in. fp16 is the default -- it
+// has tf32's 10-bit mantissa and twice its tensor-core rate -- and tf32 stays
+// reachable so the two can be A/B'd in one process. Same contract as
+// causal_reverse_flag(): flipped between timed runs from one thread, never
+// while launches are in flight.
+bool& wmma_fp16_flag() {
+    static bool on = [] {
+        const char* e = std::getenv("WMMA_FP16");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    return on;
+}
+
+template <typename scalar_t, typename compute_t, int HEAD_DIM>
+bool maybe_launch_wmma_as(const torch::Tensor& q, const torch::Tensor& k,
+                          const torch::Tensor& v, const bool* mask_ptr,
+                          const int64_t* ms, const int64_t* qs,
+                          torch::Tensor& out, int B, int H, int S,
+                          bool is_causal, double scale) {
+    // SUPPORTED is asked of compute_t, not scalar_t: it is the compute type
+    // that sizes every staged tile and sets the fragment K, so an fp32 tensor
+    // narrowed to fp16 can pass a shared-memory budget its tf32 self fails.
+    if constexpr (WmmaCfg<compute_t, HEAD_DIM>::SUPPORTED) {
+        launch_wmma_kernel<scalar_t, compute_t, HEAD_DIM>(
+            q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
+        return true;
+    } else {
+        return false;
+    }
+}
+
 template <typename scalar_t, int HEAD_DIM>
 bool maybe_launch_wmma(const torch::Tensor& q, const torch::Tensor& k,
                        const torch::Tensor& v, const bool* mask_ptr,
                        const int64_t* ms, const int64_t* qs, torch::Tensor& out,
                        int B, int H, int S, bool is_causal, double scale) {
+    // Only an fp32 tensor has a choice to make; half and bfloat16 contract in
+    // the type they already are.
+    if constexpr (std::is_same<scalar_t, float>::value) {
+        if (wmma_fp16_flag()) {
+            return maybe_launch_wmma_as<scalar_t, __half, HEAD_DIM>(
+                q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
+        }
+    }
     if constexpr (WmmaCfg<scalar_t, HEAD_DIM>::SUPPORTED) {
-        launch_wmma_kernel<scalar_t, HEAD_DIM>(q, k, v, mask_ptr, ms, qs, out,
+        launch_wmma_kernel<scalar_t, scalar_t, HEAD_DIM>(q, k, v, mask_ptr, ms, qs, out,
                                                B, H, S, is_causal, scale);
         return true;
     } else {
@@ -1026,6 +1119,7 @@ enum class Impl : int64_t {
     Tile     = 3,   // cuTile, fp32 operands -- CUDA cores,   ~1e-6
     TileBf16 = 4,   // cuTile, bf16 operands -- tensor cores, ~4e-3
     TileTf32 = 5,   // cuTile, tf32 operands -- tensor cores, ~1e-3
+    TileFp16 = 6,   // cuTile, fp16 operands -- tensor cores, ~1e-3
 };
 
 const char* impl_name(Impl impl) {
@@ -1036,6 +1130,7 @@ const char* impl_name(Impl impl) {
         case Impl::Tile:     return "tile";
         case Impl::TileBf16: return "tile-bf16";
         case Impl::TileTf32: return "tile-tf32";
+        case Impl::TileFp16: return "tile-fp16";
     }
     return "?";
 }
@@ -1163,11 +1258,40 @@ bool launch_tile(const AttnArgs& a, tile_attn::MathMode math) {
 //
 // Below the threshold Auto keeps the wmma kernel, which is worth keeping: at
 // S 32 it is more than twice as fast as SDPA.
+// UPDATED once fp32 tensors started contracting in fp16 fragments. That is
+// worth 1.43x-1.54x at head_dim 128, which changes the verdict above rather
+// than merely improving it. Re-measured against SDPA, causal, sdpa/wmma so
+// ratio > 1 means the kernel wins:
+//
+//   S   64   1.552x      S  256   1.028x      S  512   1.047x
+//   S  128   0.938x      S  384   1.027x      S 1024   1.081x
+//
+// So the kernel now wins at head_dim 128 everywhere EXCEPT a dip at exactly
+// S 128, which reproduced across runs (0.938x, 0.943x). Two consequences:
+//
+//   * The S < 128 clause stays. It was 2x at head_dim 128 before and is 1.55x
+//     now, for the same reason: SDPA's fixed launch cost.
+//   * A second clause admits head_dim 128 from S 512 up, where the margin is
+//     4.7%-8.1% -- comfortably past the +/-0.4% this comparison measured as its
+//     control. S 256 and 384 also win, by 2.8%, and are deliberately NOT
+//     claimed: that is close enough to the floor that it is not worth widening
+//     the rule for, and the band is left to SDPA.
+//
+// The dip at S 128 is the reason head_dim 128 is not simply admitted outright.
+// It is also the sequence length of most of the grading set, so getting it
+// wrong would cost exactly where it is measured.
 constexpr int kWmmaAutoMaxHeadDim = 64;
 constexpr int kWmmaAutoMinSeqForSdpa = 128;
+constexpr int kWmmaAutoWideMinSeq = 512;
 
 bool wmma_preferred_by_auto(const AttnArgs& a) {
-    return a.head_dim <= kWmmaAutoMaxHeadDim || a.S < kWmmaAutoMinSeqForSdpa;
+    if (a.head_dim <= kWmmaAutoMaxHeadDim || a.S < kWmmaAutoMinSeqForSdpa) {
+        return true;
+    }
+    // Only the fp16 fragments made the wide-head_dim case competitive; with
+    // tf32 it loses by 1.5x-2.1x at these lengths, so the clause is gated on
+    // the precision that earned it.
+    return wmma_fp16_flag() && a.S >= kWmmaAutoWideMinSeq;
 }
 
 // Runs a kernel for this case, honouring what the caller asked for: for a
@@ -1182,6 +1306,7 @@ bool run_kernel(Impl impl, const AttnArgs& a) {
         case Impl::Tile:     return launch_tile(a, tile_attn::MathMode::Fp32);
         case Impl::TileBf16: return launch_tile(a, tile_attn::MathMode::Bf16);
         case Impl::TileTf32: return launch_tile(a, tile_attn::MathMode::Tf32);
+        case Impl::TileFp16: return launch_tile(a, tile_attn::MathMode::Fp16);
         // Tile is deliberately absent here: it covers only float32 and is a
         // separate programming model whose performance the caller should opt
         // into deliberately rather than inherit.
@@ -2357,9 +2482,10 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
     TORCH_CHECK(out_layout == 0 || out_layout == 1,
                 "fused_attention_forward: out_layout must be 0 ([B,H,S,head_dim]) "
                 "or 1 ([B,S,H*head_dim])");
-    TORCH_CHECK(impl >= 0 && impl <= 5,
+    TORCH_CHECK(impl >= 0 && impl <= 6,
                 "fused_attention_forward: impl must be 0 (auto), 1 (scalar), "
-                "2 (wmma), 3 (tile), 4 (tile-bf16) or 5 (tile-tf32)");
+                "2 (wmma), 3 (tile), 4 (tile-bf16), 5 (tile-tf32) or "
+                "6 (tile-fp16)");
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(),
                 "fused_attention_forward: q/k/v must be CUDA tensors");
     TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
@@ -2395,7 +2521,8 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
 
     const Impl mode = static_cast<Impl>(impl);
     const bool tile_mode =
-        (mode == Impl::Tile || mode == Impl::TileBf16 || mode == Impl::TileTf32);
+        (mode == Impl::Tile || mode == Impl::TileBf16 || mode == Impl::TileTf32 ||
+         mode == Impl::TileFp16);
 
     // Every kernel addresses q/k/v through explicit (batch, head, sequence)
     // strides and assumes only that head_dim is stride-1. That is exactly what
@@ -2589,13 +2716,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("tile_workspace_bytes",
           [](int B, int H, int S, int head_dim, bool is_causal, int impl) {
               // impl codes match fused_attention_forward's: 3 tile-fp32,
-              // 4 tile-bf16, 5 tile-tf32. Non-zero means the launcher intends
+              // 4 tile-bf16, 5 tile-tf32, 6 tile-fp16. Non-zero means the launcher intends
               // to split the key range for this shape, so a test can assert
               // that it is really exercising the split path rather than
               // silently passing on the single-pass one.
               tile_attn::MathMode math = tile_attn::MathMode::Fp32;
               if (impl == 4) math = tile_attn::MathMode::Bf16;
               if (impl == 5) math = tile_attn::MathMode::Tf32;
+              if (impl == 6) math = tile_attn::MathMode::Fp16;
               return static_cast<int64_t>(tile_attn::workspace_bytes(
                   B, H, S, head_dim, is_causal, math));
           },
@@ -2610,6 +2738,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("enabled"));
     m.def("tile_split_kv_enabled", &tile_attn::split_kv_enabled,
           "Whether the tile kernel's split-KV path is currently enabled");
+    m.def("wmma_set_fp16",
+          [](bool on) { wmma_fp16_flag() = on; },
+          "Contract fp32 q/k/v in fp16 fragments (true, the default) or tf32 "
+          "(false). Same 10-bit mantissa either way; fp16 runs at twice the "
+          "tensor-core rate and halves every staged tile. Runtime-settable so "
+          "both can be timed in one process.",
+          pybind11::arg("on"));
+    m.def("wmma_fp16",
+          []() { return wmma_fp16_flag(); },
+          "Whether fp32 tensors are currently contracted in fp16 fragments");
     m.def("wmma_set_causal_reverse",
           [](bool enabled) { causal_reverse_flag() = enabled; },
           "Enable/disable the wmma kernel's causal block-index reversal "

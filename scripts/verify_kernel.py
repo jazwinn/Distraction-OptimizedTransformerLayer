@@ -134,11 +134,14 @@ def timed(fn, iters=30):
 # mantissa bits, so it gets the same budget.
 # tile-bf16 narrows both GEMM operands to bfloat16 (8 significand bits), so
 # its budget is an order of magnitude looser than the tf32 paths', not tighter.
+# tile-fp16 narrows to float16, which has 10 significand bits like tf32 and
+# accumulates into fp32 -- so it gets the tf32 budget, not bf16's. Holding it to
+# 3e-3 is the point: if fp16 needed a looser bound it would not be worth having.
 # Impls that raise on a case they do not cover rather than falling back, so a
 # raise from one of these is coverage rather than a failure. That is now every
 # forced impl: the scalar kernel used to fall through to ATen silently at
 # head_dim 128, which reported ATen's time under the scalar kernel's name.
-DECLINING_IMPLS = frozenset({1, 2, 3, 4, 5})
+DECLINING_IMPLS = frozenset({1, 2, 3, 4, 5, 6})
 
 IMPLS = (
     (1, "scalar", 5e-6),
@@ -146,6 +149,7 @@ IMPLS = (
     (3, "tile", 5e-6),
     (5, "tile-tf32", 3e-3),
     (4, "tile-bf16", 3e-2),
+    (6, "tile-fp16", 3e-3),
 )
 
 

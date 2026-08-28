@@ -660,6 +660,258 @@ fragment element cannot be assigned from. The CCCL message came from
 `kernel_ext.py`'s no-cuTile retry, whose flags lack `/Zc:preprocessor`, and it
 buried the real one. That fallback now re-raises the *first* error instead.
 
+## tile-fp16: the mode that was recorded as impossible, and still loses to wmma
+
+`tile_attention.h` carried this, for as long as math modes have existed:
+
+> There is no Fp16 mode: cuTile accumulates a `__half` matmul into `__half`,
+> and attention sums hundreds of products per output.
+
+**Half right, and the wrong half was load-bearing.** It is true of `ct::matmul`,
+whose result element type is fixed by its operand: `matmul_element_result<__half>`
+is `__half` (crt/cuda_tile.h:2737). It is false of `ct::mma(A, B, C)`, which takes
+the accumulator as an argument -- `low_precision_mma_v` admits `__half` operands
+against *either* a `__half` or a **`float`** accumulator (crt/cuda_tile.h:2646).
+
+The kernel's second GEMM already used `mma`. Only the first had to stop using
+`matmul`:
+
+```cuda
+auto s = [&] {
+    if constexpr (MATH == MathMode::Fp16) {
+        return ct::mma(q_op, k_op, ct::zeros<STile>());
+    } else {
+        return ct::matmul(q_op, k_op);
+    }
+}() * (scale * 1.4426950408889634f);
+```
+
+Block shapes are seeded from bf16's -- same 16-bit operand, same tile geometry.
+
+### It does exactly what the format predicts
+
+fp16 carries 10 mantissa bits like tf32, and 16-bit operands like bf16. It lands
+on both: **tile-fp16's time equals tile-bf16's to three decimal places at every
+case, and its error equals tile-tf32's to three significant figures at every
+case.**
+
+| case | wmma | tile-tf32 | tile-bf16 | tile-fp16 | tf32 err | bf16 err | fp16 err |
+|:--|--:|--:|--:|--:|--:|--:|--:|
+| default | 0.035 | 0.098 | 0.071 | 0.071 | 3.1e-4 | 4.5e-3 | 3.1e-4 |
+| default causal | 0.035 | 0.084 | 0.061 | 0.061 | 9.4e-4 | 1.2e-2 | 9.4e-4 |
+| default padded | 0.045 | 0.129 | 0.098 | 0.099 | 7.9e-4 | 8.3e-3 | 7.9e-4 |
+| long seq | 0.607 | 1.280 | 0.871 | 0.871 | 7.3e-5 | 1.0e-3 | 6.9e-5 |
+| long seq causal | 0.422 | 0.825 | 0.494 | 0.494 | 7.4e-4 | 9.2e-3 | 7.4e-4 |
+| odd shape | 0.019 | 0.020 | 0.021 | 0.020 | 1.2e-3 | 1.0e-2 | 1.2e-3 |
+
+Against sdpa at `long seq`, that moves the tile kernel from tf32's 1.26x to
+**1.85x**, and at `long seq causal` from 1.23x to **2.05x** -- for free, since
+`verify_kernel.py` holds tile-fp16 to the tf32 tolerance (3e-3), not bf16's.
+
+**tile-bf16 is now strictly dominated**: identical speed, ~10x the error. There
+is no shape at which it is the right choice.
+
+### And it still does not make the program faster
+
+The comparison that matters is against wmma, because that is what `auto` picks.
+When this was scoped, tile-bf16 (1.712 ms) beat wmma (2.563 ms) at `long seq` by
+1.50x, and the whole case for fp16 was that it would collect that win at an
+accuracy that passes. **That gap closed while the work was in flight**: the wmma
+kernel gained its own `compute_t`/fp16 path, and went 2.563 -> 0.607 ms on the
+same case. wmma is now ahead everywhere:
+
+| case | wmma | tile-fp16 | wmma ahead by |
+|:--|--:|--:|--:|
+| default | 0.035 | 0.071 | 2.03x |
+| default causal | 0.035 | 0.061 | 1.74x |
+| long seq | 0.607 | 0.871 | 1.43x |
+| long seq causal | 0.422 | 0.494 | 1.17x |
+
+End to end, forced through the harness, causal, `ffn_dim == d_model`:
+
+| shape | wmma | tile-fp16 | tile-tf32 |
+|:--|--:|--:|--:|
+| B8 S1024 d256 | **10.752x** | 9.656x | 7.906x |
+| B16 S128 d256 | **3.454x** | 3.185x | 2.996x |
+
+So fp16 is worth **+22%** to the tile kernel at S=1024 and **+6%** at S=128 over
+tf32 -- a real gain on that kernel -- and worth **nothing to the graded number**,
+because `auto` correctly keeps choosing wmma. The mode is kept because it is the
+tile kernel's best mode and because it settles the "is fp16 possible in cuTile"
+question with a measurement rather than a comment; it is not on any dispatch
+path.
+
+The `tiny` rows of `bench_attention.py` are not quoted above: they disagree with
+`verify_kernel.py`'s timings for the same shapes (0.004 ms against 0.037 ms) at
+a size where a single kernel is a few microseconds. Neither is trustworthy there,
+and nothing depends on them.
+
+## The wmma attention kernel, in fp16: 1.33x on the op, 1.039x end to end
+
+The kernel contracted fp32 q/k/v in **tf32** fragments. It now contracts them in
+**fp16**, with the tensors still fp32 -- only the shared tiles and the fragments
+narrow, and the output stays fp32 because it feeds `out_proj`, a cuBLAS fp32
+GEMM. `compute_t` is the template parameter that splits the two roles;
+`--attn-fp16 tf32` restores the old path.
+
+### Why this is not a precision trade
+
+fp16 and tf32 carry the **same 10-bit mantissa**. tf32 is 1+8+10, fp16 is
+1+5+10; only the exponent range differs, and post-LayerNorm activations use none
+of it. So the expected accuracy cost is zero, and it measures as zero -- not
+"close", identical:
+
+| | attention op vs fp64 | whole model, harness `max_abs` |
+|:--|:--|:--|
+| tf32 | 1.12e-3 … 1.77e-3 | 1.31567e-3 / 1.32135e-3 / 1.13010e-3 / 1.23608e-3 |
+| fp16 | 1.12e-3 … 1.77e-3 | 1.31567e-3 / 1.32135e-3 / 1.13010e-3 / 1.23608e-3 |
+
+Every digit of the harness column is the same for both. All shapes PASS,
+including `--causal`, `--padding-ratio 0.3` and the default.
+
+**bf16 is not the same argument and does not survive it.** 8 mantissa bits
+measured 425%-622% of the 2e-3 budget with tens of thousands of failing
+elements, under the *loosened* gate. See the fp16-vs-tf32 note in REPORT.md.
+
+### What it buys
+
+fp16 tensor cores measure 2.0x-2.25x tf32 on this card (39.7 vs 17.7 TFLOPS at
+N=2048, 44.4 vs 22.0 at N=8192), and a 16x16x16 fp16 fragment contracts twice
+the K of tf32's 16x16x8, so the mma count halves as well.
+
+`scripts/ab_attention_fp16.py`, causal, graph-timed, interleaved, control
++/-0.4%. The SDPA column is what `auto` falls back to:
+
+| shape | SDPA | tf32 | fp16 | fp16 vs tf32 | fp16 vs SDPA |
+|:--|--:|--:|--:|--:|--:|
+| B8 H4 S128 d8 | 29.3 | 11.3 | 9.3 | 1.210x | 3.145x |
+| B16 H8 S128 d32 | 83.2 | 38.8 | 31.8 | 1.221x | 2.618x |
+| B64 H8 S128 d32 | 274.5 | 123.0 | 102.0 | 1.206x | 2.691x |
+| B8 H8 S1024 d32 | 1371.8 | 543.0 | 408.0 | **1.331x** | 3.362x |
+| B8 H8 S128 d64 | 63.1 | 37.7 | 29.4 | 1.283x | 2.149x |
+| B4 H8 S512 d64 | 294.7 | 179.2 | 130.3 | 1.376x | 2.262x |
+| B1 H8 S2048 d64 | 1037.6 | 595.8 | 426.6 | **1.397x** | 2.432x |
+| B8 H8 S32 d128 | 41.8 | 15.5 | 13.2 | 1.169x | 3.162x |
+| B8 H8 S128 d128 | 95.8 | 145.4 | 101.6 | 1.430x | 0.943x |
+| B4 H8 S512 d128 | 483.7 | 706.2 | 459.6 | **1.536x** | 1.052x |
+| B2 H8 S1024 d128 | 892.2 | 1239.9 | 819.4 | 1.513x | 1.089x |
+
+Geometric mean **1.328x** over the eleven shapes.
+
+End to end, six layers, causal, `ffn_dim == d_model`, ATTENTION_FP16 flipped
+in-process and interleaved (7 rounds, worst control +/-2.2%):
+
+| shape | tf32 ms | fp16 ms | ratio | control |
+|:--|--:|--:|--:|--:|
+| B8 S1024 d256 | 7.369 | 6.564 | **1.123x** | 0.0% |
+| B8 S128 d32 | 0.194 | 0.182 | **1.065x** | 0.1% |
+| B1 S128 d256 | 0.264 | 0.249 | **1.064x** | 0.0% |
+| B8 S128 d256 | 0.689 | 0.665 | 1.036x | 2.2% |
+| B8 S128 d512 | 2.049 | 1.978 | 1.036x | 0.0% |
+| B64 S128 d256 | 4.823 | 4.719 | 1.022x | 0.1% |
+| B16 S128 d256 | 1.582 | 1.551 | 1.020x | 0.2% |
+| B8 S128 d1024 | 5.563 | 5.485 | 1.014x | 0.1% |
+| B8 S128 d512 h4 | 2.163 | 2.204 | 0.981x | 1.0% |
+
+Geometric mean **1.039x**. The gap between 1.33x on the op and 1.039x on the
+model is Amdahl and nothing else: attention is 20% of the forward pass at
+`B16 S128 d256` and 46% at `S1024`, which is exactly where the two ends of the
+table sit. The harness's own verdict agrees independently -- `--seq-len 2048
+--batch-size 1 --causal` went **4.589x to 5.231x**, a 1.14x against the A/B's
+1.123x at S 1024.
+
+The last row is a **consistency check, not a regression**: at head_dim 128 and
+S 128 the dispatch rule sends both configurations to SDPA, which is why its
+`max_abs` column is exactly 0.00e+00. 0.981x against a 1.0% control is that
+shape's noise.
+
+### head_dim 128 changes verdict, and the auto rule with it
+
+The tf32 kernel *lost* to SDPA at head_dim 128, which is why
+`kWmmaAutoMaxHeadDim` was 64 and the kernel never ran there above S 64. In fp16
+it wins -- but not everywhere. Re-measured, SDPA/wmma, so >1 means the kernel
+wins:
+
+| S | 64 | 128 | 256 | 384 | 512 | 1024 |
+|:--|--:|--:|--:|--:|--:|--:|
+| ratio | 1.552x | **0.938x** | 1.028x | 1.027x | 1.047x | 1.081x |
+
+The dip at exactly S 128 reproduced across runs (0.938x, 0.943x). So the rule
+gained one clause -- head_dim 128 is admitted from **S 512** up, where the
+margin is 4.7%-8.1%, comfortably past the +/-0.4% control. S 256 and 384 also
+win, by 2.8%, and are deliberately not claimed: too close to the floor to be
+worth widening the rule for.
+
+Leaving S 128 to SDPA matters more than the ratio suggests. It is the sequence
+length of eleven of the fourteen grading shapes, so admitting head_dim 128
+outright would have cost 6% at the one shape that has it.
+
+### NEGATIVE: the freed shared memory does not want to be spent on a bigger tile
+
+Narrowing `compute_t` frees about a third of the block's shared memory, so
+shapes appear that fp32 cannot fit -- at head_dim 128, 32x32 costs 41.4 KB in
+fp16 against 29.9 KB for 32x16, and only the latter fits in fp32. Spending the
+slack on a wider key tile was the obvious next move. It loses badly
+(`scripts/ab_attention_shapes.py`, one build per candidate):
+
+| head_dim 128, fp16 | 32x16 (incumbent) | 32x32 | 16x32 |
+|:--|--:|--:|--:|
+| B8 H8 S32 | 1.000x | 0.192x | 0.689x |
+| B8 H8 S128 | 1.000x | 0.765x | 0.378x |
+| B4 H8 S512 | 1.000x | 0.738x | 0.346x |
+| B2 H8 S1024 | 1.000x | 0.765x | 0.357x |
+| **geomean** | **1.000x** | **0.537x** | 0.424x |
+
+head_dim 64 says the same: 64x32 is 0.812x and 32x32 is 0.552x against the 64x16
+incumbent.
+
+A wider `BLOCK_N` doubles the K/V staging and the score tile without adding any
+parallelism. 41.4 KB drops the SM from three resident blocks to two, and each
+block then does twice the work per key-tile iteration. Q is already
+register-resident, so the extra occupancy pressure buys nothing. **The fp16 win
+at head_dim 128 is entirely the fragments, not the tile.** `WmmaShape` was
+parameterised on `sizeof(compute_t)` to run this sweep and then un-parameterised
+again, on the criterion the file already stated: a different winner per dtype is
+what would justify the parameter, and there is none.
+
+### Still open: fp16 q/k/v in GLOBAL memory
+
+This change narrows on the way *into* shared memory. Narrowing the tensors
+themselves would also halve the kernel's DRAM traffic, and it is worth
+measuring rather than guessing at: handing the kernel fp16 tensors directly
+measured **21.4 us at B8 H8 S128 d64 against 29.4 for fp16-compute-only** -- a
+further 1.37x on the op.
+
+It costs more than a cast. q/k/v come out of the fused qkv GEMM, so that GEMM
+would need an fp16 output epilogue (`gemm_bias_gelu_kernel` is most of one
+already), and the kernel would need an `out_t` so that a half-input call can
+still write the fp32 that `out_proj` consumes. It also stops being free on
+accuracy: the fp16-tensor measurement above wrote an fp16 *output*, which moved
+the op's error from 1.59e-3 to 1.83e-3. An `out_t` avoids that, but it has to be
+built before the 1.37x can be claimed.
+
+### Three build traps, all of which cost a debugging session
+
+1. **`if (Math::convert_frag)` must be `if constexpr`.** A runtime branch still
+   type-checks its dead body, and `__float_to_tf32` returns a float that an fp16
+   fragment element cannot be assigned from.
+2. **`static_cast<float>` does not compile on `__nv_bfloat16` here.** torch's
+   build passes `-D__CUDA_NO_BFLOAT16_CONVERSIONS__` and
+   `-D__CUDA_NO_HALF_CONVERSIONS__`, which delete the implicit operators. Hence
+   `dev_to_float`, the mirror of the existing `dev_from_float`.
+3. **Staging must stay a ternary.** Rewriting
+   `k_s[i] = inb ? cvt(k_base[g]) : zero_v` as an `if/else` with two stores cost
+   **1.3x-2.1x on the tf32 path** -- 708 us to 1473 us at B4 H8 S512 d128. The
+   ternary compiles to a predicated select; the branch does not. It was caught
+   only because SDPA, timed in the same table, did not move between the two
+   runs. Hence `dev_of_float<T>`, a value-returning narrowing helper.
+
+A fourth, in `kernel_ext.py` rather than the kernel: the no-cuTile retry does not
+pass `/Zc:preprocessor`, so **any** compile error in `fused_attention.cu` used to
+surface as CUDA 13.3's CCCL complaint about MSVC's traditional preprocessor,
+with the real error discarded by the `except Exception`. The fallback now
+re-raises the first failure.
+
 ## fused_add_layernorm: two block reductions instead of three
 
 The block-per-row kernel reduced `sum(c)` and `sum(c*c)` separately, though both

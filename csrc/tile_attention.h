@@ -19,12 +19,21 @@ namespace tile_attn {
 //
 // No shipped tensor core does a full fp32 matmul, so Fp32 lands on the CUDA
 // cores everywhere; narrowing the operands is what moves work onto the MMA
-// units. There is no Fp16 mode: cuTile accumulates a __half matmul into
-// __half, and attention sums hundreds of products per output.
+// units.
+//
+// Fp16 was long recorded here as impossible, on the grounds that "cuTile
+// accumulates a __half matmul into __half, and attention sums hundreds of
+// products per output". That is true of ct::matmul, whose result element type
+// is fixed: matmul_element_result<__half> is __half. It is NOT true of
+// ct::mma(A, B, C), which takes the accumulator as an argument --
+// low_precision_mma_v in crt/cuda_tile.h admits __half operands with either a
+// __half or a **float** accumulator. The second GEMM already used mma; the
+// first only had to stop using matmul.
 enum class MathMode : int {
     Fp32 = 0,  // exact. CUDA cores.    ~1e-6 against an exact reference.
     Bf16 = 1,  // tensor cores.         ~4e-3 -- 8 significand bits.
     Tf32 = 2,  // tensor cores.         ~1e-3 -- see supports().
+    Fp16 = 3,  // tensor cores.         ~1e-3 -- 10 significand bits, as tf32.
 };
 
 // True when this build actually contains the tile kernel (CUDA 13.3+ and

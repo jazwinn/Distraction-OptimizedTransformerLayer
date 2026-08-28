@@ -43,10 +43,31 @@ ATTENTION_BACKEND = "auto"
 #                tensor-core mode to reach for first.
 #   "tile-bf16"  as above, narrowed to bfloat16 -- 8 mantissa bits, ~4e-3.
 #                Expect it to fail the accuracy gate where "tile" passes.
+#   "tile-fp16"  narrowed to float16: 10 mantissa bits, the same as tf32, so
+#                the same ~1e-3 -- but 16-bit operands, so it runs at bf16's
+#                speed rather than tf32's. This is the one tile mode that is
+#                both accurate enough and fast enough to be worth considering
+#                against wmma; see csrc/TUNING.md for where it wins.
 ATTENTION_IMPL = "auto"
 
 _IMPL_CODE = {"auto": 0, "scalar": 1, "wmma": 2, "tile": 3, "tile-bf16": 4,
-              "tile-tf32": 5}
+              "tile-tf32": 5, "tile-fp16": 6}
+
+# Precision the wmma attention kernel contracts fp32 q/k/v in. --attn-fp16
+# overrides this for a single run.
+#
+#   "auto"   fp16 fragments. tf32 and fp16 carry the SAME 10-bit mantissa, so
+#            this is not an accuracy trade: measured against an fp64 reference
+#            the two agree to three significant figures at every shape swept
+#            (scripts/ab_attention_fp16.py prints both columns). What fp16 buys
+#            is that its tensor cores run 2.0x-2.25x tf32 on this card and a
+#            16x16x16 fragment contracts twice the K of tf32's 16x16x8.
+#   "tf32"   the old path, for re-running that comparison.
+#
+# The tensors stay fp32 either way -- only the shared tiles and the fragments
+# narrow. bf16 is not offered: 8 mantissa bits measured 425%-622% of the
+# harness's 2e-3 budget.
+ATTENTION_FP16 = "auto"
 
 # Ask the kernel for [B, S, H*head_dim] rather than [B, H, S, head_dim].
 # out_proj wants the flattened layout, and the transpose+reshape that used to

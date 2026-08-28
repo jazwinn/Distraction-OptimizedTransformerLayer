@@ -81,7 +81,7 @@ def main() -> int:
     # head_dim in this table now, but it declines rather than falling through
     # to ATen on ones it does not, which is what used to put ATen's time in
     # this table under the scalar kernel's name.
-    TILE_COLS = (("tile", 3), ("tile-tf32", 5), ("tile-bf16", 4))
+    TILE_COLS = (("tile-tf32", 5), ("tile-bf16", 4), ("tile-fp16", 6))
 
     head = (f"{'case':<18}{'sdpa':>10}{'scalar':>10}{'wmma':>10}"
             + "".join(f"{name:>10}" for name, _ in TILE_COLS)
