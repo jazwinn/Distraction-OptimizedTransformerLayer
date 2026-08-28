@@ -930,7 +930,9 @@ failure — "it can time ATen and label it 'scalar'" — and then deferred it as
 change, not a cleanup".
 
 The fix is to stop exempting it: forcing any impl now means that kernel or an error, and
-`auto` is the only mode that reaches ATen. The scalar kernel has since grown a real head_dim
+`auto` is the only mode that reaches the fallback. (That fallback is SDPA now rather than
+the explicit matmul this paragraph calls ATen -- see csrc/TUNING.md, "The uncovered-shape
+fallback is SDPA".) The scalar kernel has since grown a real head_dim
 128 — see [Coverage and limits](#coverage-and-limits) for the lane-pair split that fits it
 under the register ceiling — so that row carries a genuine measurement again, and it reads
 **1.000 against a 1.000 control**. The regression that was attributed to memory-level

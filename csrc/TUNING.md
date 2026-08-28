@@ -283,11 +283,14 @@ about 3%, reproduced over two process pairs.
 
 Two limits worth knowing:
 
-- **The padded-causal path never reaches it.** `MySelfAttention` folds causal
-  into an explicit `[B,1,S,S]` mask whenever there is real padding to combine
-  with, which arrives as `is_causal=false`. The kernel cannot tell that mask is
-  triangular, so the imbalance is there and the fix is not. Those rows show up
-  as controls in the A/B table rather than as measurements.
+- **The padded-causal path used not to reach it.** `MySelfAttention` folded
+  causal into an explicit `[B,1,S,S]` mask whenever there was real padding to
+  combine with, which arrived as `is_causal=false`; the kernel could not tell
+  that mask was triangular, so the imbalance was there and the fix was not, and
+  those rows appear as controls in the A/B table above rather than as
+  measurements. Fixed since — see "Causal and an explicit mask, together". The
+  A/B was not re-run afterwards, so those control rows are still controls in
+  the table; the reversal now applies to them.
 - **`WMMA_CAUSAL_REVERSE=0` disables it**, and `wmma_set_causal_reverse()` flips
   it at run time so both mappings can be timed in one process. Like
   `tile_set_split_kv`, it is invisible to the CUDA-graph cache key -- flipping
@@ -350,6 +353,142 @@ trade, so the cheap one (the short shape) wins.
 `splits*B*H*S*(head_dim+2)` floats, costs more than the idle SMs it buys back.
 `kMaxWorkspace = 96 MB` is a backstop against a pathological shape rather than a
 real constraint — batch 8, heads 8, seq 512, head_dim 64 at 4 splits is 34 MB.
+
+## Auto's kernel preference: where coverage and speed come apart
+
+`run_kernel(Impl::Auto)` used to mean "the first kernel that can do this",
+which is only the right rule while covering a case and being the fastest way to
+serve it are the same thing. At head_dim 128 they are not.
+
+wmma against SDPA, fp32 causal, interleaved in one process. Ratio > 1 means the
+wmma kernel is slower:
+
+| head_dim 128 | batch 8 | batch 1 |
+|:-------------|--------:|--------:|
+| seq 32       |  0.42x  |  0.59x  |
+| seq 64       |  0.98x  |  0.86x  |
+| seq 128      |  1.47x  |  1.22x  |
+| seq 256      |  1.46x  |  1.20x  |
+| seq 512      |  1.52x  |  1.44x  |
+
+The reason is in `cuobjdump -res-usage`: `fused_attention_wmma_kernel<float,
+128>` reports **REG:255**, one under the hardware ceiling. head_dim 128 gives
+each warp `q_frag[PDIM/WK]` = 16 fragments, 128 registers of query before a
+single accumulator exists, and that is what forces `WmmaShape<128>` down to
+32x16 — two warps, ~36 KB, two blocks and 128 threads per SM. There is not
+enough in flight to cover memory latency, and no block shape fixes it while Q is
+register-resident. (head_dim 64 reports REG:168, head_dim 32 REG:128.)
+
+So Auto now takes wmma at `head_dim <= 64`, or at head_dim 128 when
+`seq_len < 128`, and otherwise falls through. The crossover is where SDPA's
+fixed per-launch cost stops dominating: seq 64 is a tie at the noise floor and
+seq 128 is not. `--attn-impl wmma` still reaches the kernel at every head_dim it
+covers, because a forced impl means that kernel or nothing.
+
+float16 crosses earlier and harder (2.85x at seq 128, 3.30x at seq 512, where
+SDPA reaches its flash backend), so a gate on head_dim and length alone is
+conservative for the narrow dtypes rather than wrong for them.
+
+End to end, `--causal --d-model 1024 --ffn-dim 1024` (head_dim 128), auto
+against a forced wmma, two process pairs: **1.361x / 1.345x** against
+**1.306x / 1.310x**. Accuracy improves alongside — `max_abs` 1.21e-3 against
+1.35e-3.
+
+## The uncovered-shape fallback is SDPA, not the baseline's own matmul
+
+The path taken when no kernel covers a case used to mirror
+`BaselineSelfAttention.forward` exactly: `matmul`, mask, `softmax`, `matmul`.
+That read as the safe choice and was the opposite of one — it materializes the
+whole [B, H, S, S] score matrix, so the one path this file takes when it has
+nothing better ran the *baseline's* algorithm and inherited its memory traffic.
+
+head_dim 256 is the only head_dim in the grading set no kernel covers. The old
+fallback against SDPA, interleaved, causal fp32:
+
+| head_dim 256 | batch 8 | batch 1 |
+|:-------------|--------:|--------:|
+| seq 32       |  3.91x  |  6.29x  |
+| seq 128      |  1.37x  |  5.20x  |
+| seq 256      |  1.29x  |  2.02x  |
+| seq 512      |  1.30x  |  1.08x  |
+
+Nothing measured was slower, and the largest wins are where the score matrix is
+largest relative to the useful work. End to end at `--causal --d-model 2048
+--ffn-dim 2048` the harness reports 1.170x, against the 1.19x recorded for that
+shape before — the same, because at d_model 2048 the four projection GEMMs
+dominate what attention costs either way.
+
+## Causal and an explicit mask, together
+
+`fused_attention_forward` used to reject `is_causal` alongside `attn_mask`,
+copying SDPA's restriction. SDPA has to have it; this ABI did not. Both kernels
+already apply the two independently — a causal `break`/predicate and a separate
+mask lookup — so allowing the pair needed no kernel change at all.
+
+What it buys is not one less tensor. `is_causal` in these kernels is not
+masking, it is *skipping*: `key_limit` stops the key loop at the block's own
+last row instead of walking S. Folding the triangle into a [B, 1, S, S] mask
+hides that from the kernel, which then computes the upper half of the score
+matrix and discards it. On the attention op alone, folded against
+causal + a [B, 1, 1, S] key mask, interleaved:
+
+| case                | gain  |
+|:--------------------|------:|
+| B8 H8 seq 128 d64   | 1.18x |
+| B8 H8 seq 512 d64   | 1.69x |
+| B8 H8 seq 1024 d64  | 1.85x |
+| B64 H8 seq 128 d32  | 1.40x |
+| B8 H8 seq 128 d8    | 1.24x |
+| B3 H5 seq 37 d32    | 0.97x |
+
+converging on the 2x that is exactly the half of the matrix the early exit
+skips. Error against the reference is identical to seven digits either way —
+this is the same arithmetic on fewer keys, not an approximation. It also
+restores the causal block-index reversal to the padded path, which the section
+above records as unreachable while the fold was in the way.
+
+Whole model, in-process interleaved with a control row (the fused path timed
+against itself, true value 1.000x), `--padding-ratio 0.3 --causal`:
+
+| shape                  | gain   | control |
+|:-----------------------|-------:|--------:|
+| B8 seq 1024 d_model 512 | 1.285x | 1.001x |
+| B8 seq 512  d_model 512 | 1.158x | 1.004x |
+| B64 seq 128 d_model 256 | 1.063x | 0.998x |
+| B8 seq 128  d_model 512 | 1.009x | 0.990x |
+| B1 seq 128  d_model 256 | 0.984x | 1.005x |
+
+The two short-sequence rows are ties against a ~1% control. The win is the
+early exit, so it grows with what the early exit skips.
+
+**The tile kernels are excluded.** `MaskMode` is a template parameter with
+None/Causal/Explicit and no combined mode, so `launch_tile` declines the pair
+rather than silently dropping half of it. Adding a fourth mode is the work, if
+the tile kernels ever join Auto.
+
+## Two things measured and NOT done
+
+**cuBLASLt's fused GELU epilogue.** `torch._addmm_activation(bias, x, w.t(),
+use_gelu=True)` reaches `CUBLASLT_EPILOGUE_GELU_BIAS`, which would remove the
+separate GELU kernel — 4.6% of GPU time in a profile of the FFN-heavy grading
+shape. It fails on both counts. It is the **tanh** approximation, not erf: it
+matches `F.gelu(approximate="tanh")` to 5.6e-6 and differs from
+`approximate="none"` by 4.7e-4, which is a quarter of the whole atol budget
+spent on one op. And on [8192, 256] x [256, 256] it measures **0.842x** —
+0.1754 ms against 0.1477 for the unfused pair, because the Lt heuristic picks a
+worse kernel than plain cuBLAS does. Fused is not automatically faster.
+
+**cp.async double-buffered K/V staging in the wmma kernel.** The obvious next
+step from the priority list, and the arithmetic says no. At head_dim 64 the tile
+footprint leaves room to double the K/V buffers (32.0 KB to 40.7 KB) but that
+drops the SM from three resident blocks to two, and there is nothing to buy with
+the occupancy. `b64 h8 s128 d64 causal` moves about 84 MB (Q and O in full, K/V
+once per m-tile) in 0.226 ms — **371 GB/s, 83% of the card's 448**, before
+counting the L2 reuse between the two m-tiles that share a (b, h). The kernel is
+already bandwidth-saturated at the large shapes and latency-bound only where the
+grid is too small to fill the card, which is what split-KV and the short-grid
+shape address. Overlapping the load with the compute has almost nothing left to
+recover.
 
 ## GEMM with fused bias + GELU: measured, and NOT wired into the model
 

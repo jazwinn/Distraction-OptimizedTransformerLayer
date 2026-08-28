@@ -23,10 +23,15 @@
 //           only when the build found CUDA 13.3+. impl=3/4/5 select fp32, bf16
 //           and tf32 operands; none is picked by impl=0.
 //
-// A head_dim outside those sets -- 24 or 48, say -- falls back to the ATen
-// implementation at the bottom, which mirrors BaselineSelfAttention.forward
-// exactly. head_dim is a template parameter, so each supported value is a
-// separately compiled kernel and the set cannot be open-ended.
+// A head_dim outside those sets -- 24 or 48, say, or the 256 the grading set
+// contains -- falls back to SDPA, at the bottom. head_dim is a template
+// parameter, so each supported value is a separately compiled kernel and the
+// set cannot be open-ended.
+//
+// impl=0 (auto) does not simply take the first of the three that covers a case:
+// at head_dim 128 the wmma kernel is correct and slower than SDPA, so auto
+// declines it there and the fallback serves the call instead. Coverage and
+// preference are separate questions -- see run_kernel().
 
 #include "tile_attention.h"
 
@@ -1098,6 +1103,14 @@ bool launch_tile(const AttnArgs& a, tile_attn::MathMode math) {
                 "fused_attention_forward: the tile kernels take float32 in and "
                 "out -- the math mode narrows only the GEMM operands. Got ",
                 a.q.scalar_type());
+    // An invariant, not a user-facing rule: fused_attention_forward folds the
+    // triangle into the mask before it gets here whenever a tile impl is what
+    // was asked for. Checked rather than assumed, because dropping half a mask
+    // is a wrong answer rather than a crash.
+    TORCH_CHECK(!(a.is_causal && a.mask_ptr != nullptr),
+                "fused_attention_forward: internal error -- the tile kernels "
+                "have no combined causal + explicit mask mode and the fold did "
+                "not happen.");
     TORCH_CHECK(tile_attn::supports(math),
                 "fused_attention_forward: this build has no tile kernel for that "
                 "math mode. tf32 needs a toolkit shipping <cuda_tf32.h> (CUDA "
@@ -1123,10 +1136,45 @@ bool launch_tile(const AttnArgs& a, tile_attn::MathMode math) {
         static_cast<float>(a.scale), math, at::cuda::getCurrentCUDAStream());
 }
 
-// Runs the first kernel that covers this case, honouring what the caller asked
-// for. Auto is the only mode that tries a second kernel; forcing an impl means
-// that kernel or nothing. What happens when nothing covers the case is decided
-// by the caller, not here.
+// Auto's kernel preferences, where "covers this case" and "is the fastest thing
+// available for it" come apart.
+//
+// The wmma kernel *covers* head_dim 128 -- it is correct there and it is what
+// --attn-impl wmma still gets -- but past a short sequence it loses to SDPA,
+// and it loses by more the longer the sequence gets. head_dim 128 gives each
+// warp a 16-fragment q_frag array, 128 registers of query before a single
+// accumulator is allocated, which is what forces the block down to 32x16: two
+// warps and about 36 KB, so an SM holds two blocks and 128 threads. There is
+// not enough in flight to cover the memory latency, and no block shape fixes it
+// while Q is register-resident.
+//
+// Interleaved against SDPA, causal fp32, ratio > 1 meaning wmma is slower:
+//
+//   S   32   0.42x    S  128   1.47x    S  512   1.52x
+//   S   64   0.98x    S  256   1.46x
+//
+// The crossover is the sequence length at which SDPA's fixed per-launch cost
+// stops dominating, and it sits between 64 and 128 -- S 64 is a tie at the 4.3%
+// noise floor (0.98x at batch 8, 0.86x at batch 1), so the threshold is set at
+// the first length where the loss is unambiguous. float16 crosses earlier
+// (2.85x at S 128, where SDPA reaches its flash backend), so gating on
+// head_dim and length alone is conservative for the narrow dtypes rather than
+// wrong for them.
+//
+// Below the threshold Auto keeps the wmma kernel, which is worth keeping: at
+// S 32 it is more than twice as fast as SDPA.
+constexpr int kWmmaAutoMaxHeadDim = 64;
+constexpr int kWmmaAutoMinSeqForSdpa = 128;
+
+bool wmma_preferred_by_auto(const AttnArgs& a) {
+    return a.head_dim <= kWmmaAutoMaxHeadDim || a.S < kWmmaAutoMinSeqForSdpa;
+}
+
+// Runs a kernel for this case, honouring what the caller asked for: for a
+// forced impl, that kernel or nothing; for Auto, the fastest kernel that both
+// covers the case and is preferred for it, which is not always the first one
+// that covers it. Returning false means "the caller's fallback should serve
+// this", and what that fallback is gets decided there, not here.
 bool run_kernel(Impl impl, const AttnArgs& a) {
     switch (impl) {
         case Impl::Scalar:   return launch_scalar(a);
@@ -1137,7 +1185,13 @@ bool run_kernel(Impl impl, const AttnArgs& a) {
         // Tile is deliberately absent here: it covers only float32 and is a
         // separate programming model whose performance the caller should opt
         // into deliberately rather than inherit.
-        case Impl::Auto:     return launch_wmma(a) || launch_scalar(a);
+        case Impl::Auto:
+            // Declining here is not "no kernel covers this" -- it is a
+            // preference, and the caller's fallback is what it resolves to. The
+            // scalar kernel is not offered as the second choice at head_dim 128
+            // either: it is slower than wmma everywhere the two overlap.
+            return wmma_preferred_by_auto(a) &&
+                   (launch_wmma(a) || launch_scalar(a));
     }
     return false;
 }
@@ -1148,28 +1202,42 @@ torch::Tensor to_bshd(const torch::Tensor& t) {
     return t.transpose(1, 2).reshape({t.size(0), t.size(2), t.size(1) * t.size(3)});
 }
 
-// Mirrors BaselineSelfAttention.forward exactly. Used for shapes/dtypes no
-// kernel specializes.
-torch::Tensor attention_aten(const torch::Tensor& q, const torch::Tensor& k,
+// The fallback for shapes and dtypes no kernel here specializes.
+//
+// SDPA, not the baseline's own matmul + softmax + matmul. That version mirrored
+// BaselineSelfAttention exactly, which read as the safe choice and was not:
+// it materializes the whole [B, H, S, S] score matrix, so the one path this
+// file takes when it has nothing better runs the *baseline's* algorithm and
+// inherits its memory traffic. SDPA runs a flash-style kernel instead and never
+// builds the score matrix. Interleaved against it at head_dim 256 causal
+// (the only head_dim in the grading set no kernel covers):
+//
+//   B8 H8 S32    3.91x     B8 H8 S128   1.37x     B8 H8 S512   1.30x
+//   B1 H8 S32    6.29x     B1 H8 S128   5.20x     B1 H8 S512   1.08x
+//
+// -- with the largest wins exactly where the score matrix is largest relative
+// to the work. Nothing measured was slower. The arithmetic differs from the
+// baseline's in the last bits (the same tf32 GEMMs, summed in a different
+// order), which is what every kernel in this file already does.
+torch::Tensor attention_sdpa(const torch::Tensor& q, const torch::Tensor& k,
                              const torch::Tensor& v,
                              const c10::optional<torch::Tensor>& attn_mask,
                              bool is_causal, double scale) {
-    const int64_t S = q.size(2);
-    auto scores = torch::matmul(q, k.transpose(-2, -1)) * scale;
-
-    if (is_causal) {
-        auto blocked = torch::ones({S, S},
-                                   torch::TensorOptions().dtype(torch::kBool).device(q.device()))
-                           .triu(/*diagonal=*/1);
-        scores = scores.masked_fill(blocked, -std::numeric_limits<float>::infinity());
+    // SDPA rejects is_causal together with a mask, which this ABI deliberately
+    // allows -- so the fold the kernels no longer need happens here, for the
+    // shapes no kernel covers. It is the expensive form (an [S, S] triangle
+    // broadcast against the mask) and that is the trade: this path is already
+    // the one nothing specialises.
+    if (is_causal && attn_mask.has_value()) {
+        const int64_t S = q.size(2);
+        auto allowed = torch::ones({S, S}, attn_mask.value().options()).tril();
+        return at::scaled_dot_product_attention(
+            q, k, v, c10::optional<torch::Tensor>(attn_mask.value() & allowed),
+            /*dropout_p=*/0.0, /*is_causal=*/false, c10::optional<double>(scale));
     }
-    if (attn_mask.has_value()) {
-        scores = scores.masked_fill(attn_mask.value().logical_not(),
-                                    -std::numeric_limits<float>::infinity());
-    }
-
-    auto probs = torch::softmax(scores.to(torch::kFloat32), -1).to(q.scalar_type());
-    return torch::matmul(probs, v);
+    return at::scaled_dot_product_attention(
+        q, k, v, attn_mask, /*dropout_p=*/0.0, is_causal,
+        c10::optional<double>(scale));
 }
 
 
@@ -1706,15 +1774,17 @@ std::vector<torch::Tensor> fused_add_layernorm(torch::Tensor x,
 //   q, k, v          : [B, H, S, head_dim], CUDA
 //   attn_mask        : optional bool, broadcastable to [B, H, S, S].
 //                      SDPA convention -- true means ALLOWED to attend.
-//   is_causal        : lower-triangular masking. Never combined with attn_mask;
-//                      the caller folds causal into attn_mask when both apply.
+//   is_causal        : lower-triangular masking. May be combined with
+//                      attn_mask, unlike SDPA -- see the note in the body for
+//                      why that combination is the point rather than a
+//                      concession, and what the tile kernels do instead.
 //   scale            : score multiplier, normally 1/sqrt(head_dim).
 //   out_layout       : 0 -> [B, H, S, head_dim], the natural per-head layout
 //                      1 -> [B, S, H*head_dim], ready for out_proj
 //
 // returns            : the requested layout, always. The wmma and scalar
 //                      kernels write layout 1 directly; the tile kernels and
-//                      the ATen fallback produce layout 0 and are converted
+//                      the SDPA fallback produce layout 0 and are converted
 //                      here, so the caller never has to ask which it got.
 torch::Tensor fused_attention_forward(torch::Tensor q,
                                       torch::Tensor k,
@@ -1738,8 +1808,30 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
                 "fused_attention_forward: q/k/v must have identical shapes");
     TORCH_CHECK(q.scalar_type() == k.scalar_type() && q.scalar_type() == v.scalar_type(),
                 "fused_attention_forward: q/k/v must share a dtype");
-    TORCH_CHECK(!(is_causal && attn_mask.has_value()),
-                "fused_attention_forward: pass either is_causal or attn_mask, not both");
+    // is_causal and attn_mask together are allowed, and are the point of this
+    // ABI rather than an accident of it. SDPA rejects the combination, so a
+    // caller with both padding and causal masking has to fold the triangle into
+    // an explicit [B, 1, S, S] mask -- which costs an S^2 tensor per layer and,
+    // far worse, hides the triangle from the kernel. What the kernel does with
+    // `is_causal` is not masking, it is *skipping*: key_limit stops the loop at
+    // the block's own last row instead of walking S. Handed the same masking as
+    // data, it computes the upper triangle and throws it away.
+    //
+    // Interleaved, head_dim 64, the folded [B, 1, S, S] against this pair:
+    //
+    //   S  128   1.18x        S  512   1.69x        S 1024   1.85x
+    //
+    // -- converging on the 2x that is exactly the half of the score matrix the
+    // early exit skips. (Against plain causal with no mask at all, which is the
+    // ceiling rather than the gain, the same shapes read 1.37x/1.84x/1.98x --
+    // the difference is what the mask lookup itself still costs.) Both kernels below already apply the two independently
+    // (a causal `break`/predicate and a separate mask lookup), so this needed
+    // no kernel change; it was only ever this check.
+    //
+    // The tile kernels are the exception -- MaskMode is a template parameter
+    // with None/Causal/Explicit and no combined mode -- so they alone still pay
+    // the fold, below, once S is known. The caller's contract does not change
+    // for them; the cost does.
 
     const Impl mode = static_cast<Impl>(impl);
     const bool tile_mode =
@@ -1771,13 +1863,29 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
     const int S = static_cast<int>(qc.size(2));
     const int head_dim = static_cast<int>(qc.size(3));
 
+    // Everything below reads these rather than the arguments, because the tile
+    // kernels need the pair collapsed and nothing else does.
+    bool causal = is_causal;
+    c10::optional<torch::Tensor> mask = attn_mask;
+    if (tile_mode && causal && mask.has_value()) {
+        // The cost this ABI exists to avoid, paid here by the one family of
+        // kernels that cannot express the pair: an [S, S] triangle, and a
+        // causal early exit given up. A forced --attn-impl tile* keeps working
+        // on a padded causal shape; it just does not get the 1.18x-1.85x that
+        // csrc/TUNING.md records for the kernels that do.
+        auto allowed = torch::ones({static_cast<int64_t>(S), static_cast<int64_t>(S)},
+                                   mask.value().options()).tril();
+        mask = mask.value() & allowed;
+        causal = false;
+    }
+
     // expand() gives stride-0 dims instead of copying, so a [B,1,1,S] mask and
     // a [B,1,S,S] mask are both just a stride pattern to the kernel.
     const bool* mask_ptr = nullptr;
     int64_t ms[4] = {0, 0, 0, 0};
     torch::Tensor mask_expanded;
-    if (attn_mask.has_value()) {
-        auto m = attn_mask.value();
+    if (mask.has_value()) {
+        auto m = mask.value();
         TORCH_CHECK(m.scalar_type() == torch::kBool,
                     "fused_attention_forward: attn_mask must be a bool tensor");
         mask_expanded = m.contiguous().expand({B, H, S, S});
@@ -1809,19 +1917,20 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
                                   qc.options());
 
     const AttnArgs args{qc, kc, vc, mask_ptr, ms, qs, out,
-                        B, H, S, head_dim, is_causal, scale};
+                        B, H, S, head_dim, causal, scale};
 
     if (!run_kernel(mode, args)) {
-        // Nothing covered this case, so ATen finishes the job for Auto -- it
-        // takes any head_dim. Every *forced* impl declines loudly instead:
-        // asking for one specifically and quietly getting ATen lets a benchmark
-        // time one kernel and report it as another.
+        // Auto reaches here two ways -- nothing covers the case, or nothing
+        // covering it is the fastest way to serve it -- and SDPA finishes the
+        // job either way. Every *forced* impl declines loudly instead: asking
+        // for one specifically and quietly getting something else lets a
+        // benchmark time one kernel and report it as another.
         //
         // scalar used to be exempt, and the exemption did exactly the damage
         // it was warned about: it had no head_dim 128, so `--attn-impl scalar`
-        // there was ATen wearing the scalar kernel's name, in the benchmark
-        // scripts and then in REPORT.md. Left behind this check now: float64
-        // past head_dim 16, and any head_dim nobody specialises.
+        // there was the fallback wearing the scalar kernel's name, in the
+        // benchmark scripts and then in REPORT.md. Left behind this check now:
+        // float64 past head_dim 16, and any head_dim nobody specialises.
         TORCH_CHECK(mode == Impl::Auto,
                     "fused_attention_forward: impl=", impl, " (", impl_name(mode),
                     ") does not cover dtype=", qc.scalar_type(),
@@ -1832,16 +1941,19 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
                     "shared memory for its key tiles (float64 runs out past 16); "
                     "wmma needs SM 8.0+ and head_dim in {8,16,32,64,128}; the "
                     "tile kernels need float32 and head_dim in {8,16,32,64}. Use "
-                    "impl=0 (auto) to fall back to ATen for this shape.");
+                    "impl=0 (auto) to fall back to SDPA for this shape.");
 
         // The strided views, not .contiguous() copies -- a measured tie, not an
-        // oversight. ATen is the one consumer here that pays for a row pitch it
-        // did not ask for (1.41x-1.50x on short sequences, 1.01x by seq 2048),
-        // but cloning first costs the same 1.32x-1.54x on the same shapes. The
-        // copy is worth exactly what the strided reads are, so there is nothing
-        // to collect and an allocation to lose. Numbers in REPORT.md.
-        auto aten_out = attention_aten(qc, kc, vc, attn_mask, is_causal, scale);
-        return want_bshd ? to_bshd(aten_out) : aten_out;
+        // oversight. The fallback is the one consumer here that pays for a row
+        // pitch it did not ask for (1.41x-1.50x on short sequences, 1.01x by
+        // seq 2048), but cloning first costs the same 1.32x-1.54x on the same
+        // shapes. The copy is worth exactly what the strided reads are, so
+        // there is nothing to collect and an allocation to lose. Numbers in
+        // REPORT.md, measured when this path was the explicit matmul; SDPA
+        // makes its own copy when it wants one, so it is if anything less
+        // sensitive.
+        auto fallback_out = attention_sdpa(qc, kc, vc, mask, causal, scale);
+        return want_bshd ? to_bshd(fallback_out) : fallback_out;
     }
 
     cudaError_t err = cudaGetLastError();

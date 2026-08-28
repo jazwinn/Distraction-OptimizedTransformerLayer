@@ -23,7 +23,11 @@ ATTENTION_BACKEND = "auto"
 # Which kernel inside the extension handles attention; only meaningful when the
 # custom backend is in play. --attn-impl overrides this for a single run.
 #
-#   "auto"       tensor-core kernel where it applies, scalar kernel otherwise
+#   "auto"       the fastest path for the shape, which is not the same as the
+#                first one that covers it: the tensor-core kernel where it
+#                wins, the scalar kernel where that is all there is, and SDPA
+#                from head_dim 128 up, where the wmma kernel is correct and
+#                slower. See run_kernel() in csrc/fused_attention.cu.
 #   "scalar"     force the scalar kernel (no tensor cores, no TF32 rounding);
 #                head_dim in {8,16,32,64,128}, and raises on anything else. It
 #                used to fall through to ATen instead, which meant --attn-impl

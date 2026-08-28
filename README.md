@@ -404,7 +404,7 @@ optimized/config.py                       the runtime knobs: backend, kernel, CU
 optimized/cli.py                          --attn-backend / --attn-impl / --cuda-graph
 optimized/model.py                        OptimizedTransformer: the whole forward pass
 optimized/layers.py                       its submodules, named to match the baseline's
-optimized/kernels.py                      dispatch into csrc/, with SDPA and ATen fallbacks
+optimized/kernels.py                      dispatch into csrc/, with an SDPA fallback
 optimized/graphs.py                       CUDA graph capture, replay and teardown
 optimized/util.py                         small shared helpers
 

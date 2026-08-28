@@ -1,4 +1,4 @@
-"""Dispatch into the custom CUDA extension, with SDPA and ATen fallbacks.
+"""Dispatch into the custom CUDA extension, with an SDPA fallback.
 
 Nothing here knows about CUDA graphs or about the model; it is the boundary
 between torch ops and csrc/.
@@ -6,7 +6,7 @@ between torch ops and csrc/.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -56,6 +56,7 @@ def _attention_dispatch(
     attn_mask: Optional[torch.Tensor],
     is_causal: bool,
     scale: float,
+    causal_mask: Optional[Callable[[], torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Route attention to the custom CUDA kernel or to SDPA.
 
@@ -63,6 +64,14 @@ def _attention_dispatch(
     backend served the call: the custom kernels write it from their epilogue,
     SDPA cannot, so the transpose/reshape happens here. One contract, so the
     caller never has to ask which backend it got.
+
+    `attn_mask` and `is_causal` may both be set, which is what lets a padded
+    causal call stay a [B, 1, 1, S] key mask plus a flag rather than a folded
+    [B, 1, S, S] triangle -- the kernels keep their causal early exit that way,
+    worth 1.18x-1.85x on the op. SDPA cannot take the pair, so `causal_mask`
+    optionally supplies a cached [S, S] triangle to fold with; it is called only
+    on the branch that needs it, and that branch builds its own when there is
+    none.
     """
     global _fallback_warned
 
@@ -92,6 +101,24 @@ def _attention_dispatch(
                 f'[info] to silence this:    set ATTENTION_BACKEND = "sdpa" '
                 f"in optimized/config.py"
             )
+
+    if is_causal and attn_mask is not None:
+        # SDPA rejects the combination the kernels accept. Fold, and pay for the
+        # [B, 1, S, S] the custom path no longer builds. `causal_mask` is the
+        # caller's cache for the triangle -- seq_len is fixed for a model
+        # instance's lifetime, so rebuilding it per layer would be waste -- but
+        # it is a cache, not a contract: without one, build the triangle here
+        # rather than refuse. This is the branch that has to stay correct for
+        # any caller, not the one that has to be fast.
+        if causal_mask is not None:
+            allowed = causal_mask()
+        else:
+            seq_len = q.shape[2]
+            allowed = torch.ones(
+                seq_len, seq_len, device=q.device, dtype=torch.bool
+            ).tril()
+        attn_mask = attn_mask & allowed
+        is_causal = False
 
     context = F.scaled_dot_product_attention(
         q, k, v, attn_mask=attn_mask, is_causal=is_causal, scale=scale
