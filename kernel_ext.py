@@ -336,12 +336,28 @@ def get_kernels(verbose: bool = False):
             try:
                 _kernels = do_load(with_tile=True)
                 _tile_enabled = True
-            except Exception:
+            except Exception as tile_error:
                 # A tile-capable toolkit that still cannot build the tile
                 # kernel must not cost us the other two. Retry without it;
                 # tile_attention.cu then compiles to its declining stub.
-                _kernels = do_load(with_tile=False)
-                _tile_enabled = False
+                #
+                # If the retry ALSO fails, report the tile build's error rather
+                # than the retry's. An ordinary compile error in
+                # fused_attention.cu fails both, and the retry's flags lack
+                # /Zc:preprocessor -- so the second failure surfaces as CUDA
+                # 13.3's CCCL preprocessor complaint and buries the real
+                # message. That cost a debugging session once.
+                try:
+                    _kernels = do_load(with_tile=False)
+                    _tile_enabled = False
+                except Exception as plain_error:
+                    raise RuntimeError(
+                        f"{tile_error}\n\n"
+                        f"[kernel_ext] the retry without cuTile also failed; "
+                        f"its error is usually the less informative of the two "
+                        f"and is omitted. Retry error type: "
+                        f"{type(plain_error).__name__}"
+                    ) from tile_error
         else:
             _kernels = do_load(with_tile=False)
             _tile_enabled = False

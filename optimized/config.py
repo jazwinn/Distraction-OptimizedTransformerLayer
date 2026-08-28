@@ -54,6 +54,44 @@ _IMPL_CODE = {"auto": 0, "scalar": 1, "wmma": 2, "tile": 3, "tile-bf16": 4,
 # The kernel epilogue reaches the same addresses for free.
 _OUT_LAYOUT_BSHD = 1
 
+# Fuse the FFN's first Linear with its GELU into one kernel. --linear-gelu
+# overrides this for a single run.
+#
+#   "auto"   the fused kernel, fp16 fragments. Faster than cuBLAS + a separate
+#            GELU at every shape measured -- 1.24x to 2.40x on the op, across
+#            grids from 2 tiles to 20000 and K/N from 32 to 4096 -- so there is
+#            no shape gate. See pick_gemm_tile() in csrc/fused_attention.cu.
+#   "tf32"   the fused kernel with tf32 fragments instead. Same 10-bit mantissa
+#            as fp16 and therefore the same accuracy, but half the tensor-core
+#            throughput on this card, so this is for measurement and as a
+#            fallback -- not a mode to run in.
+#   "off"    always cuBLAS + F.gelu.
+#
+# Why fp16 rather than tf32: both carry a 10-bit mantissa, so they produce the
+# same error against an fp64 reference -- measured identical to three
+# significant figures at the attention op, the FFN GEMM, and the whole six-layer
+# model. But fp16 tensor cores run 2.0x-2.25x faster here (39.7 vs 17.7 TFLOPS
+# at N=2048) and an fp16 fragment contracts 16 elements of K against tf32's 8.
+# bf16 is not offered: 8 mantissa bits put it at 425%-622% of the accuracy
+# budget, with tens of thousands of failing elements.
+#
+# Worth having an off switch because this is the one optimization that can move
+# the accuracy number. Where cuBLAS picks a TF32 kernel with the same k-order,
+# "tf32" here is BIT-IDENTICAL to F.linear + F.gelu; fp16 is not, and costs
+# about 1e-4 of extra end-to-end error. Measured against the 2e-3 gate, the
+# tightest grading shape sits at 1.35e-3 -- a 33% margin. Do not assume that
+# holds across shapes or driver versions; scripts/tune_linear_gelu.py prints
+# max_abs per shape.
+#
+# fp16 also has a PRECONDITION tf32 does not: operands must fit fp16's range.
+# This model's activations are post-LayerNorm and its weights are O(1/sqrt(d)),
+# so it holds by construction; "tf32" or "off" is the escape hatch if it ever
+# does not.
+LINEAR_GELU = "auto"
+
+# Math ids, matching kGemmMath* in csrc/fused_attention.cu.
+_GEMM_MATH_CODE = {"auto": -1, "tf32": 0}
+
 # CUDA graph capture. --cuda-graph overrides this for a single run.
 #
 #   "off"     never capture; every forward pass launches its ~79 kernels

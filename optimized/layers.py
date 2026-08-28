@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .kernels import _add_layernorm, _attention_dispatch
+from .kernels import _add_layernorm, _attention_dispatch, _linear_gelu
 from .util import _version_or_none
 
 
@@ -207,7 +207,7 @@ class MyTransformerBlock(nn.Module):
         attn_out = self.attention(normed, valid_token_mask, self.causal, mask_is_trivial)
         x, normed = _add_layernorm(x, attn_out, self.norm2)
 
-        ffn_out = self.ffn_out(F.gelu(self.ffn_in(normed), approximate="none"))
+        ffn_out = self.ffn_out(_linear_gelu(normed, self.ffn_in))
 
         if valid_token_mask is not None and not mask_is_trivial:
             # Padded rows are zeroed *between* the add and the norm, so this

@@ -49,6 +49,33 @@ def _add_layernorm(
     return total, norm(total)
 
 
+def _linear_gelu(x: torch.Tensor, lin: "MyLinear") -> torch.Tensor:
+    """GELU(lin(x)), fused into one kernel on the shapes where that is faster.
+
+    Unfused, the GELU pass reads the whole [M, ffn_dim] GEMM result back out of
+    global memory, applies one cheap function and writes it again. Folding it
+    into the accumulator makes it free -- a third of the pair's cost at this
+    model's shapes, where ffn_dim == d_model and the GEMM is small.
+
+    The extension decides which shapes it can serve: `linear_gelu` returns an
+    undefined tensor -- None here -- rather than raising, so the fallback below
+    covers anything it declines. With fp16 fragments it is faster than cuBLAS at
+    every shape measured, so nothing is declined on speed grounds any more; see
+    pick_gemm_tile() for the table.
+    """
+    if config.LINEAR_GELU != "off" and lin.bias is not None:
+        kernels = _custom_kernels()
+        if kernels is not None:
+            out = kernels.linear_gelu(
+                x, lin.weight, lin.bias, -1,
+                config._GEMM_MATH_CODE[config.LINEAR_GELU],
+            )
+            if out is not None:
+                return out
+
+    return F.gelu(lin(x), approximate="none")
+
+
 def _attention_dispatch(
     q: torch.Tensor,
     k: torch.Tensor,

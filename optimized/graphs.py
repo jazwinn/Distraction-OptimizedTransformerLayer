@@ -95,16 +95,17 @@ class _GraphRunner:
 def _graph_key(x: torch.Tensor, use_mask: bool) -> Tuple:
     """What makes two calls interchangeable to one captured graph.
 
-    ATTENTION_BACKEND/ATTENTION_IMPL are in the key because a capture freezes
-    whichever kernel they selected; without them, an in-process A/B script
-    flipping the global would silently do nothing on a captured model.
+    ATTENTION_BACKEND/ATTENTION_IMPL/LINEAR_GELU are in the key because a
+    capture freezes whichever kernel they selected; without them, an in-process
+    A/B script flipping the global would silently do nothing on a captured
+    model.
 
     Strides are deliberately absent: inputs are copied into a freshly allocated
     contiguous buffer and copy_ handles any source layout, so one graph is valid
     for every layout of x.
     """
     return (x.shape, x.dtype, x.device.index, use_mask,
-            config.ATTENTION_BACKEND, config.ATTENTION_IMPL)
+            config.ATTENTION_BACKEND, config.ATTENTION_IMPL, config.LINEAR_GELU)
 
 
 def _graph_pool_cap_bytes(device: torch.device) -> int:

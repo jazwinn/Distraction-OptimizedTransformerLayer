@@ -35,6 +35,15 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
              "the custom extension runs attention",
     )
     parser.add_argument(
+        "--linear-gelu",
+        choices=("auto", "tf32", "off"),
+        default=None,
+        help="override LINEAR_GELU for this run only: fuse the FFN's first "
+             "Linear with its GELU into one kernel. 'auto' uses fp16 "
+             "fragments, 'tf32' the same kernel at half the tensor-core rate "
+             "(for measurement), 'off' cuBLAS plus a separate GELU",
+    )
+    parser.add_argument(
         "--cuda-graph",
         choices=("off", "auto", "always"),
         default=None,
@@ -50,6 +59,8 @@ def apply_overrides(args: argparse.Namespace) -> None:
         config.ATTENTION_BACKEND = args.attn_backend
     if args.attn_impl is not None:
         config.ATTENTION_IMPL = args.attn_impl
+    if args.linear_gelu is not None:
+        config.LINEAR_GELU = args.linear_gelu
     if args.cuda_graph is not None:
         config.CUDA_GRAPH = args.cuda_graph
 

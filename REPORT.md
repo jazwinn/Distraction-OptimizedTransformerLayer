@@ -971,6 +971,133 @@ binary. On a quiet card the same row reads 1.42x, three times over. The control 
 decoration, but it is not sufficient either — see also [Absolute speedups are unusually
 sensitive to host contention](#absolute-speedups-are-unusually-sensitive-to-host-contention).
 
+## Fused Linear + GELU, in fp16
+
+The FFN's first layer is `GELU(x @ W1^T + b1)`. Run as two ops, the GELU pass
+reads the whole `[batch*seq, ffn_dim]` GEMM result back out of global memory,
+applies one cheap function, and writes it again. Folded into the GEMM's
+accumulator it is free -- and at the grading appendix's shapes, where
+`ffn_dim == d_model`, that pass is a third of the pair.
+
+The kernel to do it -- `gemm_bias_gelu_kernel`, a 4x2 warp grid over a block
+tile, register-prefetched staging -- had been sitting in the tree as **dead
+code** on the verdict "loses to cuBLAS at every shape the model uses, 0.88x".
+Two changes turned that around, and the second was worth more than the first.
+
+### Why it was written off, and why that was wrong
+
+**A kernel rejected on a benchmark is rejected on that benchmark's shape.** The
+0.88x was measured at the harness default, where `ffn_dim = 4*d_model`. Every
+appendix shape has `ffn_dim == d_model`.
+
+**A DRAM-traffic model is void when the operands fit in L2.** The 128x128 tile
+was *chosen*, not tuned: a BMxBN tile does `BM*BN*K` MACs per `(BM+BN)*K` floats
+loaded, so 64x64 sustains 32 MAC/float, capping the kernel at ~7 TFLOPS against
+448 GB/s. Correct arithmetic that assumes the loads reach DRAM. At `d_model` 256
+the weight is 256 KB and never leaves the 3070's 4 MB L2. What binds instead is
+the grid: at `M=128, N=256` a 128x128 tile is **2 blocks on a 46-SM card**, and
+it measured 0.198x of cuBLAS there.
+
+**An op benchmark at small M measures PyTorch dispatch, not the kernel.** Eager,
+`F.linear` at `M=128, K=N=256` reads 32.3 us -- and at `M=1024`, eight times the
+work, 30.4 us. Both are ~27 us of dispatch, which the model has already removed
+by capturing a CUDA graph. Everything below is graph-timed.
+
+Re-tiled to 64x64, tf32 went from losing everywhere to winning at 6 of 13
+shapes, and needed a gate to keep it off the other 7.
+
+### fp16: the same accuracy, twice the tensor cores
+
+TF32 and FP16 both carry a **10-bit mantissa**, so with an fp32 accumulator they
+are equally accurate. Not approximately -- measurably. Rounding operands to each
+and scoring against an fp64 reference:
+
+| | attention op | FFN GEMM | whole 6-layer model |
+|:--|--:|--:|:--|
+| tf32 | 1.63e-03 | 1.22e-03 | 9.82e-04 -- 49% of the 2e-3 budget |
+| fp16 | 1.63e-03 | 1.22e-03 | 9.82e-04 -- 49% of the 2e-3 budget |
+| bf16 | 1.18e-02 | 1.02e-02 | 9.70e-03 -- 485%, **12339 elements fail** |
+
+What differs is throughput. On this card fp16 tensor cores measure **1.98x-2.25x**
+tf32 (39.7 vs 17.7 TFLOPS at N=2048). An fp16 fragment also contracts 16 elements
+of K against tf32's 8, halving the mma instruction count, and the narrowing moves
+from per-fragment-load to once on the way into shared memory.
+
+bf16 was already believed dead, but on a measurement taken against the *old*
+1e-3 gate. The loosened 2e-3 / 2% tolerance was a reason to re-ask; the answer
+did not change.
+
+### The result: no gate left
+
+Graph-timed against cuBLAS + `F.gelu`, best tile per precision, control ±1.0-2.9%:
+
+| M | K | N | tiles64 | tf32 | fp16 | best tile |
+|---:|---:|---:|---:|--:|--:|:--|
+| 32 | 256 | 256 | 4 | 0.99x | **1.634x** | 64x32 |
+| 128 | 64 | 64 | 2 | 1.36x | **1.665x** | 64x32 |
+| 128 | 256 | 256 | 8 | 0.91x | **1.327x** | 64x32 |
+| 512 | 256 | 256 | 32 | 0.71x | **1.240x** | 64x32 |
+| 1024 | 32 | 32 | 16 | 2.10x | **2.402x** | 64x32 |
+| 1024 | 256 | 256 | 64 | 0.86x | **1.425x** | 64x32 |
+| 2048 | 256 | 256 | 128 | 1.66x | **3.188x** | 64x64 |
+| 8192 | 256 | 256 | 512 | 1.34x | **2.534x** | 64x64 |
+| 16384 | 256 | 256 | 1024 | 1.18x | **2.139x** | 64x64 |
+| 320000 | 256 | 256 | 20000 | 1.03x | **1.919x** | 64x64 |
+| 1024 | 512 | 512 | 128 | 1.19x | **2.448x** | 64x64 |
+| 1024 | 1024 | 1024 | 256 | 0.86x | **1.846x** | 64x64 |
+| 512 | 2048 | 2048 | 256 | 0.78x | **1.638x** | 64x64 |
+| 1024 | 512 | 2048 | 512 | 0.82x | **1.707x** | 64x64 |
+| 2048 | 4096 | 4096 | 2048 | 0.62x | **1.371x** | 128x128 |
+
+Grids from 2 tiles to 20000, K and N from 32 to 4096, and **fp16 wins every
+row** by 1.24x to 2.40x. So the shape gate tf32 needed is gone entirely; what
+remains is the coverage check and one precondition.
+
+`pick_gemm_tile()` keeps two thresholds, which are different constraints. Below
+two full waves of blocks, 64x32 doubles the grid and wins. Past L2 -- K=N=4096,
+a 64 MB weight -- the traffic argument finally does bite and 128x128 wins, one
+measured point beyond any shape this model issues.
+
+**The precondition fp16 has and tf32 does not:** operands must fit fp16's range.
+Post-LayerNorm activations and `O(1/sqrt(d))` weights satisfy it by construction
+here; `--linear-gelu tf32` and `off` are the escape hatches.
+
+### End to end, with the two changes scored separately
+
+`scripts/ab_linear_gelu.py` times all three settings in one process, interleaved,
+with `off` at both ends of every round as the control. Geometric means over
+eleven appendix shapes:
+
+- fusion alone (`off` → `tf32`): **1.008x**
+- fp16 alone (`tf32` → `fp16`): **1.058x**
+- together (`off` → `fp16`): **1.066x**
+
+Best shapes: 1.115x at `d_model` 32, 1.101x at S=1024, 1.091x at B16, 1.090x at
+B128. Nothing regresses beyond its control.
+
+That first line deserves reading carefully. **The fusion on its own is worth
+nothing now** — because `tf32` here is ungated, so it runs at the seven shapes
+where tf32 loses. The gated tf32 configuration that shipped first measured
+1.032x over these same eleven shapes. fp16 roughly doubles the payoff *and*
+removes the gate that tf32 needed to reach even that.
+
+One row disagrees with the op sweep: `B64 S128 d256` reads fp16 at 0.987x of
+tf32 where the op says 1.892x, against a 1.5% control. It is the shape whose
+activation volume declines CUDA-graph capture, so it is timed eagerly, but that
+is a hypothesis rather than an explanation. Total against `off` is still 1.064x.
+
+### Accuracy
+
+Every shape PASSes the harness. fp16 costs about 1e-4 of extra end-to-end error;
+the tightest grading shape sits at 1.35e-3 against the 2e-3 gate, a **~33%
+margin**. `verify_kernel.py`, `verify_graph.py`, default, `--causal` and
+`--padding-ratio 0.3` all still PASS.
+
+What was given up to get it: with tf32 the kernel was **bit-identical** to
+`F.linear + F.gelu` wherever cuBLAS picked a tf32 kernel with the same k-order.
+fp16 is not, and cannot be. `--linear-gelu tf32` buys that property back at half
+the tensor-core rate.
+
 ## What's left
 
 Everything above is attention. This section is the other direction: given a kernel that is
@@ -1051,7 +1178,7 @@ bit-exact. Absorbed by reading strides, which cost nothing because head_dim was 
 stride-1 — the copy had only ever been paying for a row pitch. See [Reading q/k/v in
 place](#reading-qkv-in-place).
 
-**1. Fused Linear+GELU — ~5% available, and the cheap route collects 2% of it at a price.**
+**1. Fused Linear+GELU — ~5% available. Collected, by hand-writing the GEMM.**
 
 PyTorch exposes cuBLASLt's bias+GELU epilogue as `torch._addmm_activation`. Measured at the
 default FFN shape:
@@ -1062,14 +1189,20 @@ torch._addmm_activation fused   184.6 us    <- 2%; cuBLASLt picks a slower GEMM 
 F.linear alone                  138.9 us    <- so GELU itself is only ~50 us
 ```
 
-It is also the **tanh** approximation, not erf: 3.87e-4 against an erf reference, matching
-tanh to three digits. Against end-to-end `max_abs` that already peaks at 8.7e-4 on a 1e-3
-gate, that is most of the remaining margin for 2%. Collecting the full 5% means hand-writing
-a TF32 tensor-core GEMM with a GELU epilogue that beats cuBLAS.
+It is also the **tanh** approximation, not erf: 3.87e-4 against an erf reference. Against an
+end-to-end `max_abs` that already peaks at 8.7e-4, that is most of the remaining margin for
+2%. So the cheap route was rejected, and the expensive one — a TF32 tensor-core GEMM with a
+GELU epilogue that beats cuBLAS — was taken instead, and then moved from tf32 to fp16
+fragments for a further 2x on the tensor cores at identical accuracy. Together they are
+worth **1.066x end to end** (geometric mean, up to 1.115x) on the grading appendix's
+shapes. See [Fused Linear + GELU, in fp16](#fused-linear--gelu-in-fp16).
 
 **2. INT8 / W8A8 — available on this hardware, dead on accuracy.** SM 8.6 has INT8 tensor
-cores. But the gate is `abs <= 1e-3` against an fp32 reference, and bf16 — far finer than
-INT8 — already fails it for 29% of elements.
+cores. But bf16 — far finer than INT8 — fails the gate on its own, and that has now been
+re-measured against the *current* 2e-3 / 2% tolerance rather than the old 1e-3 one: 485% of
+the budget at B16 S128 d256, with 12339 of 524288 elements failing. The reduced precision
+that does pay is fp16, which is not a step down from tf32 at all — same 10-bit mantissa,
+twice the tensor-core rate. See [Fused Linear + GELU, in fp16](#fused-linear--gelu-in-fp16).
 
 **3. RMSNorm — disqualified above, and it would not pay.** The argument for it is one fewer
 pass over memory; `fused_add_layernorm` already removed that pass. The mean subtraction is
@@ -1082,13 +1215,16 @@ arithmetic on data that is already in registers, competing for a fraction of 6.5
 ### What that adds up to
 
 Both collectable items are collected. Graphs took default from 1.263x to 1.353x and `small`
-from 2.49x to 11.23x; the q/k/v copies were worth a further ~6% on top of that. What remains
-at the default configuration is GELU at ~5%, and only if it is hand-written — the cheap route
-costs most of the accuracy margin for 2%, as below.
+from 2.49x to 11.23x; the q/k/v copies were worth a further ~6% on top of that. GELU at ~5%
+was the one item left, and hand-writing the GEMM did collect it — but only where the shape
+suits a 64x64 tile, which is most of the grading appendix and none of the default's 4x FFN.
 
 So **the remaining opportunity is cuBLAS**, which is two thirds of the forward pass at
-default and four fifths at `wide`, and beating cuBLAS is not a weekend. Everything cheaper
-than that has been taken.
+default and four fifths at `wide`. The GELU fusion is a first bite at exactly that, and the
+shape of the result is instructive: this kernel beats cuBLAS by up to 1.67x on the small
+GEMMs where cuBLAS is far from its own roofline, and loses by 0.78x-0.84x as soon as the
+operands stop fitting in L2 and cuBLAS switches to a tile this one cannot match. Beating
+cuBLAS *in general* is still not a weekend.
 
 The three wins landed in different places, which is the useful shape of the result rather
 than an accident: the attention kernel pays on long sequences, graphs pay when the GPU is
@@ -1121,6 +1257,14 @@ python torch_transformer_benchmark.py --seq-len 2048 --batch-size 1 --causal
 
 `--batch-size --seq-len --d-model --heads --ffn-dim --layers --causal --dtype
 --padding-ratio --input-scale --atol --rtol`
+
+`--linear-gelu {auto,tf32,off}` controls whether the FFN's first Linear and its GELU run as
+one kernel, `auto` by default. `auto` uses fp16 fragments, which beat cuBLAS at every shape
+measured; `tf32` runs the same kernel at half the tensor-core rate and is bit-identical to
+`F.linear + F.gelu` where cuBLAS picks a matching tf32 kernel; `off` is cuBLAS plus a
+separate GELU. The alternatives exist because this is the one optimization that can move the
+accuracy number, though the margin at the tightest grading shape is ~33%. See
+[Fused Linear + GELU, in fp16](#fused-linear--gelu-in-fp16).
 
 `--cuda-graph {off,auto,always}` controls CUDA graph capture, `auto` by default. `always`
 ignores the size gate and exists so `scripts/ab_graph.py` can measure the shapes `auto`
