@@ -532,6 +532,206 @@ mma-per-fragment-load ratio from 1.33 to 2.0 (needs 128 accumulator registers,
 so it may spill); and swizzled block scheduling for L2 reuse. That is a
 GEMM-tuning project, not a step in this one.
 
+## fused_add_layernorm: warp per row, several rows per block
+
+### What was measured first, and what it got wrong
+
+`scripts/bench_layernorm_occupancy.py`, occupancy straight from the driver:
+
+| D | threads | warps/blk | blocks/SM | warps/SM | of max | limiter | vs roofline |
+|---|---|---|---|---|---|---|---|
+| **32** | 32 | 1 | **16** | 16 | **33%** | blocks/SM cap | **1.48x off** |
+| 64 | 64 | 2 | 16 | 32 | 67% | blocks/SM cap | 0.98x |
+| 128 | 128 | 4 | 12 | 48 | 100% | warps | 0.97x |
+| 256+ | 256 | 8 | 6 | 48 | 100% | warps | 0.99-1.00x |
+
+Read literally this says: D=32 is starved because one row needs one warp and
+sm_86 caps resident blocks at 16 however small they are; D=64 already reaches
+67% and that is enough to saturate; so this is a D=32 problem and the fix is
+more rows per block. **Every one of those statements is true and the conclusion
+from them was wrong.**
+
+The rows-per-block sweep is what exposed it. At D=32, 524288 rows:
+
+| rows/block | warps/SM | us |
+|---|---|---|
+| 1 | 16 | 702 |
+| 2 | 32 | 679 |
+| 4 | 48 | 719 |
+| 8 | 48 | 689 |
+| 16 | 48 | 694 |
+
+One row per block has **identical occupancy to the block-per-row kernel** -- 16
+warps of 48 -- and already gets 702 us against its 1016. And the rest of the
+sweep is flat inside a +/-9% control. If occupancy were the constraint neither
+could be true.
+
+What the warp kernel actually removes is the shared-memory round trip, the
+cross-warp reduction stage, and all six `__syncthreads()`. That is a **latency**
+win, not a bandwidth one, so it pays wherever the kernel is latency-bound --
+which is any moderate row count at any width, not just narrow rows.
+
+### Results
+
+Graph replay with 20 calls captured per graph (see the trap below):
+
+| shape | block | warp | ratio |
+|---|---|---|---|
+| 1024 x 32 | 3.58 us | **1.66** | **2.16x** |
+| 1024 x 64 | 4.17 us | **1.86** | **2.24x** |
+| 1024 x 256 | 8.60 us | **3.99** | **2.15x** |
+| 4096 x 32 | 9.53 us | **3.24** | **2.94x** |
+| 16384 x 32 | 33.13 us | **22.51** | 1.47x |
+| 8192 x 256 | 88.11 us | 86.95 | 1.01x |
+| 1024 x 512 | 23.01 us | 22.98 | 1.00x |
+
+The two ties are the shapes big enough to saturate DRAM -- nothing left to win,
+nothing lost either. **D=64 and D=256 are 2.2x wins and the occupancy reading
+said both were fine**, which is why the width threshold is 256 and not the 32
+the first pass set.
+
+Bandwidth regime (17M elements at every D), where only D=32 moves:
+
+| D | block | warp | ratio | block GB/s | warp GB/s |
+|---|---|---|---|---|---|
+| 32 | 1015.7 us | **672.4** | **1.51x** | 264 | **399** |
+| 64 | 680.0 | 678.2 | 1.003x | 395 | 396 |
+| 128+ | - | - | 0.998-1.001x | ~397 | ~397 |
+
+D=32 lands exactly on the measured 395 GB/s roofline.
+
+### End to end
+
+Alternating runs, three per variant, `--layers 6 --causal`:
+
+| shape | block | warp | ratio | speedup vs baseline |
+|---|---|---|---|---|
+| hd8 B8 S128 d32 | 0.2683 ms | **0.2427** | **1.105x** | 20.11x -> 22.17x |
+| hd16 B8 S128 d256 | 0.7861 | **0.7461** | **1.054x** | 6.72x -> 7.13x |
+| hd32 B8 S32 d256 | 0.3267 | **0.3174** | 1.029x | 17.13x -> 17.54x |
+| hd32 B16 S128 d256 | 1.7842 | **1.7371** | 1.027x | 2.88x -> 2.94x |
+| hd32 B1 S128 d256 | 0.3079 | **0.3031** | 1.016x | 18.88x -> 19.12x |
+| hd32 B64 S128 d256 | 5.1331 | 5.1084 | 1.005x | bandwidth-bound |
+| hd64 B8 S128 d512 | 2.1917 | 2.1924 | 1.000x | control (block kernel) |
+| hd128 B8 S128 d1024 | 6.0228 | 6.0238 | 1.000x | control |
+
+Cumulative on the hd8 shape, all three variants in one thermal state:
+
+| | ms | speedup |
+|---|---|---|
+| original, flat 256 threads | 0.3164 | 17.08x |
+| width-scaled block size | 0.2683 | 20.15x |
+| **warp per row** | **0.2430** | **22.37x** |
+
+### The threshold
+
+`layernorm_warp_width()` defaults to 256, which is the widest
+`ELEMS_PER_LANE` the launcher instantiates (8 * 32). It stops there because
+1024 x 512 measures 23.0 us against a 21.2 us traffic floor -- already
+bandwidth-bound, so a wider instantiation would buy nothing.
+
+`layernorm_warp_rows()` is 4, and the sweep above says it barely matters; 4 is
+the middle of a flat region.
+
+Knobs: `layernorm_set_warp_width(n)` (0 disables, -1 restores the default) and
+`layernorm_set_warp_rows(n)`, plus `LAYERNORM_WARP_WIDTH` / `LAYERNORM_WARP_ROWS`.
+
+### Two measurement traps, both of which produced a wrong number first
+
+**Capturing one call per CUDA graph measures the replay, not the kernel.**
+Replaying a graph costs several microseconds whatever it holds. A first pass
+captured a single call and reported 8.02 vs 8.95 us at 1024x32 -- a 0.90x
+*regression* on the shape this was built for. The tell was 256x32, a quarter of
+the work, coming out at 7.99 vs 8.84: two shapes differing 4x in work and
+0.03 us in time are not being measured. Capturing 20 calls per graph turned the
+same comparison into 3.58 vs 1.66 us, 2.16x.
+
+**The first run in a fresh process is not comparable to the rest.** An
+end-to-end sweep reported 1.321x on hd8; re-run in a settled state it was
+1.105x, and a separate three-way sweep of the same shape agreed at 1.104x. Every
+*other* shape in that sweep matched to within 0.002x across both runs -- only the
+first one was wrong. Run a throwaway shape first, or discard run one.
+
+## fused_add_layernorm: the block size has to scale with d_model
+
+`threads` was a flat 256 in the launcher. That is right from d_model 256 up --
+every thread owns at least one element and the loops stride for the rest -- and
+it collapses below it. At d_model 32 only 32 of the 256 threads load anything,
+while all eight warps still run three `block_reduce_sum` calls, six
+`__syncthreads()` and a shared-memory round trip over what is mostly zeros.
+
+Fixed by `layernorm_block_threads()`: one thread per element, rounded up to a
+whole warp, capped at 256.
+
+### Bandwidth regime -- ~16M elements at every width, so nothing is dispatch-bound
+
+Floor is analytic: 4N floats (read x, read sub, write x_new, write normed) at
+the card's **measured** 384 GB/s copy bandwidth, which is 698.68 us at this
+element count for every row. It is not a `torch.add` row -- `torch.add` is
+itself dispatch-bound at these sizes and reported a "floor" *above* the kernel
+it was meant to bound, which is what made the first pass of this sweep useless.
+
+| rows x D | old (t256) | new | speedup | new vs roofline |
+|---|---|---|---|---|
+| 524288 x 32   | 3197.74 | **1075.44** | **2.97x** | 1.54x off |
+| 262144 x 64   | 1647.27 | **711.30**  | **2.32x** | 1.02x |
+| 131072 x 128  | 941.70  | **674.68**  | **1.40x** | 0.97x |
+| 65536 x 256   | 719.50  | 704.92 | 1.00x (same launch) | 1.01x |
+| 32768 x 512   | 708.88  | 716.70 | 1.00x | 1.03x |
+| 16384 x 1024  | 692.45  | 706.32 | 1.00x | 1.01x |
+| 8192 x 2048   | 710.72  | 711.24 | 1.00x | 1.02x |
+
+So D <= 128 went from 1.3x-4.6x off the roofline to on it, and D >= 256 is
+untouched by construction -- the rule returns 256 there, so it is the identical
+launch, not a re-tuned one.
+
+### End to end, the shape this targets
+
+`--batch-size 8 --seq-len 128 --d-model 32 --heads 4 --ffn-dim 32 --layers 6
+--causal` (head_dim 8, 2 of the 14 appendix shapes), where add+LayerNorm was
+37.6% of the forward:
+
+| | median | speedup vs baseline |
+|---|---|---|
+| flat 256 | 0.3174 ms | 17.130x |
+| width-scaled | **0.2693 ms** | **20.298x** |
+
+**1.179x on the whole forward.** Accuracy is not merely close but identical --
+`max_abs=0.0011037`, same digits both ways, because at D=32 the extra 224
+threads were only ever summing zeros into the reduction tree.
+
+Control on a shape the rule leaves at 256 (`b64 s128 d256 ffn256 causal`):
+3.078x vs 3.068x, i.e. a tie inside noise, as it must be.
+
+### Why the cap and the floor are where they are
+
+**Capped at 256, not raised to D.** At D >= 512 more threads is not better --
+t512 and t1024 are inside noise of t256 at every width, and t1024 is 4x worse at
+D=32. Striding is already what the loops do.
+
+**Floored at one warp, not at D.** A partial warp occupies the same issue slots
+as a full one, and `block_reduce_sum`'s `__shfl_down_sync` assumes all 32 lanes
+are present -- a 24-thread block would fold in undefined values from the
+missing lanes.
+
+### What is left at D=32
+
+Still **1.54x off roofline**, the only width that is not on it. One warp per
+block means one *block* per row, and SM 8.6 caps residency at 16 blocks/SM, so
+the kernel gets 16 warps of the 48 an SM can hold -- 33% occupancy, not enough
+memory-level parallelism to saturate. Fixing that means several rows per block
+(warp-per-row, 8 warps, 8 rows), which also drops the shared-memory staging and
+every `__syncthreads()` for narrow rows. That is a kernel rewrite, not a launch
+parameter, and it is worth at most the remaining 1.54x on 37.6% of one shape.
+
+### The knob
+
+`layernorm_set_block_threads(n)` forces the block size, `0` restores the rule;
+`LAYERNORM_BLOCK_THREADS` supplies the initial value. Same contract as
+`tile_set_split_kv` and `wmma_set_causal_reverse` -- it exists so candidates are
+timed interleaved in one process, per the first rule at the top of this file,
+and the A/B above was run through it rather than through two builds.
+
 ## CUDA graph capture gate
 
 See REPORT.md — "The gate is on activation volume, and it is a measured

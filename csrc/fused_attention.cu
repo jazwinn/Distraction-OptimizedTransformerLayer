@@ -1363,6 +1363,257 @@ __global__ void fused_add_layernorm_kernel(const scalar_t* __restrict__ x,
     }
 }
 
+// Warp-per-row add + LayerNorm, several rows to a block.
+//
+// The block-per-row kernel below cannot fill this card at narrow D. One row
+// needs one warp there, and an SM caps *resident blocks* at 16 on sm_86 however
+// small they are -- so D=32 gets 16 blocks x 1 warp = 16 of the 48 warps an SM
+// can hold, 33% occupancy, and measured 260 GB/s against 386. (D=64 gets 2
+// warps per block, 67%, and that is already enough to saturate: measured 394
+// GB/s. So this is a D=32 problem specifically, not a narrow-D problem.)
+//
+// Putting ROWS rows in one block multiplies the warps per block by ROWS without
+// touching the block count, which is the only lever the cap leaves. Three things
+// fall out for free once a row belongs to exactly one warp:
+//
+//   * the reduction is a warp butterfly, so the shared scratch and the
+//     cross-warp stage both disappear
+//   * every __syncthreads() disappears with them -- a warp is already in
+//     lockstep, so __shfl_xor_sync is its own barrier
+//   * the row stages in registers instead of shared memory, so shared memory
+//     stops bounding occupancy at all
+//
+// ELEMS_PER_LANE is ceil(D/32) rounded up to a power of two, so the row lives in
+// a compile-time-sized register array. Lanes past D contribute zero and store
+// nothing.
+//
+// The statistics are the same corrected two-pass form as the block kernel, and
+// deliberately so: a plain sum-then-mean drifts to 1.5e-3 at mean 1e4, past atol
+// on its own. The sum is likewise rounded through scalar_t before being kept,
+// because the reference adds in the tensor dtype and normalises *that*.
+template <typename scalar_t, int ELEMS_PER_LANE>
+__global__ void warp_add_layernorm_kernel(const scalar_t* __restrict__ x,
+                                          const scalar_t* __restrict__ sub,
+                                          const scalar_t* __restrict__ w,
+                                          const scalar_t* __restrict__ beta,
+                                          scalar_t* __restrict__ x_new,
+                                          scalar_t* __restrict__ normed,
+                                          int D, int rows, float eps) {
+    const int row = static_cast<int>(blockIdx.x) * blockDim.y + threadIdx.y;
+    // Uniform across the warp -- the row is chosen by threadIdx.y alone -- so a
+    // warp either runs in full or exits in full, and the full-mask shuffles
+    // below never read a lane that has left.
+    if (row >= rows) {
+        return;
+    }
+    const int lane = static_cast<int>(threadIdx.x);
+    const int64_t base = static_cast<int64_t>(row) * D;
+
+    float v[ELEMS_PER_LANE];
+    float local_sum = 0.0f;
+    #pragma unroll
+    for (int t = 0; t < ELEMS_PER_LANE; ++t) {
+        const int d = lane + t * 32;
+        if (d < D) {
+            const scalar_t s = static_cast<scalar_t>(
+                static_cast<float>(x[base + d]) + static_cast<float>(sub[base + d]));
+            v[t] = static_cast<float>(s);
+            x_new[base + d] = s;
+            local_sum += v[t];
+        } else {
+            v[t] = 0.0f;
+        }
+    }
+
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        local_sum += __shfl_xor_sync(0xffffffffu, local_sum, off);
+    }
+    const float mean_est = local_sum / static_cast<float>(D);
+
+    float local_c = 0.0f;
+    float local_cc = 0.0f;
+    #pragma unroll
+    for (int t = 0; t < ELEMS_PER_LANE; ++t) {
+        if (lane + t * 32 < D) {
+            const float c = v[t] - mean_est;
+            local_c += c;
+            local_cc += c * c;
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        local_c  += __shfl_xor_sync(0xffffffffu, local_c, off);
+        local_cc += __shfl_xor_sync(0xffffffffu, local_cc, off);
+    }
+
+    const float delta = local_c / static_cast<float>(D);
+    const float mean_sq = local_cc / static_cast<float>(D);
+    const float mean = mean_est + delta;
+    const float var = fmaxf(mean_sq - delta * delta, 0.0f);
+    const float rstd = rsqrtf(var + eps);
+
+    #pragma unroll
+    for (int t = 0; t < ELEMS_PER_LANE; ++t) {
+        const int d = lane + t * 32;
+        if (d < D) {
+            const float nv = (v[t] - mean) * rstd;
+            normed[base + d] = static_cast<scalar_t>(
+                nv * static_cast<float>(w[d]) + static_cast<float>(beta[d]));
+        }
+    }
+}
+
+// Runtime override for the block size the rule below picks, so candidates can
+// be swept inside one process rather than one rebuild each; see
+// layernorm_set_block_threads in the module. 0 means "use the rule". The
+// environment variable supplies only the initial value. Deliberately
+// unsynchronised, on the same contract as causal_reverse_flag: a benchmarking
+// knob flipped between timed runs from one thread, never while launches are in
+// flight.
+int& layernorm_threads_override() {
+    static int forced = [] {
+        const char* e = std::getenv("LAYERNORM_BLOCK_THREADS");
+        return e != nullptr ? std::atoi(e) : 0;
+    }();
+    return forced;
+}
+
+// Threads per block for the block-per-row kernel, as a function of the row
+// width.
+//
+// NOTE ON REACH: since the warp-per-row kernel took over D <= 256, the only
+// widths that arrive here are wider than 256 -- where this returns a flat 256
+// anyway -- plus anything routed back by layernorm_set_warp_width(0). So the
+// scaling below is now exercised by the A/B path and by nothing else in a
+// default run. It is kept rather than collapsed to `return 256` precisely
+// because that A/B has to stay honest: the fallback the warp kernel is measured
+// against must be the best block-per-row kernel, not a straw man.
+//
+// This was a flat 256, which is right from d_model 256 up -- every thread owns
+// at least one element and the loops stride for the rest -- and wrong below it.
+// At d_model 32 only 32 of the 256 threads load anything, while all eight warps
+// still run three block_reduce_sum calls, six __syncthreads and a shared-memory
+// round trip over what is mostly zeros. Measured at 8192 rows: D=256 sits on
+// the bandwidth roofline (87.9 us against an 86.0 us floor) and D=32 is 5.0x
+// off it (54.0 us against 10.75 us). head_dim 8 / d_model 32 is 2 of the 14
+// grading shapes, and add+LayerNorm is 37.6% of that forward.
+//
+// So: one thread per element, rounded up to a whole warp, capped at 256. The
+// floor is a full warp rather than D itself because a partial warp occupies the
+// same issue slots as a full one, and block_reduce_sum's __shfl_down_sync
+// assumes all 32 lanes of a warp are present -- a 24-thread block would read
+// undefined values from the missing lanes.
+int layernorm_block_threads(int64_t D) {
+    const int forced = layernorm_threads_override();
+    if (forced > 0) {
+        // Clamped, not trusted: the knob is reachable from Python. A block over
+        // 1024 fails to launch, and the reduction needs whole warps.
+        const int clamped = forced > 1024 ? 1024 : forced;
+        return clamped < 32 ? 32 : (clamped & ~31);
+    }
+    if (D >= 256) {
+        return 256;
+    }
+    int threads = 32;
+    while (threads < D) {
+        threads <<= 1;
+    }
+    return threads;
+}
+
+// Widest row the warp-per-row kernel is used for, and how many rows share a
+// block. Both are runtime-settable for the same reason every other knob in this
+// file is -- candidates have to be timed interleaved in one process -- and both
+// have a measured default; see layernorm_warp_width() and csrc/TUNING.md.
+//
+// -1 means "use the measured default", 0 disables the warp kernel outright.
+int& layernorm_warp_width_override() {
+    static int forced = [] {
+        const char* e = std::getenv("LAYERNORM_WARP_WIDTH");
+        return e != nullptr ? std::atoi(e) : -1;
+    }();
+    return forced;
+}
+
+int& layernorm_warp_rows_override() {
+    static int forced = [] {
+        const char* e = std::getenv("LAYERNORM_WARP_ROWS");
+        return e != nullptr ? std::atoi(e) : 0;
+    }();
+    return forced;
+}
+
+// Whether this row width goes to the warp-per-row kernel.
+//
+// 256 is the widest the launcher instantiates, and the measurements say to use
+// all of it. The first guess here was 32, reasoning from occupancy: D=32 is the
+// only width the occupancy API calls starved (16 warps of 48, against 32 warps
+// at D=64), and it was the only width measurably off the bandwidth roofline.
+// Both facts are true and both are the wrong lever.
+//
+// What the warp kernel actually removes is the shared-memory round trip and
+// every barrier, and that is a *latency* win, not a bandwidth one -- so it pays
+// wherever the kernel is latency-bound, which is any moderate row count at any
+// width, not just narrow rows. Measured under graph replay:
+//
+//     1024 x 32   3.58 -> 1.66 us   2.16x
+//     1024 x 64   4.17 -> 1.86 us   2.24x     <- occupancy said this was fine
+//     1024 x 256  8.60 -> 3.99 us   2.15x     <- and this
+//     4096 x 32   9.53 -> 3.24 us   2.94x
+//     8192 x 256 88.11 -> 86.95 us  1.01x     <- bandwidth-bound, a tie
+//
+// The two ties are the shapes big enough to saturate DRAM, where there is
+// nothing left to win and nothing lost either. That is also why the threshold
+// stops at 256 rather than being extended: 1024 x 512 measures 23.0 us against
+// a 21.2 us traffic floor, so it is already bandwidth-bound and a wider
+// ELEMS_PER_LANE would buy nothing.
+//
+// Two clues that the occupancy reading was wrong, both visible in
+// scripts/ab_layernorm_warp.py's own output: one row per block -- identical
+// occupancy to the block kernel -- already gets 702 us against the block
+// kernel's 1016 at D=32, and the rows-per-block sweep is flat within noise. If
+// occupancy were the constraint neither would be true.
+int layernorm_warp_width() {
+    const int forced = layernorm_warp_width_override();
+    // 256 is a hard ceiling, not a preference: the widest ELEMS_PER_LANE the
+    // launcher instantiates is 8, which covers 8*32 == 256. A larger override
+    // would otherwise silently drop the tail of every row.
+    const int width = forced >= 0 ? forced : 256;
+    return width > 256 ? 256 : width;
+}
+
+// Rows per block. Swept over 1/2/4/8/16 at three row counts in
+// scripts/ab_layernorm_warp.py and the whole sweep is flat inside noise -- at
+// 524288 rows the spread across all five is 679-719 us against a control of
+// +/-9%. So this number does not matter much; 4 is kept because it is the
+// middle of the flat region and keeps the grid small at large row counts.
+int layernorm_warp_rows() {
+    const int forced = layernorm_warp_rows_override();
+    if (forced > 0) {
+        return forced > 32 ? 32 : forced;
+    }
+    return 4;
+}
+
+// Blocks of fused_add_layernorm_kernel an SM can hold at this row width, from
+// the occupancy API. Exported for measurement: the kernel is one block per row,
+// so at narrow D the binding limit is suspected to be the hardware's blocks-per-SM
+// cap rather than shared memory or registers -- and "suspected" is not good
+// enough to justify a rewrite. This says which it is.
+int layernorm_blocks_per_sm(int64_t D) {
+    const int threads = layernorm_block_threads(D);
+    const int nwarps = (threads + 31) / 32;
+    const size_t smem = sizeof(float) * static_cast<size_t>(D + nwarps);
+    int per_sm = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &per_sm, fused_add_layernorm_kernel<float>, threads, smem)
+        != cudaSuccess) {
+        return 0;
+    }
+    return per_sm;
+}
+
 
 // ---------------------------------------------------------------------------
 // GEMM with a fused bias + GELU epilogue:   C = GELU(A @ W^T + bias)
@@ -1737,9 +1988,9 @@ std::vector<torch::Tensor> fused_add_layernorm(torch::Tensor x,
     auto normed = torch::empty_like(xc);
 
     const int64_t rows = xc.numel() / D;
-    // 256 threads keeps the block reduction short while still coalescing the
-    // loads; each thread strides by blockDim, so any D spreads over it.
-    const int threads = 256;
+    // Scaled to the row width rather than fixed, so narrow rows do not run
+    // eight warps over one element each. See layernorm_block_threads.
+    const int threads = layernorm_block_threads(D);
     const int nwarps = (threads + 31) / 32;
     const size_t smem = sizeof(float) * static_cast<size_t>(D + nwarps);
 
@@ -1750,16 +2001,46 @@ std::vector<torch::Tensor> fused_add_layernorm(torch::Tensor x,
                 "fused_add_layernorm: last dimension ", D,
                 " needs ", smem, " bytes of shared memory, over the 48 KB budget");
 
+    // Narrow rows go to the warp-per-row kernel, which packs several rows into
+    // one block. See warp_add_layernorm_kernel for why the block-per-row form
+    // cannot fill the card there.
+    const bool use_warp = (D <= layernorm_warp_width());
+    const int warp_rows = layernorm_warp_rows();
+
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
         xc.scalar_type(), "fused_add_layernorm", [&] {
-            fused_add_layernorm_kernel<scalar_t>
-                <<<static_cast<int>(rows), threads, smem,
-                   at::cuda::getCurrentCUDAStream()>>>(
-                    xc.const_data_ptr<scalar_t>(), sc.const_data_ptr<scalar_t>(),
-                    wc.const_data_ptr<scalar_t>(), bc.const_data_ptr<scalar_t>(),
-                    x_new.data_ptr<scalar_t>(), normed.data_ptr<scalar_t>(),
-                    static_cast<int>(D), static_cast<float>(eps));
+            auto stream = at::cuda::getCurrentCUDAStream();
+            if (use_warp) {
+                const dim3 block(32, warp_rows);
+                const dim3 grid(static_cast<unsigned>(
+                    (rows + warp_rows - 1) / warp_rows));
+                // ELEMS_PER_LANE is a template parameter so the row lives in a
+                // register array; the launcher picks the smallest that covers D.
+                auto launch = [&](auto elems) {
+                    warp_add_layernorm_kernel<scalar_t, decltype(elems)::value>
+                        <<<grid, block, 0, stream>>>(
+                            xc.const_data_ptr<scalar_t>(),
+                            sc.const_data_ptr<scalar_t>(),
+                            wc.const_data_ptr<scalar_t>(),
+                            bc.const_data_ptr<scalar_t>(),
+                            x_new.data_ptr<scalar_t>(),
+                            normed.data_ptr<scalar_t>(),
+                            static_cast<int>(D), static_cast<int>(rows),
+                            static_cast<float>(eps));
+                };
+                if (D <= 32)       launch(std::integral_constant<int, 1>{});
+                else if (D <= 64)  launch(std::integral_constant<int, 2>{});
+                else if (D <= 128) launch(std::integral_constant<int, 4>{});
+                else               launch(std::integral_constant<int, 8>{});
+            } else {
+                fused_add_layernorm_kernel<scalar_t>
+                    <<<static_cast<int>(rows), threads, smem, stream>>>(
+                        xc.const_data_ptr<scalar_t>(), sc.const_data_ptr<scalar_t>(),
+                        wc.const_data_ptr<scalar_t>(), bc.const_data_ptr<scalar_t>(),
+                        x_new.data_ptr<scalar_t>(), normed.data_ptr<scalar_t>(),
+                        static_cast<int>(D), static_cast<float>(eps));
+            }
         });
 
     cudaError_t err = cudaGetLastError();
@@ -1980,6 +2261,41 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("weight"),
           pybind11::arg("bias"),
           pybind11::arg("eps") = 1e-5);
+    m.def("layernorm_set_block_threads",
+          [](int threads) { layernorm_threads_override() = threads; },
+          "Force fused_add_layernorm's block size, or 0 to restore the "
+          "width-scaled rule. Runtime-settable so candidates can be timed in "
+          "one process. Clamped to a whole number of warps, at most 1024.",
+          pybind11::arg("threads"));
+    m.def("layernorm_set_warp_width",
+          [](int width) { layernorm_warp_width_override() = width; },
+          "Widest row that fused_add_layernorm sends to the warp-per-row "
+          "kernel. 0 disables it (block-per-row everywhere), -1 restores the "
+          "measured default. Capped at 256. Runtime-settable so both kernels "
+          "can be timed in one process.",
+          pybind11::arg("width"));
+    m.def("layernorm_warp_width",
+          []() { return layernorm_warp_width(); },
+          "The current warp-per-row width threshold");
+    m.def("layernorm_set_warp_rows",
+          [](int rows) { layernorm_warp_rows_override() = rows; },
+          "Rows per block for the warp-per-row kernel; 0 restores the measured "
+          "default.",
+          pybind11::arg("rows"));
+    m.def("layernorm_warp_rows",
+          []() { return layernorm_warp_rows(); },
+          "The current rows-per-block for the warp-per-row kernel");
+    m.def("layernorm_blocks_per_sm",
+          [](int64_t D) { return layernorm_blocks_per_sm(D); },
+          "Blocks of the float32 fused_add_layernorm kernel one SM can hold at "
+          "this row width, from the occupancy API. Multiply by the block's warp "
+          "count to get warps in flight against the SM's 48.",
+          pybind11::arg("D"));
+    m.def("layernorm_block_threads",
+          [](int64_t D) { return layernorm_block_threads(D); },
+          "The block size fused_add_layernorm would launch for a row of D "
+          "elements, override included",
+          pybind11::arg("D"));
     m.def("tile_workspace_bytes",
           [](int B, int H, int S, int head_dim, bool is_causal, int impl) {
               // impl codes match fused_attention_forward's: 3 tile-fp32,
