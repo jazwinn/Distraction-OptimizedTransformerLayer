@@ -13,7 +13,9 @@ so the diff against it is readable. `optimized/model.py` holds the forward pass,
 
 Attention runs through one of two interchangeable backends: PyTorch's
 `scaled_dot_product_attention`, or a hand-written fused CUDA kernel in
-[`csrc/fused_attention.cu`](csrc/fused_attention.cu).
+[`csrc/`](csrc/) -- [`attention_wmma.cuh`](csrc/attention_wmma.cuh) and
+[`attention_scalar.cuh`](csrc/attention_scalar.cuh), picked between by
+[`attention_dispatch.cuh`](csrc/attention_dispatch.cuh).
 
 The custom backend has two kernels behind it. The default one runs both of attention's
 matrix multiplies — `Q @ K^T` and `P @ V` — on the GPU's tensor cores through
@@ -408,8 +410,14 @@ optimized/kernels.py                      dispatch into csrc/, with an SDPA fall
 optimized/graphs.py                       CUDA graph capture, replay and teardown
 optimized/util.py                         small shared helpers
 
-csrc/fused_attention.cu                   fused attention CUDA kernels (tensor-core + scalar),
-                                          fused add+LayerNorm, and the extension bindings
+csrc/fused_attention.cu                   the extension bindings, and a map of the tree below.
+                                          The only translation unit that builds the .cuh slices
+csrc/kernel_common.cuh                    the few pieces more than one kernel needs
+csrc/attention_scalar.cuh                 attention, one thread per query row
+csrc/attention_wmma.cuh                   attention on tensor cores via nvcuda::wmma
+csrc/attention_dispatch.cuh               which attention kernel runs, and the entry point
+csrc/add_layernorm.cuh                    fused residual add + LayerNorm
+csrc/linear_gelu.cuh                      GEMM with a fused bias + GELU epilogue
 csrc/tile_attention.cu                    the same attention on the CUDA tile programming model
 csrc/tile_attention.h                     plain-pointer boundary between the two translation units
 csrc/TUNING.md                            the measurements behind every block shape and threshold

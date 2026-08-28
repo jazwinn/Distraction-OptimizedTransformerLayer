@@ -23,7 +23,7 @@ OBJS = ("build/tile_attention.cuda.o", "build/fused_attention.cuda.o")
 WARPS = 4          # 128 threads / 32, for every kernel in the table
 
 # Kernels whose shared memory is dynamic, so cuobjdump -res-usage
-# reports 0. Values derived from WmmaCfg in fused_attention.cu.
+# reports 0. Values derived from WmmaCfg in attention_wmma.cuh.
 DYNAMIC_SHARED = {"wmma tf32    64x32": 44800}
 THREADS = 128
 

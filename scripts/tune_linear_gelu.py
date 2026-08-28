@@ -43,7 +43,7 @@ import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
 # Tile ids and math ids, matching kGemmTile*/kGemmMath* in
-# csrc/fused_attention.cu. Tile and precision are independent axes, so the sweep
+# csrc/linear_gelu.cuh. Tile and precision are independent axes, so the sweep
 # is their product -- the best tile is not necessarily the same for both, since
 # an fp16 fragment contracts 16 elements of K where tf32 contracts 8.
 TILES = [("128x128", 0), ("64x64", 1), ("64x32", 2)]

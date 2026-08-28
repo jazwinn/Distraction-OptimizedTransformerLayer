@@ -27,7 +27,7 @@ ATTENTION_BACKEND = "auto"
 #                first one that covers it: the tensor-core kernel where it
 #                wins, the scalar kernel where that is all there is, and SDPA
 #                from head_dim 128 up, where the wmma kernel is correct and
-#                slower. See run_kernel() in csrc/fused_attention.cu.
+#                slower. See run_kernel() in csrc/attention_dispatch.cuh.
 #   "scalar"     force the scalar kernel (no tensor cores, no TF32 rounding);
 #                head_dim in {8,16,32,64,128}, and raises on anything else. It
 #                used to fall through to ATen instead, which meant --attn-impl
@@ -81,7 +81,7 @@ _OUT_LAYOUT_BSHD = 1
 #   "auto"   the fused kernel, fp16 fragments. Faster than cuBLAS + a separate
 #            GELU at every shape measured -- 1.24x to 2.40x on the op, across
 #            grids from 2 tiles to 20000 and K/N from 32 to 4096 -- so there is
-#            no shape gate. See pick_gemm_tile() in csrc/fused_attention.cu.
+#            no shape gate. See pick_gemm_tile() in csrc/linear_gelu.cuh.
 #   "tf32"   the fused kernel with tf32 fragments instead. Same 10-bit mantissa
 #            as fp16 and therefore the same accuracy, but half the tensor-core
 #            throughput on this card, so this is for measurement and as a
@@ -110,7 +110,7 @@ _OUT_LAYOUT_BSHD = 1
 # does not.
 LINEAR_GELU = "auto"
 
-# Math ids, matching kGemmMath* in csrc/fused_attention.cu.
+# Math ids, matching kGemmMath* in csrc/linear_gelu.cuh.
 _GEMM_MATH_CODE = {"auto": -1, "tf32": 0}
 
 # CUDA graph capture. --cuda-graph overrides this for a single run.

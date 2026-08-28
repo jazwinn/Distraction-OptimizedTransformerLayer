@@ -1,6 +1,6 @@
 # Kernel tuning notes
 
-Measurements behind the constants in `tile_attention.cu` and `fused_attention.cu`.
+Measurements behind the constants in the `csrc/` kernels. `fused_attention.cu` is the module root and includes the `.cuh` slices; its header comment maps the tree.
 All numbers are from an RTX 3070 (SM 8.6, 46 SMs, 448 GB/s), CUDA 13.3.
 
 The source files point here rather than carrying these tables inline. If you

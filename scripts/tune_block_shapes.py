@@ -3,7 +3,7 @@
 Shapes are template parameters, so each candidate needs its own build. Every
 backend exposes `-D` overrides for exactly that reason -- TF32_M_*/TF32_N_* in
 tile_attention.cu, FP32_*/BF16_* beside them, WMMA_M_*/WMMA_N_* in
-fused_attention.cu -- so this can search without editing the sources. The
+attention_wmma.cuh -- so this can search without editing the sources. The
 numbers it prints go back into those macro defaults.
 
     python scripts/tune_block_shapes.py                      # every backend, dense
@@ -77,7 +77,7 @@ _WMMA_M = (16, 32, 64, 128)
 _WMMA_N = (16, 32, 48, 64, 80, 96, 112, 128)
 
 # Bytes per element and fragment K/pad, keyed by the dtype the sweep runs at.
-# Mirrors FragTraits in csrc/fused_attention.cu.
+# Mirrors FragTraits in csrc/attention_wmma.cuh.
 _FRAG = {
     torch.float32:  (4, 8, 4),    # tf32 fragments: 16x16x8, ldm % 4 == 0
     torch.float16:  (2, 16, 8),   # ldm % 8 == 0
@@ -91,7 +91,7 @@ def _wmma_smem(dtype, head_dim: int, m: int, n: int):
     `scratch` is the QO/K/V/S span the accumulator probe borrows before the
     first key tile is staged; SUPPORTED requires it to cover PROBE_BYTES.
 
-    Kept in step with csrc/fused_attention.cu by hand. If the two drift, the
+    Kept in step with csrc/attention_wmma.cuh by hand. If the two drift, the
     only cost is a wasted build or a shape skipped that would have compiled --
     the kernel's own SUPPORTED check is still what decides, and a shape that
     slips through anyway declines at run time and scores as `inf`.
