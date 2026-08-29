@@ -751,10 +751,12 @@ def ncu_argv(ncu: str, argv: List[str], kernels: Optional[List[str]] = None,
     command = [ncu, "--csv"]
     for section in (NCU_SECTIONS_FULL if full else NCU_SECTIONS):
         command += ["--section", section]
-    # Sections and explicit metrics add together; a metric no section exports
-    # comes back alongside them rather than instead of them.
-    for metric in (NCU_METRICS_FULL if full else NCU_METRICS):
-        command += ["--metrics", metric]
+    # One comma-separated list, not a repeated option: ncu refuses a second
+    # --metrics outright. --section does repeat, which hid this until a real
+    # run reached ncu.
+    metrics = NCU_METRICS_FULL if full else NCU_METRICS
+    if metrics:
+        command += ["--metrics", ",".join(metrics)]
 
     names = kernels if kernels is not None else _OWN_NAMES
     if names:

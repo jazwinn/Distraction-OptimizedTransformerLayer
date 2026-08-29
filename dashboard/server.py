@@ -169,6 +169,17 @@ except Exception as exc:
 print("PROBE" + json.dumps(info))
 """
 
+# The same probe, but it exits non-zero when the extension did not load. The
+# profile and counter jobs run this first precisely to guarantee the build; a
+# step that reports success while the build failed sends them on to profile code
+# that was never loaded.
+_PREPARE_SOURCE = _PROBE_SOURCE + """
+if not info["loaded"]:
+    sys.stderr.write("[prepare] the CUDA extension did not build, so there is "
+                     "nothing of csrc/ to profile\\n")
+    raise SystemExit(3)
+"""
+
 
 def probe_extension(force: bool = False) -> Dict[str, Any]:
     """Whether the built extension loads, and whether it has cuTile support.
@@ -370,7 +381,8 @@ def _shape_label(form: Dict[str, Any]) -> str:
 
 def _impl_label(form: Dict[str, Any]) -> str:
     parts = [str(form.get(key)) for key in
-             ("attn_backend", "attn_impl", "attn_fp16", "linear_gelu", "cuda_graph")
+             ("attn_backend", "attn_impl", "attn_precision", "linear_gelu",
+              "cuda_graph")
              if form.get(key) not in (None, "")]
     return " ".join(parts) if parts else "defaults"
 
@@ -558,7 +570,7 @@ def build_job(payload: Dict[str, Any]) -> Tuple[Optional[Job], List[Dict[str, st
         # then falls back to SDPA silently, so the profile measures ATen and
         # says nothing. A warm cache loads fine under the same profiler, so one
         # untraced build up front removes the whole failure mode.
-        prepare_argv = [sys.executable, "-u", "-c", _PROBE_SOURCE.format(repo=REPO)]
+        prepare_argv = [sys.executable, "-u", "-c", _PREPARE_SOURCE.format(repo=REPO)]
         if form.get("devenv"):
             prepare_argv = runspec.through_devenv(prepare_argv)
 
@@ -570,6 +582,7 @@ def build_job(payload: Dict[str, Any]) -> Tuple[Optional[Job], List[Dict[str, st
             ),
             label="prepare",
             parse_output=False,
+            required=True,
         )
         prepare.meta = {"role": "prepare"}
 
@@ -647,13 +660,14 @@ def build_job(payload: Dict[str, Any]) -> Tuple[Optional[Job], List[Dict[str, st
         label = f"{_shape_label(merged)} | {_impl_label(merged)}"
         spec = runspec.for_harness(merged, label)
 
-        prepare_argv = [sys.executable, "-u", "-c", _PROBE_SOURCE.format(repo=REPO)]
+        prepare_argv = [sys.executable, "-u", "-c", _PREPARE_SOURCE.format(repo=REPO)]
         if form.get("devenv"):
             prepare_argv = runspec.through_devenv(prepare_argv)
         prepare = Step(
             spec=runspec.RunSpec(argv=prepare_argv, cwd=REPO, label="prepare"),
             label="prepare",
             parse_output=False,
+            required=True,
         )
         prepare.meta = {"role": "prepare"}
 

@@ -79,6 +79,9 @@ class Step:
     # as it offers the same feed()/result/finish() surface HarnessParser does.
     # nsys stats uses this to stream its CSV in through the same machinery.
     parser_factory: Optional[Callable[[], Any]] = None
+    # A step the rest of the job depends on. When one fails the steps after it
+    # are skipped rather than run against a state they were promised was ready.
+    required: bool = False
     # Filled in as it runs.
     status: str = "pending"          # pending | running | done | failed | stopped
     exit_code: Optional[int] = None
@@ -210,6 +213,11 @@ class Job:
                     continue
                 self._run_step(step)
                 if step.status == "stopped":
+                    break
+                if step.required and step.status == "failed":
+                    self.append(f"[dashboard] {step.label} failed and the rest of "
+                                f"this job depends on it; skipping the remaining "
+                                f"steps")
                     break
             if self.stop_requested:
                 self.status = "stopped"
