@@ -657,8 +657,9 @@ def build_job(payload: Dict[str, Any]) -> Tuple[Optional[Job], List[Dict[str, st
         )
         prepare.meta = {"role": "prepare"}
 
+        detail = "full" if str(form.get("ncu_detail")) == "full" else "essential"
         collect_argv = profiling.ncu_argv(tools["ncu"], spec.argv,
-                                          launch_count=launches)
+                                          launch_count=launches, detail=detail)
         if form.get("devenv"):
             collect_argv = runspec.through_devenv(collect_argv)
         collect = Step(
@@ -674,7 +675,8 @@ def build_job(payload: Dict[str, Any]) -> Tuple[Optional[Job], List[Dict[str, st
             parser_factory=profiling.NcuParser,
         )
         collect.meta = {"role": "collect", "shape": _shape_label(merged),
-                        "config": _impl_label(merged), "launches": launches}
+                        "config": _impl_label(merged), "launches": launches,
+                        "detail": detail}
 
         return (Job("ncu", [prepare, collect],
                     title=f"counters {label}"), issues)

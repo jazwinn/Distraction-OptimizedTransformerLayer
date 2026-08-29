@@ -540,6 +540,24 @@ table.data th.left, table.data td.left { text-align: left; }
  * stops being a magnitude and starts being a state. */
 .share-fill.is-hot { background: var(--warning); }
 
+/* Counters read as pairs, so they are laid out as pairs rather than a table:
+ * there are a dozen of them and no reason to scan a column. */
+.counter-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 2px 18px; margin: 4px 0 0 12px;
+}
+.counter { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.counter-label {
+  font: 400 11px/1.6 var(--sans); color: var(--ink-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.counter-value {
+  margin-left: auto; font: 400 11px/1.6 var(--mono);
+  color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.counter-value.is-warning { color: var(--warning-ink); }
+.counter-value.is-critical { color: var(--critical-ink); }
+
 /* One line per rule, the rest on the title -- same treatment as .note. */
 .rule-line {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;

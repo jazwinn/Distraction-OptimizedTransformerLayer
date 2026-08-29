@@ -663,6 +663,62 @@ NCU_SECTIONS = (
     "ComputeWorkloadAnalysis",  # IPC, to separate "stalled" from "not issuing"
 )
 
+# Everything above, plus where the memory traffic goes and why warps stall.
+# Each section is another replay of every kernel, so this is opt-in.
+NCU_SECTIONS_FULL = NCU_SECTIONS + (
+    "MemoryWorkloadAnalysis",   # L1/L2/DRAM throughput and hit rates
+    "SchedulerStats",           # eligible vs issued warps
+    "WarpStateStats",           # what the stalls are waiting on
+    "InstructionStats",         # instruction counts, for a mix
+)
+
+# Counters no section exports as a scalar. Tensor-core utilisation is the first
+# one this project would ask for -- the whole point of the wmma kernels is that
+# the tensor pipe is busy -- and a section cannot answer it.
+#
+# Every name here was checked against `ncu --query-metrics --chip ga104`, which
+# is the chip in this machine; the query works without a GPU, so a typo is
+# caught here rather than after a long run.
+NCU_METRICS = (
+    "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active",
+    "sm__pipe_tensor_op_hmma_cycles_active.avg.pct_of_peak_sustained_active",
+    "sm__inst_executed_pipe_tensor.sum",
+)
+
+NCU_METRICS_FULL = NCU_METRICS + (
+    "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum",
+    "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum",
+    "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum",
+    "smsp__inst_executed_op_shared_ld.sum",
+    "smsp__inst_executed_op_shared_st.sum",
+    "l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum",
+    "dram__bytes_read.sum",
+    "dram__bytes_write.sum",
+)
+
+# What to call them on screen. The raw names are precise and unreadable.
+NCU_METRIC_LABELS = {
+    "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active":
+        ("tensor pipe active", "%"),
+    "sm__pipe_tensor_op_hmma_cycles_active.avg.pct_of_peak_sustained_active":
+        ("tensor pipe active (HMMA)", "%"),
+    "sm__inst_executed_pipe_tensor.sum": ("tensor instructions", ""),
+    "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum": ("global load sectors", ""),
+    "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum": ("global store sectors", ""),
+    "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum": ("global load requests", ""),
+    "smsp__inst_executed_op_shared_ld.sum": ("shared loads", ""),
+    "smsp__inst_executed_op_shared_st.sum": ("shared stores", ""),
+    "l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum": ("shared bank conflicts", ""),
+    "dram__bytes_read.sum": ("DRAM bytes read", "byte"),
+    "dram__bytes_write.sum": ("DRAM bytes written", "byte"),
+}
+
+_TENSOR_PCT = "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active"
+_TENSOR_HMMA_PCT = ("sm__pipe_tensor_op_hmma_cycles_active.avg"
+                    ".pct_of_peak_sustained_active")
+_GLOBAL_LD_SECTORS = "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum"
+_GLOBAL_LD_REQUESTS = "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum"
+
 # The metrics read out of those sections, by the name ncu prints. The section is
 # part of the address, not decoration: several of these names appear in more
 # than one section with different units.
@@ -683,7 +739,7 @@ _BLOCK_LIMITS = {
 
 
 def ncu_argv(ncu: str, argv: List[str], kernels: Optional[List[str]] = None,
-             launch_count: int = 12) -> List[str]:
+             launch_count: int = 12, detail: str = "essential") -> List[str]:
     """Collect counters for our kernels only, a bounded number of times.
 
     Both restrictions are load-bearing. ncu replays a kernel several times to
@@ -691,9 +747,14 @@ def ncu_argv(ncu: str, argv: List[str], kernels: Optional[List[str]] = None,
     would take a very long time to tell us about code we do not own; and without
     a launch cap it would do that for every iteration of the benchmark.
     """
+    full = detail == "full"
     command = [ncu, "--csv"]
-    for section in NCU_SECTIONS:
+    for section in (NCU_SECTIONS_FULL if full else NCU_SECTIONS):
         command += ["--section", section]
+    # Sections and explicit metrics add together; a metric no section exports
+    # comes back alongside them rather than instead of them.
+    for metric in (NCU_METRICS_FULL if full else NCU_METRICS):
+        command += ["--metrics", metric]
 
     names = kernels if kernels is not None else _OWN_NAMES
     if names:
@@ -886,8 +947,35 @@ def analyse_ncu(rows: List[Dict[str, str]]) -> List[Dict[str, Any]]:
                 if limit_value is None or found < limit_value:
                     limiter, limit_value = human, found
 
+        # Metrics asked for by name arrive with no section, or one ncu invents.
+        # They are carried through as a group rather than each being given a
+        # field here, so adding one to NCU_METRICS needs no change below.
+        extras = []
+        for (section_name, metric_name), found in metrics.items():
+            if metric_name not in NCU_METRIC_LABELS:
+                continue
+            label, unit = NCU_METRIC_LABELS[metric_name]
+            extras.append({
+                "key": metric_name,
+                "label": label,
+                "value": found["value"],
+                "text": found["text"],
+                "unit": found["unit"] or unit,
+            })
+        extras.sort(key=lambda item: list(NCU_METRIC_LABELS).index(item["key"]))
+
+        # Sectors per request is the coalescing number: 4 is one 32-byte sector
+        # per thread-quarter and ideal, 32 means every thread pulled its own.
+        sectors = value(_GLOBAL_LD_SECTORS)
+        requests = value(_GLOBAL_LD_REQUESTS)
+        per_request = (sectors / requests) if sectors and requests else None
+
         out.append({
             "name": entry["name"],
+            "tensor_pct": value(_TENSOR_PCT),
+            "tensor_hmma_pct": value(_TENSOR_HMMA_PCT),
+            "sectors_per_request": per_request,
+            "extras": extras,
             "block_size": entry["block_size"],
             "grid_size": entry["grid_size"],
             "duration_ns": _duration_ns(metrics.get((_SOL_SECTION, _SOL_DURATION))),

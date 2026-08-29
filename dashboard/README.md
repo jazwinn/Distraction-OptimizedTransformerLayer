@@ -148,6 +148,30 @@ finite: it profiles **only kernels defined in `csrc/`** (the names are read from
 there) and only the first N launches, 12 by default. Even so it is far slower
 than the timeline run; that is the tool, not the wrapper.
 
+**Detail** picks how much to collect, because each extra section is another
+replay of every kernel:
+
+* *essential* — Speed of Light, launch statistics, occupancy and compute
+  workload, plus the tensor-pipe metrics.
+* *full* — adds memory workload, scheduler and warp-stall statistics, and the
+  memory counters: global load/store sectors and requests, shared loads, stores
+  and bank conflicts, DRAM bytes.
+
+**Tensor-core utilisation gets its own column**, because on this project it is
+usually the question. No section exports it as a scalar, so it is requested by
+name — `sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active` and two
+others. A wmma kernel reading near zero there is not using tensor cores at all,
+whatever else the table says.
+
+Under each kernel, *counters* lists what was collected and **sectors per
+request** is derived from it: 4 is fully coalesced, and higher means each
+request is pulling more cache lines than it needs.
+
+Every requested metric name is checked against
+`ncu --query-metrics --chip ga104` — that query needs no GPU, so a name that
+does not exist on this card is caught before a long run rather than after one
+that quietly reports nothing.
+
 Read it as: above ~80% of either pipe the kernel is near the roofline and only
 less work will help; both under ~40% means it is waiting rather than working,
 and occupancy is the first thing to look at. Those thresholds are Nsight

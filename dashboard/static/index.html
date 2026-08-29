@@ -422,9 +422,16 @@
               <div class="btn-row" style="margin-top:10px">
                 <button class="btn" id="ncu-go">Kernel counters</button>
                 <button class="btn btn-danger" id="ncu-stop" disabled>Stop</button>
-                <label class="field" style="max-width:120px">
+                <label class="field" style="max-width:110px">
                   <span class="field-label">launches</span>
                   <input type="number" id="ncu-launches" value="12" min="1" max="200">
+                </label>
+                <label class="field" style="max-width:190px">
+                  <span class="field-label">detail</span>
+                  <select id="ncu-detail">
+                    <option value="essential">essential &mdash; 4 sections</option>
+                    <option value="full">full &mdash; memory and warp stalls</option>
+                  </select>
                 </label>
                 <span class="status-line" id="ncu-job-status">no job yet</span>
               </div>

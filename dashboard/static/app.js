@@ -2162,6 +2162,7 @@ function setupProfile() {
   $('ncu-go').addEventListener('click', () => {
     form.devenv = $('prof-devenv').checked;
     form.launch_count = parseInt($('ncu-launches').value, 10) || 12;
+    form.ncu_detail = $('ncu-detail').value;
     submit('ncu', { mode: 'ncu', form }, ncuUi);
   });
   $('ncu-stop').addEventListener('click', () => requestStop('ncu', ncuUi));
@@ -2497,6 +2498,18 @@ const NCU_COLUMNS = [
   { key: 'memory', title: 'memory', type: 'num',
     value: (row) => row.memory_pct,
     render: (cell, row) => peakCell(cell, row.memory_pct) },
+  { key: 'tensor', title: 'tensor', type: 'num',
+    value: (row) => row.tensor_pct,
+    render: (cell, row) => {
+      // The whole point of the wmma kernels is that this is not near zero, so
+      // it earns a column rather than a line in the details.
+      peakCell(cell, row.tensor_pct);
+      if (row.tensor_pct !== null && row.tensor_pct !== undefined) {
+        cell.title = 'Share of peak that the tensor pipe was active. A kernel '
+          + 'that should be using tensor cores and reads near zero here is not '
+          + 'using them.';
+      }
+    } },
   { key: 'occupancy', title: 'occupancy', type: 'num',
     value: (row) => row.occupancy_pct,
     render: (cell, row) => {
@@ -2539,8 +2552,10 @@ function renderNcuResults(rows, data) {
   const kernels = result.kernels || [];
 
   $('ncu-results-card').hidden = false;
+  const level = (step.meta && step.meta.detail) || '';
   $('ncu-note').textContent = kernels.length
     ? kernels.length + ' launch' + (kernels.length === 1 ? '' : 'es') + ' profiled'
+      + (level ? ' · ' + level : '')
     : '';
 
   renderTable($('ncu-results'), kernels.map((k) => Object.assign({}, k, {
@@ -2573,6 +2588,56 @@ function renderNcuResults(rows, data) {
       + '— the same thing the timeline reports as "no custom kernels ran".';
     guide.appendChild(line);
     return;
+  }
+
+  // The counters that have no column: memory traffic, coalescing, and whatever
+  // else the chosen detail level collected.
+  const withExtras = kernels.filter((k) => (k.extras || []).length);
+  if (withExtras.length) {
+    const heading = el('div', 'field-label');
+    heading.style.margin = '4px 0 10px';
+    heading.textContent = 'counters';
+    guide.appendChild(heading);
+
+    withExtras.forEach((kernel) => {
+      const block = el('div');
+      block.style.marginBottom = '12px';
+      const name = el('div');
+      name.style.font = '500 12px/1.5 var(--mono)';
+      name.textContent = shortKernel(kernel.name);
+      block.appendChild(name);
+
+      const grid = el('div', 'counter-grid');
+      kernel.extras.forEach((metric) => {
+        const item = el('div', 'counter');
+        item.appendChild(el('span', 'counter-label', metric.label));
+        const shown = metric.value === null || metric.value === undefined
+          ? (metric.text || '–')
+          : (metric.unit === '%' ? metric.value.toFixed(1) + '%'
+            : Math.round(metric.value).toLocaleString());
+        item.appendChild(el('span', 'counter-value', shown));
+        item.title = metric.key;
+        grid.appendChild(item);
+      });
+
+      // Sectors per request is the coalescing number and reads as nothing
+      // without its ideal beside it.
+      if (kernel.sectors_per_request) {
+        const item = el('div', 'counter');
+        item.appendChild(el('span', 'counter-label', 'sectors per request'));
+        const value = el('span', 'counter-value',
+          kernel.sectors_per_request.toFixed(1) + ' / 4 ideal');
+        if (kernel.sectors_per_request > 8) value.classList.add('is-critical');
+        else if (kernel.sectors_per_request > 4.5) value.classList.add('is-warning');
+        item.appendChild(value);
+        item.title = 'Global load sectors divided by requests. 4 is fully '
+          + 'coalesced; higher means each request is pulling more cache lines '
+          + 'than it needs.';
+        grid.appendChild(item);
+      }
+      block.appendChild(grid);
+      guide.appendChild(block);
+    });
   }
 
   // NVIDIA's own analysis, passed through rather than paraphrased. It is more
