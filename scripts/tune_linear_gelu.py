@@ -109,23 +109,6 @@ def graph_timed(fn, iters=50, reps=5, per_graph=20):
     return best
 
 
-def eager_timed(fn, iters=50, reps=5):
-    for _ in range(20):
-        fn()
-    torch.cuda.synchronize()
-    best = float("inf")
-    for _ in range(reps):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(iters):
-            fn()
-        end.record()
-        torch.cuda.synchronize()
-        best = min(best, start.elapsed_time(end) / iters * 1e3)
-    return best
-
-
 def operands(M, K, N, dev):
     g = torch.Generator(device="cuda").manual_seed(1234)
     return (torch.randn(M, K, device=dev, generator=g),
