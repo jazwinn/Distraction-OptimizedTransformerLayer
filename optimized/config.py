@@ -213,3 +213,26 @@ _GRAPH_MIN_FREE_BYTES = 512 << 20
 # Capture feeds the model its own data rather than the caller's, from a local
 # generator so it cannot perturb the global RNG stream main() seeds.
 _GRAPH_SEED = 20240827
+
+# Split the batch and retry when a forward runs out of memory. Reactive: the
+# whole batch is always tried first, so shapes that fit pay nothing. It cannot
+# help when the *caller's* input does not fit -- that fails before forward() --
+# and results shift ~6.5e-4 when it fires, since cuBLAS picks its GEMM algorithm
+# from M = B*S. The chosen chunk size is cached per shape to keep that stable.
+MICROBATCH_FALLBACK = True
+
+# Floor on the retry ladder: at one row there is nothing left to split.
+_MICROBATCH_MIN_ROWS = 1
+
+# Predictive half of the gate, and on Windows the half that matters: an
+# oversubscribed allocation there does not raise, it spills to system RAM and
+# crawls, so nothing catches it after the fact. peak =~ FACTOR * one [B,S,D]
+# activation; measured 9.03-9.33 on the shapes this fires for. Deliberately not
+# 14 (shape 8's ratio): that would predict 8.54 GiB for shape 6, whose real peak
+# is 5.51, and split a batch that fits. False positives cost numerics and speed;
+# false negatives just fall through to the ladder.
+_MICROBATCH_PEAK_FACTOR = 10
+
+# Share of total device memory the prediction may claim before splitting up
+# front. 0.85 leaves shape 6 (6.10 GiB predicted of 6.80) running whole.
+_MICROBATCH_BUDGET_FRACTION = 0.85

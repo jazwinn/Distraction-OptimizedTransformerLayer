@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from . import config
 from .graphs import (_GraphRunner, _capture_graph, _graph_eligible,
                      _graph_key, _graph_note_decline)
 from .layers import MyLayerNorm, MyTransformerBlock
@@ -56,6 +57,13 @@ class OptimizedTransformer(nn.Module):
         # depends on the CUDA_GRAPH global that scripts flip mid-process.
         self._graphs: Dict[Tuple, _GraphRunner] = {}
         self._graph_denied: set = set()
+
+        # Rows per chunk that last fit. Plain attributes for the same reason as
+        # the caches above -- out of state_dict(), so strict weight copying keeps
+        # working. Caching pays the failed whole-batch attempt once per shape and
+        # keeps the chunk size, which moves the numerics, stable across calls.
+        self._chunk_rows: Dict[Tuple, int] = {}
+        self._device_budget: Optional[int] = None
 
     def _mask_is_trivial(self, mask: Optional[torch.Tensor]) -> bool:
         """True when every position is valid, so every mask op is a no-op.
@@ -154,8 +162,85 @@ class OptimizedTransformer(nn.Module):
         if runner is not None:
             return runner.replay(x, valid_token_mask)
 
+        if config.MICROBATCH_FALLBACK and x.is_cuda and x.shape[0] > 1:
+            return self._forward_chunk_on_oom(x, valid_token_mask, use_mask)
         return self._forward_eager(x, valid_token_mask, use_mask)
         # ============================================================
+
+    def _rows_within_budget(self, x: torch.Tensor) -> int:
+        """Rows whose predicted peak fits the budget; x.shape[0] if all do. One
+        multiply and a compare -- the device total is read once and cached.
+        """
+        rows = x.shape[0]
+        per_row = (
+            x.shape[1] * x.shape[2] * x.element_size() * config._MICROBATCH_PEAK_FACTOR
+        )
+        if per_row <= 0:
+            return rows
+
+        budget = self._device_budget
+        if budget is None:
+            _, total = torch.cuda.mem_get_info(x.device)
+            budget = int(total * config._MICROBATCH_BUDGET_FRACTION)
+            self._device_budget = budget
+
+        if per_row * rows <= budget:
+            return rows
+        return max(config._MICROBATCH_MIN_ROWS, min(rows, budget // per_row))
+
+    def _forward_chunk_on_oom(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor],
+        use_mask: bool,
+    ) -> torch.Tensor:
+        """_forward_eager, retried over batch chunks if it runs out of memory.
+
+        Eager path only, deliberately: an OOM *during* graph capture leaves the
+        capture broken rather than merely failed. `use_mask` is threaded through
+        rather than re-derived, so per-chunk mask slices cannot miss
+        _mask_is_trivial's weakref cache and cost a sync each.
+        """
+        rows = x.shape[0]
+        key = (rows, x.shape[1], x.shape[2], x.dtype, use_mask)
+        n = self._chunk_rows.get(key)
+        if n is None:
+            # A guess the ladder below still corrects, but the only thing that
+            # catches a WDDM spill, which crawls instead of raising.
+            n = self._rows_within_budget(x)
+
+        if n >= rows:
+            try:
+                return self._forward_eager(x, valid_token_mask, use_mask)
+            except torch.OutOfMemoryError:
+                # Without this the retry inherits the fragmentation that caused
+                # the OOM and fails at the same size.
+                torch.cuda.empty_cache()
+                n = rows // 2
+
+        while n >= config._MICROBATCH_MIN_ROWS:
+            out = None
+            try:
+                # In place: torch.cat would hold the pieces and the whole at
+                # once, raising the peak just when it must come down.
+                out = torch.empty_like(x)
+                for lo in range(0, rows, n):
+                    hi = min(lo + n, rows)
+                    chunk_mask = (
+                        valid_token_mask[lo:hi] if valid_token_mask is not None else None
+                    )
+                    out[lo:hi] = self._forward_eager(x[lo:hi], chunk_mask, use_mask)
+                self._chunk_rows[key] = n
+                return out
+            except torch.OutOfMemoryError:
+                del out
+                torch.cuda.empty_cache()
+                if n <= config._MICROBATCH_MIN_ROWS:
+                    raise
+                n //= 2
+
+        # Nothing was attempted: let the caller see a real OOM, not an invented one.
+        return self._forward_eager(x, valid_token_mask, use_mask)
 
     def _maybe_capture(
         self,
