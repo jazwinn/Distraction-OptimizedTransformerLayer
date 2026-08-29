@@ -40,7 +40,11 @@ from typing import Any, Dict, List, Optional, Tuple
 # Finding the tools
 # --------------------------------------------------------------------------
 
-_NVIDIA_DIR = r"C:\Program Files\NVIDIA Corporation"
+# Where the Nsight installers land. Read from the environment rather than
+# written down: Program Files is not always on C:, and is localised on some
+# Windows installs. NSYS_PATH / NCU_PATH override the search entirely.
+_NVIDIA_DIR = os.path.join(
+    os.environ.get("ProgramFiles", r"C:\Program Files"), "NVIDIA Corporation")
 
 # The reports the Profile view is built from. Ordered cheapest-looking first so
 # the streamed output fills the page top-down as nsys works through them.

@@ -175,6 +175,29 @@ cmd.exe /c scripts\devenv.bat python scripts\verify_attn_axes.py   # every kerne
 cmd.exe /c scripts\devenv.bat python scripts\verify_graph.py       # the recorded version matches the normal one exactly
 ```
 
+### 4. Find the CUDA graph gate value for your machine
+
+Optional, and only worth doing on a card that is not an RTX 3070.
+
+One optimization records the whole sequence of GPU commands once and replays it as a single
+instruction. That only pays off while the card is being starved of work — on large inputs it has
+nothing to give, so it is switched off above a size threshold. The threshold shipped here was
+measured on this project's card. A faster card starves at larger sizes and wants a **larger**
+value; a slower one wants a smaller one.
+
+To re-derive it on your own machine:
+
+```bash
+cmd.exe /c scripts\devenv.bat python scriptsb_graph.py --recommend
+```
+
+It sweeps the size axis and prints the value to use. Put that number in `_GRAPH_MAX_ACTIVATION`
+in [optimized/config.py](optimized/config.py), which carries the same explanation next to it.
+
+Getting this wrong is cheap in both directions: too low leaves some speed unclaimed, too high
+holds on to a little memory for no gain. Neither can change an answer — the replayed version is
+bit-for-bit identical to the ordinary one at any setting.
+
 ### If something goes wrong
 
 **"the CUDA extension failed to load, and there is no fallback."** The compiler was not found. Run

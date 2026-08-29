@@ -1,0 +1,16 @@
+# Line endings, decided here rather than by whatever core.autocrlf the person
+# cloning happens to have set. Without this, a clone with core.autocrlf=false
+# gets LF-only .bat files, which cmd.exe parses inconsistently.
+
+* text=auto
+
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+
+*.py   text eol=lf
+*.cu   text eol=lf
+*.cuh  text eol=lf
+*.h    text eol=lf
+*.md   text eol=lf
+
+*.png  binary

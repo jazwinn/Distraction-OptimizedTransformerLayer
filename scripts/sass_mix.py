@@ -13,12 +13,43 @@ three tensor-core kernels, which pins the emitted body at exactly one key tile.
 """
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import subprocess
+import sys
 from collections import Counter
 
-CUDA_BIN = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin"
-ROOT = r"c:\Users\ngjaz\OneDrive\Documents\OptimizingTransformerLayer"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+
+def _cuda_tool(name: str) -> str:
+    """Absolute path to a CUDA binary utility, or the bare name as a fallback.
+
+    Prefers the toolkit kernel_ext builds with, because the objects read here
+    were produced by it and an older cuobjdump does not necessarily understand
+    a newer object's sections. CUDA_PATH / CUDA_HOME, then PATH, stand in when
+    that lookup finds nothing.
+    """
+    exe = name + (".exe" if sys.platform == "win32" else "")
+    homes = []
+    try:
+        import kernel_ext
+        homes.append(kernel_ext._find_tile_cuda_home())
+    except Exception:                                   # noqa: BLE001
+        pass
+    homes += [os.environ.get("CUDA_PATH"), os.environ.get("CUDA_HOME")]
+    for home in homes:
+        if home:
+            candidate = os.path.join(home, "bin", exe)
+            if os.path.isfile(candidate):
+                return candidate
+    return shutil.which(exe) or exe
+
+
+CU_FILT = _cuda_tool("cu++filt")
+CUOBJDUMP = _cuda_tool("cuobjdump")
 OBJS = ("build/tile_attention.cuda.o", "build/fused_attention.cuda.o")
 WARPS = 4          # 128 threads / 32, for every kernel in the table
 
@@ -77,7 +108,7 @@ SELECT = [
 
 
 def demangle(names):
-    p = subprocess.run([CUDA_BIN + r"\cu++filt.exe"], input="\n".join(names),
+    p = subprocess.run([CU_FILT], input="\n".join(names),
                        capture_output=True, text=True)
     return dict(zip(names, p.stdout.strip().splitlines()))
 
@@ -85,7 +116,7 @@ def demangle(names):
 def sass():
     out: dict[str, Counter] = {}
     for obj in OBJS:
-        p = subprocess.run([CUDA_BIN + r"\cuobjdump.exe", "-sass", obj],
+        p = subprocess.run([CUOBJDUMP, "-sass", obj],
                            capture_output=True, text=True, cwd=ROOT)
         cur = None
         for line in p.stdout.splitlines():
@@ -105,7 +136,7 @@ def sass():
 def resources():
     out = {}
     for obj in OBJS:
-        p = subprocess.run([CUDA_BIN + r"\cuobjdump.exe", "-res-usage", obj],
+        p = subprocess.run([CUOBJDUMP, "-res-usage", obj],
                            capture_output=True, text=True, cwd=ROOT)
         cur = None
         for line in p.stdout.splitlines():

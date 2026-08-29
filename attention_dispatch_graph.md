@@ -1,6 +1,6 @@
 # Optimized Transformer: Pipeline, Host, and Device Architecture
 
-Every decision is made on the host before anything is launched; the device only ever runs kernels. Thresholds come from [`optimized/config.py`](file:///C:/Users/ngjaz/OneDrive/Documents/OptimizingTransformerLayer/optimized/config.py) and the launchers in [`csrc/`](file:///C:/Users/ngjaz/OneDrive/Documents/OptimizingTransformerLayer/csrc).
+Every decision is made on the host before anything is launched; the device only ever runs kernels. Thresholds come from [`optimized/config.py`](optimized/config.py) and the launchers in [`csrc/`](csrc).
 
 Edge labels below indicate dispatch conditions, kept concise so arrows remain compact. The full rule behind each label is documented in the reference table following each diagram.
 
@@ -68,12 +68,12 @@ flowchart TD
 
 | Label | Rule | Source Location |
 | :--- | :--- | :--- |
-| `hit` | `(shape, dtype, device, use_mask, impl, linear_gelu, precision)` is present in `_graphs`. `ATTENTION_BACKEND` is deliberately absent: it has one legal value, so it can never make two calls differ | [`graphs._graph_key`](file:///C:/Users/ngjaz/OneDrive/Documents/OptimizingTransformerLayer/optimized/graphs.py) |
-| `miss` | Not cached, or `_graph_eligible` declines: graphs disabled, non-CUDA device, capture already in progress, `_GRAPH_MAX_ENTRIES` reached, or activation exceeds `_GRAPH_MAX_ACTIVATION` | [`graphs._graph_eligible`](file:///C:/Users/ngjaz/OneDrive/Documents/OptimizingTransformerLayer/optimized/graphs.py) |
-| `1` | Batch size is 1, or `MICROBATCH_FALLBACK` is off — single whole-batch eager pass | [`model.forward`](file:///C:/Users/ngjaz/OneDrive/Documents/OptimizingTransformerLayer/optimized/model.py) |
-| `n` | Batch size > 1: predict peak memory, split up front if exceeding 85% device VRAM, then halve on every `OutOfMemoryError` | [`model._forward_chunk_on_oom`](file:///C:/Users/ngjaz/OneDrive/Documents/OptimizingTransformerLayer/optimized/model.py) |
-| `d <= 64` | No mask (or trivial mask) **and** `d_model <= _FFN_BLOCK_MAX_D` **and** kernel has explicit `(d_model, ffn_dim)` instantiation | [`kernels._ffn_block`](file:///C:/Users/ngjaz/OneDrive/Documents/OptimizingTransformerLayer/optimized/kernels.py) |
-| `wide` | Anything else — executes the full four-kernel chain | [`layers.MyTransformerBlock.forward`](file:///C:/Users/ngjaz/OneDrive/Documents/OptimizingTransformerLayer/optimized/layers.py) |
+| `hit` | `(shape, dtype, device, use_mask, impl, linear_gelu, precision)` is present in `_graphs`. `ATTENTION_BACKEND` is deliberately absent: it has one legal value, so it can never make two calls differ | [`graphs._graph_key`](optimized/graphs.py) |
+| `miss` | Not cached, or `_graph_eligible` declines: graphs disabled, non-CUDA device, capture already in progress, `_GRAPH_MAX_ENTRIES` reached, or activation exceeds `_GRAPH_MAX_ACTIVATION` | [`graphs._graph_eligible`](optimized/graphs.py) |
+| `1` | Batch size is 1, or `MICROBATCH_FALLBACK` is off — single whole-batch eager pass | [`model.forward`](optimized/model.py) |
+| `n` | Batch size > 1: predict peak memory, split up front if exceeding 85% device VRAM, then halve on every `OutOfMemoryError` | [`model._forward_chunk_on_oom`](optimized/model.py) |
+| `d <= 64` | No mask (or trivial mask) **and** `d_model <= _FFN_BLOCK_MAX_D` **and** kernel has explicit `(d_model, ffn_dim)` instantiation | [`kernels._ffn_block`](optimized/kernels.py) |
+| `wide` | Anything else — executes the full four-kernel chain | [`layers.MyTransformerBlock.forward`](optimized/layers.py) |
 
 Colour carries the lane, so the diagram needs no swimlanes: grey is a host decision, green a device kernel, amber the fused block that replaces four of them. Thick arrows (`==>`) are kernel launches; thin arrows between green nodes are data dependencies. The device never hands control back to the host during execution.
 
@@ -87,7 +87,7 @@ Because kernel launches are asynchronous, the host runs ahead, queuing kernel `n
 
 ## 2. Attention: Kernel Dispatch Selection
 
-`fused_attention_forward` in [`csrc/attention_dispatch.cuh`](file:///C:/Users/ngjaz/OneDrive/Documents/OptimizingTransformerLayer/csrc/attention_dispatch.cuh). Preparation preceding the selector is invariant across kernel choices.
+`fused_attention_forward` in [`csrc/attention_dispatch.cuh`](csrc/attention_dispatch.cuh). Preparation preceding the selector is invariant across kernel choices.
 
 ```mermaid
 flowchart TD
@@ -330,7 +330,7 @@ flowchart TD
 | Label | Rule |
 | :--- | :--- |
 | `padded` | Explicit padded mask tensor present. Padded rows are zeroed *between* residual addition and LayerNorm; reference LayerNorm normalizes zeroed elements rather than unpadded sums, preventing kernel fusion |
-| `<= 64` | `config._FFN_BLOCK_MAX_D`, host preference in [`optimized/kernels.py`](file:///C:/Users/ngjaz/OneDrive/Documents/OptimizingTransformerLayer/optimized/kernels.py). (`FFN_BLOCK="force"` overrides this for A/B testing) |
+| `<= 64` | `config._FFN_BLOCK_MAX_D`, host preference in [`optimized/kernels.py`](optimized/kernels.py). (`FFN_BLOCK="force"` overrides this for A/B testing) |
 | `pair` | Fused kernel instantiates explicit `(d_model, ffn_dim)` pairs: `(128,128)`, `(64,64)`, `(48,48)`, `(32,32)`, and `(16,16)`. Each pair requires macro expansion of two WMMA GEMMs; mismatched dimensions (`d_model != ffn_dim`) force unfused execution |
 
 ### Performance Profile (Fused vs. Chained Baseline)
@@ -386,7 +386,7 @@ This optimization delivers **2.2x** kernel speedup and **1.02x–1.11x** end-to-
 
 ## 7. Linear + GELU Fusion
 
-[`optimized/kernels.py`](file:///C:/Users/ngjaz/OneDrive/Documents/OptimizingTransformerLayer/optimized/kernels.py) invokes `_linear_gelu` when `LINEAR_GELU != "off"` and Linear bias is enabled. If the extension cannot service a configuration, it returns `None`, causing the host to fall back to `F.gelu(F.linear(...))`.
+[`optimized/kernels.py`](optimized/kernels.py) invokes `_linear_gelu` when `LINEAR_GELU != "off"` and Linear bias is enabled. If the extension cannot service a configuration, it returns `None`, causing the host to fall back to `F.gelu(F.linear(...))`.
 
 Fallbacks occur exclusively on coverage constraints: `float32` input, `K % 4 == 0`, and SM 8.0+. When running with FP16 fragments, this fused kernel outperforms cuBLAS combined with a separate GELU kernel across all evaluated grid configurations (delivering **1.24x–2.40x** speedup across grid dimensions from 2 to 20,000 tiles). Block tile layouts are selected per shape via `pick_gemm_tile(M, N, K)`.
 
