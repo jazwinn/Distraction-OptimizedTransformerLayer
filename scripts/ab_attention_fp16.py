@@ -28,6 +28,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from ab_common import balanced_order  # noqa: E402
+
 import kernel_ext  # noqa: E402
 
 import torch  # noqa: E402
@@ -141,18 +143,18 @@ def main() -> int:
 
         best = {"tf32": math.inf, "fp16": math.inf}
         ctrl = math.inf
-        for _ in range(args.rounds):
-            # tf32 at both ends of the round; the two are identical code, so
-            # their ratio is this machine's noise floor and nothing else.
-            K.wmma_set_fp16(False)
-            a = graph_timed(wmma, args.iters)
-            K.wmma_set_fp16(True)
-            f = graph_timed(wmma, args.iters)
-            K.wmma_set_fp16(False)
-            c = graph_timed(wmma, args.iters)
-            best["tf32"] = min(best["tf32"], a, c)
-            best["fp16"] = min(best["fp16"], f)
-            ctrl = min(ctrl, abs(a / c - 1.0))
+        for rnd in range(args.rounds):
+            # Both arms twice, positions symmetric, lead alternating. The old
+            # form timed tf32 at both ends and fp16 once between them, which is
+            # min-of-2 against min-of-1 with fp16 also holding the faster middle
+            # slot. See ab_common.balanced_order.
+            t = {False: [], True: []}
+            for on in balanced_order((False, True), rnd):
+                K.wmma_set_fp16(on)
+                t[on].append(graph_timed(wmma, args.iters))
+            best["tf32"] = min([best["tf32"]] + t[False])
+            best["fp16"] = min([best["fp16"]] + t[True])
+            ctrl = min(ctrl, abs(t[False][0] / t[False][1] - 1.0))
         K.wmma_set_fp16(True)
         worst_ctrl = max(worst_ctrl, ctrl)
 
@@ -235,13 +237,13 @@ def model_section(K, args):
 
         best = {"tf32": math.inf, "auto": math.inf}
         ctrl = math.inf
-        for _ in range(args.rounds):
-            a = run("tf32", args.iters)
-            f = run("auto", args.iters)
-            c = run("tf32", args.iters)
-            best["tf32"] = min(best["tf32"], a, c)
-            best["auto"] = min(best["auto"], f)
-            ctrl = min(ctrl, abs(a / c - 1.0))
+        for rnd in range(args.rounds):
+            t = {"tf32": [], "auto": []}
+            for name in balanced_order(("tf32", "auto"), rnd):
+                t[name].append(run(name, args.iters))
+            for name in ("tf32", "auto"):
+                best[name] = min([best[name]] + t[name])
+            ctrl = min(ctrl, abs(t["tf32"][0] / t["tf32"][1] - 1.0))
         worst_ctrl = max(worst_ctrl, ctrl)
 
         outs = {}

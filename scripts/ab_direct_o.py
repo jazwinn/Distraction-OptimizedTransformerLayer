@@ -20,9 +20,9 @@ head_dims whose shared memory does not shrink gain nothing, and head_dim 256,
 whose block count goes from one to two, nearly doubles. So the occupancy
 section prints what the driver says each layout is worth before any timing.
 
-Sampling is symmetric -- two timings per side per round. Timing one side twice
-and the other once and taking min of each compares min-of-2 against min-of-1
-and biases the ratio by about 2.5%; see csrc/TUNING.md.
+Sampling AND ordering are symmetric, via ab_common.balanced_order. Two timings
+a side is not enough on its own: if the sides always occupy the same slots and
+the later slots are faster, the bias survives. See csrc/TUNING.md.
 
     python scripts/ab_direct_o.py
     python scripts/ab_direct_o.py --self-control
@@ -37,6 +37,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from ab_common import balanced_order  # noqa: E402
 
 import kernel_ext  # noqa: E402
 
@@ -173,18 +175,14 @@ def op_section(K, args, self_control):
         best_off = math.inf
         best_on = math.inf
         ctrl = math.inf
-        for _ in range(args.rounds):
-            K.wmma_set_direct_o(False)
-            a = graph_timed(run, args.iters)
-            K.wmma_set_direct_o(not self_control)
-            f = graph_timed(run, args.iters)
-            K.wmma_set_direct_o(False)
-            c = graph_timed(run, args.iters)
-            K.wmma_set_direct_o(not self_control)
-            d = graph_timed(run, args.iters)
-            best_off = min(best_off, a, c)
-            best_on = min(best_on, f, d)
-            ctrl = min(ctrl, abs(a / c - 1.0))
+        for rnd in range(args.rounds):
+            t = {False: [], True: []}
+            for on in balanced_order((False, True), rnd):
+                K.wmma_set_direct_o(on and not self_control)
+                t[on].append(graph_timed(run, args.iters))
+            best_off = min([best_off] + t[False])
+            best_on = min([best_on] + t[True])
+            ctrl = min(ctrl, abs(t[False][0] / t[False][1] - 1.0))
         K.wmma_set_direct_o(True)
 
         r = best_off / best_on
@@ -272,14 +270,13 @@ def model_section(K, args):
 
         best = {False: math.inf, True: math.inf}
         ctrl = math.inf
-        for _ in range(args.rounds):
-            a = run(False, args.iters)
-            f = run(True, args.iters)
-            c = run(False, args.iters)
-            dd = run(True, args.iters)
-            best[False] = min(best[False], a, c)
-            best[True] = min(best[True], f, dd)
-            ctrl = min(ctrl, abs(a / c - 1.0))
+        for rnd in range(args.rounds):
+            t = {False: [], True: []}
+            for on in balanced_order((False, True), rnd):
+                t[on].append(run(on, args.iters))
+            best[False] = min([best[False]] + t[False])
+            best[True] = min([best[True]] + t[True])
+            ctrl = min(ctrl, abs(t[False][0] / t[False][1] - 1.0))
 
         outs = {}
         for on in (False, True):

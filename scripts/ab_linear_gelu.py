@@ -40,6 +40,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from ab_common import balanced_order  # noqa: E402
+
 import kernel_ext  # noqa: E402,F401
 
 import torch  # noqa: E402
@@ -142,16 +144,17 @@ def main() -> int:
 
         best = {name: math.inf for name in SETTINGS}
         best_ctrl = math.inf
-        for _ in range(args.rounds):
-            # Round-robin, with "off" timed at both ends. The two off timings
-            # are identical code, so their ratio is this machine's noise floor.
-            first_off = time_ms(models["off"], x, m, args.iters, "off")
-            for name in SETTINGS[1:]:
-                best[name] = min(best[name],
-                                 time_ms(models[name], x, m, args.iters, name))
-            second_off = time_ms(models["off"], x, m, args.iters, "off")
-            best["off"] = min(best["off"], first_off, second_off)
-            best_ctrl = min(best_ctrl, abs(first_off / second_off - 1.0))
+        for rnd in range(args.rounds):
+            # Every setting timed twice, positions symmetric about the middle
+            # of the round, lead alternating. "off" at both ends with the rest
+            # once between them was min-of-2 against min-of-1, and put every
+            # candidate in the faster middle slots. See ab_common.
+            t = {name: [] for name in SETTINGS}
+            for name in balanced_order(SETTINGS, rnd):
+                t[name].append(time_ms(models[name], x, m, args.iters, name))
+            for name in SETTINGS:
+                best[name] = min([best[name]] + t[name])
+            best_ctrl = min(best_ctrl, abs(t["off"][0] / t["off"][1] - 1.0))
         worst_ctrl = max(worst_ctrl, best_ctrl)
 
         outs = {}

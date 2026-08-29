@@ -403,6 +403,52 @@ against a forced wmma, two process pairs: **1.361x / 1.345x** against
 **1.306x / 1.310x**. Accuracy improves alongside — `max_abs` 1.21e-3 against
 1.35e-3.
 
+## Two ways an interleaved A/B lies
+
+Both of the following were found in this project's own scripts, both look
+exactly like a small real speedup, and neither is noise. Both were caught only
+by a **self-control** -- the same code timed against itself, where the true
+ratio is 1.000x by construction. `scripts/ab_common.py` now holds the fix and
+every `ab_*.py` uses it.
+
+### 1. Asymmetric sampling: ~2.5%
+
+Timing one arm twice per round and the other once, then taking min of each,
+compares min-of-2 against min-of-1. Found during the split-KV work: rows whose
+two sides were *identical code* read a geometric mean of **0.975x**.
+
+### 2. Asymmetric ordering: up to 11.5%
+
+Fixing the first left rounds looking like `off, on, off, on` -- which hands the
+off arm slots 1 and 3 and the on arm slots 2 and 4, every round, forever. The
+later slots are systematically faster here (graph-pool warm-up), so the on arm
+got a free head start. On a self-control that must read 1.000x:
+
+| | before | after |
+|:--|--:|--:|
+| S32 hd32 B64 H4 | **1.115x** | 0.997x |
+| seq <= 128 group | 1.012x | 0.999x |
+| seq >= 512 group | 1.000x | 0.999x |
+
+**Symmetric sampling does not imply symmetric ordering**, and the first fix
+made the second bias easier to miss by making the rounds look balanced. The fix
+is `ab_common.balanced_order`: every arm timed the same number of times, slot
+pattern symmetric about the middle of the round, and the lead alternating
+between rounds so no arm keeps the good slots. For two arms that is
+`off on on off` then `on off off on`.
+
+Note the size: 1.2% on short shapes, ~0 on long ones. It does not touch results
+like the direct-O epilogue's 1.25x or 1.91x, and those shapes were long enough
+that their self-control read 0.999x anyway. It does mean **any result inside
+about 1.5% on a short shape was unreadable** before the fix -- direct-O's
+head_dim 32 row, reported as 1.008x, should be read as no measurable effect,
+which was the conclusion drawn there for an independent reason.
+
+**Run `--self-control` before trusting any A/B under ~1.1x, and read the
+per-row control column rather than the geomean.** A self-control that does not
+read 1.000x is a harness bug, not a small win. The cross-process ablation in
+"The measurement trap" above is the third member of this family.
+
 ## O straight to global: 1.13x on the op, and a fourth resident block
 
 The epilogue used to put O in shared memory before writing it out: one

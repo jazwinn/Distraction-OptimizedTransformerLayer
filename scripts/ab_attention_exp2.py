@@ -29,6 +29,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from ab_common import balanced_order  # noqa: E402
+
 import kernel_ext  # noqa: E402
 
 import torch  # noqa: E402
@@ -154,19 +156,20 @@ def main() -> int:
 
         best = {0: math.inf, 1: math.inf, 2: math.inf}
         ctrl = math.inf
-        for _ in range(args.rounds):
-            # mode 0 at both ends of the round; identical code, so their ratio
-            # is this machine's noise and nothing else.
-            timed = {}
-            for m in (0, 1, 2):
+        for rnd in range(args.rounds):
+            # Every mode timed twice, positions symmetric about the middle of
+            # the round, and the lead alternating between rounds. The old form
+            # timed mode 0 at both ends and the others once, which is min-of-2
+            # against min-of-1 AND gives the others the middle slots -- two
+            # biases pointing opposite ways. ab_common.balanced_order has the
+            # measurements.
+            t = {0: [], 1: [], 2: []}
+            for m in balanced_order((0, 1, 2), rnd):
                 setmode(m)
-                timed[m] = graph_timed(run, args.iters)
-            setmode(0)
-            c = graph_timed(run, args.iters)
-            best[0] = min(best[0], timed[0], c)
-            best[1] = min(best[1], timed[1])
-            best[2] = min(best[2], timed[2])
-            ctrl = min(ctrl, abs(timed[0] / c - 1.0))
+                t[m].append(graph_timed(run, args.iters))
+            for m in (0, 1, 2):
+                best[m] = min([best[m]] + t[m])
+            ctrl = min(ctrl, abs(t[0][0] / t[0][1] - 1.0))
         K.wmma_set_softmax_mode(1)
         worst_ctrl = max(worst_ctrl, ctrl)
 
@@ -261,13 +264,13 @@ def model_section(K, args):
 
         best = {0: math.inf, 1: math.inf}
         ctrl = math.inf
-        for _ in range(args.rounds):
-            a = run(0, args.iters)
-            f = run(1, args.iters)
-            c = run(0, args.iters)
-            best[0] = min(best[0], a, c)
-            best[1] = min(best[1], f)
-            ctrl = min(ctrl, abs(a / c - 1.0))
+        for rnd in range(args.rounds):
+            t = {0: [], 1: []}
+            for m in balanced_order((0, 1), rnd):
+                t[m].append(run(m, args.iters))
+            for m in (0, 1):
+                best[m] = min([best[m]] + t[m])
+            ctrl = min(ctrl, abs(t[0][0] / t[0][1] - 1.0))
         worst_ctrl = max(worst_ctrl, ctrl)
 
         outs = {}

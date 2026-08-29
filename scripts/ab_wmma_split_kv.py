@@ -32,6 +32,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from ab_common import balanced_order  # noqa: E402
+
 import kernel_ext  # noqa: E402
 
 import torch  # noqa: E402
@@ -175,18 +177,17 @@ def ab_section(K, args, self_control=False):
         # the change by ~2.5%, which is enough to sink a 1.03x. Measured: with
         # the asymmetric form the DECLINED rows, which are identical code both
         # sides, read a geometric mean of 0.975x instead of 1.000x.
-        for _ in range(args.rounds):
-            K.wmma_set_split_kv(False)
-            a = graph_timed(run, args.iters)
-            K.wmma_set_split_kv(not self_control)
-            f = graph_timed(run, args.iters)
-            K.wmma_set_split_kv(False)
-            c = graph_timed(run, args.iters)
-            K.wmma_set_split_kv(not self_control)
-            d = graph_timed(run, args.iters)
-            best_off = min(best_off, a, c)
-            best_on = min(best_on, f, d)
-            ctrl = min(ctrl, abs(a / c - 1.0))
+        # ... and symmetric ORDERING, which the fix above did not give it:
+        # off,on,off,on hands one side slots 1 and 3 every round, and the later
+        # slots are faster. See ab_common.balanced_order.
+        for rnd in range(args.rounds):
+            t = {False: [], True: []}
+            for on in balanced_order((False, True), rnd):
+                K.wmma_set_split_kv(on and not self_control)
+                t[on].append(graph_timed(run, args.iters))
+            best_off = min([best_off] + t[False])
+            best_on = min([best_on] + t[True])
+            ctrl = min(ctrl, abs(t[False][0] / t[False][1] - 1.0))
         K.wmma_set_split_kv(True)
 
         r = best_off / best_on
@@ -275,14 +276,13 @@ def model_section(K, args):
         # Two samples each, for the reason in ab_section: the declined rows are
         # identical code and must read 1.000x, and under asymmetric sampling
         # they read 0.975x.
-        for _ in range(args.rounds):
-            a = run(False, args.iters)
-            f = run(True, args.iters)
-            c = run(False, args.iters)
-            d = run(True, args.iters)
-            best[False] = min(best[False], a, c)
-            best[True] = min(best[True], f, d)
-            ctrl = min(ctrl, abs(a / c - 1.0))
+        for rnd in range(args.rounds):
+            t = {False: [], True: []}
+            for on in balanced_order((False, True), rnd):
+                t[on].append(run(on, args.iters))
+            best[False] = min([best[False]] + t[False])
+            best[True] = min([best[True]] + t[True])
+            ctrl = min(ctrl, abs(t[False][0] / t[False][1] - 1.0))
 
         outs = {}
         for on in (False, True):

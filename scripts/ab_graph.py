@@ -57,6 +57,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from ab_common import balanced_order  # noqa: E402
+
 # Above torch on purpose: importing kernel_ext preloads the driver's GPU
 # compiler, which stops a cuTile run from exiting 0xC0000005 only if it happens
 # before torch pulls the NVIDIA DLLs in. See kernel_ext.preload_tile_compiler().
@@ -212,22 +214,22 @@ def measure(shape, rounds, iters):
 
     best_eager = best_graph = math.inf
     best_ctrl_a = best_ctrl_b = math.inf
-    for _ in range(rounds):
-        # Round-robin, so a thermal or clock drift over the run hits both sides
-        # equally rather than whichever went first. The second eager timing is
-        # the control: identical code to the first, so its ratio against the
-        # first is this machine's noise floor and nothing else.
-        config.CUDA_GRAPH = "off"
-        e1 = time_ms(eager_model, x, m, iters)
-        config.CUDA_GRAPH = "always"
-        gt = time_ms(graph_model, x, m, iters)
-        config.CUDA_GRAPH = "off"
-        e2 = time_ms(eager_model, x, m, iters)
+    for rnd in range(rounds):
+        # Both sides timed twice, positions symmetric about the middle of the
+        # round, lead alternating. Eager at both ends with the graph between
+        # them compared min-of-2 against min-of-1 AND handed the graph the
+        # faster middle slot -- and only e1 fed best_eager, so the eager side
+        # was scored on its slowest slot. See ab_common.balanced_order.
+        t = {"eager": [], "graph": []}
+        for side in balanced_order(("eager", "graph"), rnd):
+            config.CUDA_GRAPH = "off" if side == "eager" else "always"
+            model = eager_model if side == "eager" else graph_model
+            t[side].append(time_ms(model, x, m, iters))
 
-        best_eager = min(best_eager, e1)
-        best_graph = min(best_graph, gt)
-        best_ctrl_a = min(best_ctrl_a, e1)
-        best_ctrl_b = min(best_ctrl_b, e2)
+        best_eager = min([best_eager] + t["eager"])
+        best_graph = min([best_graph] + t["graph"])
+        best_ctrl_a = min(best_ctrl_a, t["eager"][0])
+        best_ctrl_b = min(best_ctrl_b, t["eager"][1])
 
     for r in graph_model._graphs.values():
         r.release()

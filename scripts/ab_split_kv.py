@@ -34,6 +34,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from ab_common import balanced_order  # noqa: E402
+
 # Above torch on purpose: importing kernel_ext preloads the driver's GPU
 # compiler, which stops a cuTile run from exiting 0xC0000005 only if it happens
 # before torch pulls the NVIDIA DLLs in. See kernel_ext.preload_tile_compiler().
@@ -173,8 +175,11 @@ def main() -> int:
 
     for r in range(args.rounds):
         for w in work:
-            w["best_off"] = min(w["best_off"], time_once(w["off"]))
-            w["best_on"] = min(w["best_on"], time_once(w["on"]))
+            # off then on every round would hand "on" the later slot each time,
+            # and the later slot is faster. See ab_common.balanced_order.
+            for side in balanced_order(("off", "on"), r):
+                key = "best_" + side
+                w[key] = min(w[key], time_once(w[side]))
         print(f"  round {r + 1}/{args.rounds} done", file=sys.stderr)
 
     row = "{:<26} {:>10} {:>7} {:>10} {:>10} {:>8}"

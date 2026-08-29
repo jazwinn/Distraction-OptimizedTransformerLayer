@@ -42,6 +42,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from ab_common import balanced_order  # noqa: E402
+
 import kernel_ext  # noqa: E402
 
 import torch  # noqa: E402
@@ -195,18 +197,23 @@ def main() -> int:
         x, sub, w, b = make(nrows, D, dev)
         eb = timed(lambda: both(x, sub, w, b, 0), args.iters)
         ew = timed(lambda: both(x, sub, w, b, 256), args.iters)
-        K.layernorm_set_warp_width(0)
-        gb = graph_timed(lambda: K.fused_add_layernorm(x, sub, w, b, 1e-5),
-                         args.iters)
-        K.layernorm_set_warp_width(256)
-        gw = graph_timed(lambda: K.fused_add_layernorm(x, sub, w, b, 1e-5),
-                         args.iters)
+        # Both widths timed twice, in both orders: block-first only would
+        # give the warp kernel the later and faster slot every time. See
+        # ab_common.balanced_order.
+        g = {0: [], 256: []}
+        for width in balanced_order((0, 256), 0):
+            K.layernorm_set_warp_width(width)
+            g[width].append(
+                graph_timed(lambda: K.fused_add_layernorm(x, sub, w, b, 1e-5),
+                            args.iters))
         K.layernorm_set_warp_width(-1)
+        gb = min(t for t in g[0] if t) if all(g[0]) else None
+        gw = min(t for t in g[256] if t) if all(g[256]) else None
         used = "warp" if D <= K.layernorm_warp_width() else "block"
-        g = f"{gb / gw:.3f}x" if gb and gw else "-"
+        ratio = f"{gb / gw:.3f}x" if gb and gw else "-"
         rows_out.append((nrows, D, eb, ew, gb, gw, used))
         print(f"  {nrows:6d} {D:5d} {eb:8.2f} {ew:8.2f} {eb/ew:6.3f}x "
-              f"{gb:8.2f} {gw:8.2f} {g:>7}  {used}")
+              f"{gb:8.2f} {gw:8.2f} {ratio:>7}  {used}")
 
     print("\n  geometric mean over shapes the default routes to the warp "
           "kernel:")
