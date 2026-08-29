@@ -157,10 +157,12 @@
         <section class="card" id="run-results-card" hidden>
           <div class="card-head">
             <h2>Result</h2>
+            <button class="btn btn-sm" data-view="run-results" aria-haspopup="dialog" aria-expanded="false" title="Filter and sort this table">Filter &amp; sort</button>
             <button class="btn btn-sm" data-csv="run-results">copy CSV</button>
           </div>
           <div class="card-body" id="run-summary"></div>
-          <div class="card-body scroll-x" style="padding:0"><table class="data" id="run-results"></table></div>
+          <div class="card-body scroll-x" style="padding:0"><div class="table-note" id="run-results-note" hidden></div>
+          <table class="data" id="run-results"></table></div>
         </section>
 
         <section class="card">
@@ -180,14 +182,41 @@
           <div class="card-head">
             <h2>Shape</h2>
             <span class="sub">shared by both sides, so the comparison is like for like</span>
-            <select id="cmp-preset" class="btn btn-sm" style="height:26px">
-              <option value="">load preset&hellip;</option>
-            </select>
+            <div class="seg-toggle" role="group" aria-label="Shape source" id="cmp-shape-mode">
+              <button data-shape-mode="single" aria-pressed="true">One shape</button>
+              <button data-shape-mode="many" aria-pressed="false">Many shapes</button>
+            </div>
           </div>
-          <div class="card-body">
+
+          <div class="card-body" data-shape-pane="single">
+            <div class="btn-row" style="margin-bottom:12px">
+              <select id="cmp-preset" class="btn btn-sm" style="height:26px">
+                <option value="">load preset&hellip;</option>
+              </select>
+            </div>
             <div class="fields is-tight" id="cmp-shape"></div>
             <div class="derived" id="cmp-derived"></div>
-            <div class="fields" id="cmp-timing" style="margin-top:14px"></div>
+          </div>
+
+          <div data-shape-pane="many" hidden>
+            <div class="card-body" style="padding-bottom:12px">
+              <p class="prose">Both configs are run on every shape you tick, one
+                shape at a time. A and B for a shape run back to back, so clock
+                and temperature drift moves both sides together instead of
+                landing on whichever was queued later. Edit
+                <code id="cmp-presets-path">presets.json</code> in the Presets
+                view to change this list.</p>
+              <div class="btn-row" style="margin-top:10px">
+                <button class="btn btn-sm" id="cmp-all">all</button>
+                <button class="btn btn-sm" id="cmp-none">none</button>
+              </div>
+            </div>
+            <div class="picklist" id="cmp-shapes"></div>
+            <div class="listfoot"><span id="cmp-count"></span></div>
+          </div>
+
+          <div class="card-body" style="border-top:1px solid var(--line)">
+            <div class="fields" id="cmp-timing"></div>
           </div>
         </section>
 
@@ -202,7 +231,7 @@
               <summary>Kernel switches</summary>
               <div class="disclosure-body"><div class="fields" id="cmp-a-env"></div></div>
             </details>
-            <div class="card-body"><pre class="command is-compact" id="cmp-a-command">&nbsp;</pre></div>
+            <div class="card-body"><pre class="command is-compact" id="cmp-a-command">&nbsp;</pre><div class="note" id="cmp-a-preview-note" hidden></div></div>
           </section>
 
           <section class="card">
@@ -212,7 +241,7 @@
               <summary>Kernel switches</summary>
               <div class="disclosure-body"><div class="fields" id="cmp-b-env"></div></div>
             </details>
-            <div class="card-body"><pre class="command is-compact" id="cmp-b-command">&nbsp;</pre></div>
+            <div class="card-body"><pre class="command is-compact" id="cmp-b-command">&nbsp;</pre><div class="note" id="cmp-b-preview-note" hidden></div></div>
           </section>
         </div>
 
@@ -220,18 +249,22 @@
           <div class="card-body">
             <div class="issues" id="cmp-issues" style="margin-bottom:12px"></div>
             <label class="checkline"><input type="checkbox" id="cmp-control" checked>
-              Run a control &mdash; config A a second time</label>
+              <span>Run a control &mdash; config A a second time<span
+                id="cmp-control-scope"></span></span></label>
             <p class="prose" style="margin-top:8px">A and B are timed in separate
               processes, so the gap between them carries run-to-run noise. The
               control's A/A ratio has a true value of <strong>1.000x</strong>, so
               whatever it comes back as is the bar an A-vs-B difference has to clear
               before it means anything. Every A/B script in <code>scripts/</code>
               prints the same column, and <code>csrc/TUNING.md</code> puts the floor
-              near 4.3%.</p>
+              near 4.3%. Across many shapes it runs once per shape, because the
+              floor belongs to the shape &mdash; a 32-token sequence is far noisier
+              than a long one.</p>
             <div class="btn-row" style="margin-top:14px">
               <button class="btn btn-primary" id="cmp-go">Run comparison</button>
               <button class="btn btn-danger" id="cmp-stop" disabled>Stop</button>
               <span class="status-line" id="cmp-job-status">no job yet</span>
+              <span class="status-line" id="cmp-run-count" style="margin-left:auto"></span>
             </div>
           </div>
         </section>
@@ -239,10 +272,12 @@
         <section class="card" id="cmp-results-card" hidden>
           <div class="card-head">
             <h2>Result</h2>
+            <button class="btn btn-sm" data-view="cmp-results" aria-haspopup="dialog" aria-expanded="false" title="Filter and sort this table">Filter &amp; sort</button>
             <button class="btn btn-sm" data-csv="cmp-results">copy CSV</button>
           </div>
           <div class="card-body" id="cmp-summary"></div>
-          <div class="card-body scroll-x" style="padding:0"><table class="data" id="cmp-results"></table></div>
+          <div class="card-body scroll-x" style="padding:0"><div class="table-note" id="cmp-results-note" hidden></div>
+          <table class="data" id="cmp-results"></table></div>
         </section>
 
         <section class="card">
@@ -306,10 +341,12 @@
         <section class="card" id="sweep-results-card" hidden>
           <div class="card-head">
             <h2>Results</h2>
+            <button class="btn btn-sm" data-view="sweep-results" aria-haspopup="dialog" aria-expanded="false" title="Filter and sort this table">Filter &amp; sort</button>
             <button class="btn btn-sm" data-csv="sweep-results">copy CSV</button>
           </div>
           <div class="card-body" id="sweep-summary"></div>
-          <div class="card-body scroll-x" style="padding:0"><table class="data" id="sweep-results"></table></div>
+          <div class="card-body scroll-x" style="padding:0"><div class="table-note" id="sweep-results-note" hidden></div>
+          <table class="data" id="sweep-results"></table></div>
         </section>
 
         <section class="card">
@@ -400,16 +437,68 @@
       <section class="card">
         <div class="card-head">
           <h2>Finished jobs</h2>
+          <button class="btn btn-sm" data-view="history-table" aria-haspopup="dialog" aria-expanded="false" title="Filter and sort this table">Filter &amp; sort</button>
           <button class="btn btn-sm" id="history-refresh">refresh</button>
         </div>
         <div class="card-body" style="padding-bottom:12px">
           <p class="prose">Newest first, from <code>dashboard/runs/history.jsonl</code>.
             Full logs sit beside it as <code>&lt;job&gt;.log</code>.</p>
         </div>
-        <div class="card-body scroll-x" style="padding:0"><table class="data" id="history-table"></table></div>
+        <div class="card-body scroll-x" style="padding:0"><div class="table-note" id="history-table-note" hidden></div>
+          <table class="data" id="history-table"></table></div>
       </section>
     </section>
 
+  </div>
+</div>
+
+<div class="popover" id="view-menu" role="dialog" aria-label="Filter and sort" hidden>
+  <h3>Sort</h3>
+  <div class="pop-row">
+    <label for="vm-sort">by</label>
+    <select id="vm-sort"></select>
+  </div>
+  <div class="pop-row">
+    <label>order</label>
+    <div class="seg" role="group" aria-label="Sort direction">
+      <button type="button" data-dir="asc" aria-pressed="false">Ascending</button>
+      <button type="button" data-dir="desc" aria-pressed="true">Descending</button>
+    </div>
+  </div>
+
+  <h3>Filter</h3>
+  <div class="pop-row">
+    <label for="vm-text">name</label>
+    <input type="text" id="vm-text" placeholder="contains&hellip;">
+  </div>
+  <div class="pop-row" id="vm-accuracy-row">
+    <label>accuracy</label>
+    <div class="seg" role="group" aria-label="Accuracy">
+      <button type="button" data-accuracy="" aria-pressed="true">Any</button>
+      <button type="button" data-accuracy="pass" aria-pressed="false">Pass</button>
+      <button type="button" data-accuracy="fail" aria-pressed="false">Fail</button>
+    </div>
+  </div>
+  <div class="pop-row" id="vm-state-row">
+    <label for="vm-state">state</label>
+    <select id="vm-state"></select>
+  </div>
+  <div class="pop-row">
+    <label for="vm-num">where</label>
+    <select id="vm-num"></select>
+  </div>
+  <div class="pop-row">
+    <label for="vm-op">is</label>
+    <select id="vm-op">
+      <option value="ge">&ge;</option>
+      <option value="le">&le;</option>
+    </select>
+    <input type="number" id="vm-value" step="any" placeholder="value">
+  </div>
+
+  <div class="pop-foot">
+    <button class="btn btn-sm" id="vm-reset">Reset</button>
+    <span class="pop-count" id="vm-count"></span>
   </div>
 </div>
 

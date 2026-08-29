@@ -369,34 +369,99 @@ def build_job(payload: Dict[str, Any]) -> Tuple[Optional[Job], List[Dict[str, st
         form_b = form_of("form_b")
         if form_a is None or form_b is None:
             return None, bad_shape
-        issues = ([dict(issue, message=f"A: {issue['message']}")
-                   for issue in _blocking_issues(form_a)]
-                  + [dict(issue, message=f"B: {issue['message']}")
-                     for issue in _blocking_issues(form_b)])
-        if any(issue["level"] == "error" for issue in issues):
-            return None, issues
+        shapes = payload.get("shapes") or []
+        if not isinstance(shapes, list):
+            return None, bad_shape
+        want_control = bool(payload.get("control"))
 
         label_a = f"A: {_impl_label(form_a)}"
         label_b = f"B: {_impl_label(form_b)}"
-        steps = [
-            Step(spec=runspec.for_harness(form_a, label_a), label=label_a),
-            Step(spec=runspec.for_harness(form_b, label_b), label=label_b),
-        ]
-        steps[0].meta = {"role": "A", "config": _impl_label(form_a),
-                         "shape": _shape_label(form_a)}
-        steps[1].meta = {"role": "B", "config": _impl_label(form_b),
-                         "shape": _shape_label(form_b)}
-        if payload.get("control"):
-            # A third run of config A. Its ratio against the first A is the
-            # noise floor for this machine right now -- the same control column
-            # every A/B script in scripts/ prints. An A-vs-B difference smaller
-            # than this one is not a result.
-            control = Step(spec=runspec.for_harness(form_a, "control: A again"),
-                           label="control: A again")
-            control.meta = {"role": "control", "config": _impl_label(form_a),
-                            "shape": _shape_label(form_a)}
-            steps.append(control)
-        return Job("compare", steps, title=f"{label_a} vs {label_b}"), issues
+
+        def sided(form: Dict[str, Any], side: str) -> List[Dict[str, str]]:
+            return [dict(issue, message=f"{side}: {issue['message']}")
+                    for issue in _blocking_issues(form)]
+
+        def pair(merged_a: Dict[str, Any], merged_b: Dict[str, Any],
+                 name: str) -> List[Step]:
+            """The runs for one shape, in the order they execute.
+
+            A, then B, then the control -- adjacent in time on purpose. Clocks
+            and temperature drift over a long job; running the pair back to back
+            moves both sides together instead of landing the drift on whichever
+            config happened to be queued later.
+            """
+            made: List[Step] = []
+            for role, form, fallback in (("A", merged_a, label_a),
+                                         ("B", merged_b, label_b)):
+                text = f"{name} · {role}" if name else fallback
+                step = Step(spec=runspec.for_harness(form, text), label=text)
+                step.meta = {"role": role, "config": _impl_label(form),
+                             "shape": _shape_label(form), "preset": name}
+                made.append(step)
+            if want_control:
+                # A second run of config A. Its ratio against the first A is the
+                # noise floor for this machine right now -- the same control
+                # column every A/B script in scripts/ prints. An A-vs-B
+                # difference smaller than this one is not a result.
+                #
+                # It runs per shape because the floor is a property of the shape:
+                # a 32-token sequence is far noisier than a long one, so a floor
+                # borrowed from another row would make this row's verdict
+                # over-confident.
+                text = f"{name} · control" if name else "control: A again"
+                step = Step(spec=runspec.for_harness(merged_a, text), label=text)
+                step.meta = {"role": "control", "config": _impl_label(merged_a),
+                             "shape": _shape_label(merged_a), "preset": name}
+                made.append(step)
+            return made
+
+        if not shapes:
+            issues = sided(form_a, "A") + sided(form_b, "B")
+            if any(issue["level"] == "error" for issue in issues):
+                return None, issues
+            return (Job("compare", pair(form_a, form_b, ""),
+                        title=f"{label_a} vs {label_b}"), issues)
+
+        per_shape = 3 if want_control else 2
+        if len(shapes) * per_shape > 96:
+            return None, [{"level": "error",
+                           "message": f"{len(shapes)} shapes at {per_shape} runs "
+                                      f"each is {len(shapes) * per_shape} runs, "
+                                      f"more than the 96 this will queue at once"}]
+
+        steps = []
+        issues = []
+        kept = 0
+        for shape in shapes:
+            if not isinstance(shape, dict):
+                continue
+            merged_a = dict(form_a)
+            merged_b = dict(form_b)
+            for key in presets.SHAPE_KEYS:
+                if key in shape:
+                    merged_a[key] = shape[key]
+                    merged_b[key] = shape[key]
+            name = shape.get("name") or _shape_label(merged_a)
+            found = sided(merged_a, "A") + sided(merged_b, "B")
+            if any(issue["level"] == "error" for issue in found):
+                # Skip the whole shape, not the offending half: a pair with one
+                # side missing is not a comparison. And skip rather than fail --
+                # one uncovered head_dim should not cost the other thirteen rows.
+                issues.extend(dict(issue, message=f"{name}: {issue['message']}")
+                              for issue in found
+                              if issue["level"] == "error")
+                continue
+            issues.extend(dict(issue, message=f"{name}: {issue['message']}")
+                          for issue in found)
+            steps.extend(pair(merged_a, merged_b, name))
+            kept += 1
+
+        if not steps:
+            issues.append({"level": "error",
+                           "message": "every selected shape was rejected"})
+            return None, issues
+        return (Job("compare", steps,
+                    title=f"{label_a} vs {label_b} · {kept} shapes"), issues)
 
     if mode == "sweep":
         form = form_of("form")

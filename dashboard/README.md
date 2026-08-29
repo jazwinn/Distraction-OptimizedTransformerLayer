@@ -49,12 +49,31 @@ both report numbers that mean nothing.
 Optimizations panel covering `--attn-backend`, `--attn-impl`, `--attn-fp16`,
 `--linear-gelu` and `--cuda-graph`.
 
-**Compare** — two configurations against a shared shape, run one after the
-other. Leave *Run a control* ticked: it runs config A a second time, and the A/A
-ratio it reports is the noise floor for your machine at that moment. Its true
-value is 1.000x, so whatever it comes back as is the bar an A-vs-B difference
-has to clear before it means anything. This is the same control column every
-A/B script in `scripts/` prints, and `csrc/TUNING.md` puts the floor near 4.3%.
+**Compare** — two configurations against the same shape or shapes, run one after
+the other. The toggle in the Shape card picks between *One shape*, which is the
+typed shape fields, and *Many shapes*, which is the same tickable preset list
+Sweep uses. Results pivot: a row is a shape, and each config gets its own column
+group — median, speedup and accuracy for A beside the same three for B, then the
+A-vs-B ratio and the verdict.
+
+Leave *Run a control* ticked: it runs config A a second time, and the A/A ratio
+it reports is the noise floor for your machine at that moment. Its true value is
+1.000x, so whatever it comes back as is the bar an A-vs-B difference has to clear
+before it means anything. This is the same control column every A/B script in
+`scripts/` prints, and `csrc/TUNING.md` puts the floor near 4.3%.
+
+Across many shapes the control runs **once per shape**, because the floor
+belongs to the shape rather than the machine — a 32-token sequence is far noisier
+than a long one, and a floor borrowed from a large shape would make the small
+rows look conclusive when they are not. That makes the arithmetic three runs per
+shape rather than two; the count beside the Run button says what is about to be
+queued, and 96 runs is the cap.
+
+Runs are ordered A, B, control for one shape before moving to the next, so the
+pair being compared is timed within seconds of itself. If a shape is impossible
+for either side — an `--attn-impl` that does not cover its head_dim, say — the
+whole shape is skipped with the reason shown, and the rest of the selection still
+runs. Half a pair is not a comparison.
 
 **Sweep** — one configuration across many shapes, one child process per shape,
 rows filling in as each finishes.

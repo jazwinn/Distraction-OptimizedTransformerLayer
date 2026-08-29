@@ -76,11 +76,15 @@ const state = {
   forms: { run: {}, cmpShape: {}, cmpA: {}, cmpB: {}, sweep: {}, script: {} },
   jobs: { run: null, compare: null, sweep: null, script: null },
   polls: {},
+  // Each view's Run/Stop pair, so the queue poll can put them back if a job's
+  // own polling ever stops reporting. See reconcileControls().
+  uis: {},
   selectedScript: null,
 };
 
-// Filled in by setupSweep so a preset save can rebuild the shape list.
-let rebuildShapeList = null;
+// Every shape list that exists, so saving a preset rebuilds all of them. A list
+// still offering a shape that has been deleted from the file would queue it.
+const shapeLists = [];
 
 /* ------------------------------------------------------------------- api -- */
 
@@ -375,6 +379,8 @@ function rowFromStep(step) {
   return {
     label: step.label,
     role: (step.meta && step.meta.role) || '',
+    preset: (step.meta && step.meta.preset) || '',
+    shape: (step.meta && step.meta.shape) || '',
     status: step.status,
     exitCode: step.exit_code,
     accuracy: result.accuracy_passed === null || result.accuracy_passed === undefined
@@ -399,20 +405,22 @@ function rowFromStep(step) {
   };
 }
 
+/* `type` drives both sorting and what the filter offers: "num" columns get the
+ * numeric predicate, everything else sorts as text. */
 const COLUMNS = [
-  { key: 'label', title: 'run', left: true },
-  { key: 'status', title: 'state' },
-  { key: 'accuracy', title: 'accuracy' },
-  { key: 'maxAbs', title: 'max_abs' },
-  { key: 'maxRel', title: 'max_rel' },
-  { key: 'failed', title: 'failed' },
-  { key: 'baseline', title: 'baseline ms' },
-  { key: 'optimized', title: 'optimized ms' },
-  { key: 'p90', title: 'p90 ms' },
-  { key: 'min', title: 'min ms' },
-  { key: 'speedup', title: 'speedup' },
-  { key: 'throughput', title: 'token/s' },
-  { key: 'secs', title: 'took' },
+  { key: 'label', title: 'run', left: true, type: 'text' },
+  { key: 'status', title: 'state', type: 'text' },
+  { key: 'accuracy', title: 'accuracy', type: 'text' },
+  { key: 'maxAbs', title: 'max_abs', type: 'num' },
+  { key: 'maxRel', title: 'max_rel', type: 'num' },
+  { key: 'failed', title: 'failed', type: 'text' },
+  { key: 'baseline', title: 'baseline ms', type: 'num' },
+  { key: 'optimized', title: 'optimized ms', type: 'num' },
+  { key: 'p90', title: 'p90 ms', type: 'num' },
+  { key: 'min', title: 'min ms', type: 'num' },
+  { key: 'speedup', title: 'speedup', type: 'num' },
+  { key: 'throughput', title: 'token/s', type: 'num' },
+  { key: 'secs', title: 'took', type: 'num' },
 ];
 
 function fillCell(cell, key, row) {
@@ -507,32 +515,421 @@ function fillCell(cell, key, row) {
   }
 }
 
-function renderTable(table, rows, extraColumns) {
-  const columns = COLUMNS.concat(extraColumns || []);
+/* Per-table view state: the rows as they arrived, plus how this table is being
+ * looked at. Kept so a filter can be re-applied without another fetch, and so a
+ * running job's poll does not reset the sort under the reader's cursor. */
+const tableViews = {};
+
+const BLANK_VIEW = () => ({
+  sort: { key: null, dir: 'desc' },
+  text: '', accuracy: '', status: '', numKey: 'speedup', numOp: 'ge', numValue: '',
+});
+
+function viewFor(id) {
+  if (!tableViews[id]) {
+    tableViews[id] = Object.assign({ id, rows: [], columns: [] }, BLANK_VIEW());
+  }
+  return tableViews[id];
+}
+
+function viewIsFiltering(view) {
+  return !!(view.text || view.accuracy || view.status
+    || (view.numValue !== '' && view.numValue !== null));
+}
+
+function activeFilterCount(view) {
+  return [view.text, view.accuracy, view.status,
+    (view.numValue === '' || view.numValue === null) ? '' : 'n'].filter(Boolean).length;
+}
+
+/* The value a column sorts and filters on, which is not always what the cell
+ * prints: "optimized ms" shows a suffix on a streamed row, and the compare
+ * view's "vs A" is computed rather than stored. */
+function cellValue(column, row) {
+  if (column.value) return column.value(row);
+  if (column.key === 'accuracy') {
+    return row.accuracy === null || row.accuracy === undefined
+      ? '' : (row.accuracy ? 'PASS' : 'FAIL');
+  }
+  return row[column.key];
+}
+
+function applyView(view) {
+  const byKey = {};
+  view.columns.forEach((column) => { byKey[column.key] = column; });
+  let rows = view.rows.slice();
+
+  if (view.text) {
+    const needle = view.text.toLowerCase();
+    rows = rows.filter((row) => String(row.label || '').toLowerCase().includes(needle));
+  }
+  if (view.accuracy) {
+    const want = view.accuracy === 'pass';
+    rows = rows.filter((row) => row.accuracy === want);
+  }
+  if (view.status) {
+    rows = rows.filter((row) => row.status === view.status);
+  }
+  if (view.numValue !== '' && view.numValue !== null && byKey[view.numKey]) {
+    const threshold = Number(view.numValue);
+    if (!Number.isNaN(threshold)) {
+      rows = rows.filter((row) => {
+        const value = cellValue(byKey[view.numKey], row);
+        // A row with no value for the column cannot satisfy a numeric test, and
+        // silently keeping it would misreport the filter.
+        if (typeof value !== 'number' || Number.isNaN(value)) return false;
+        return view.numOp === 'ge' ? value >= threshold : value <= threshold;
+      });
+    }
+  }
+
+  const column = byKey[view.sort.key];
+  if (column) {
+    const sign = view.sort.dir === 'asc' ? 1 : -1;
+    rows.sort((a, b) => {
+      const x = cellValue(column, a);
+      const y = cellValue(column, b);
+      const xEmpty = x === null || x === undefined || x === '';
+      const yEmpty = y === null || y === undefined || y === '';
+      // Rows with nothing in the sorted column sink to the bottom either way -
+      // a run with no speedup is not "the smallest speedup".
+      if (xEmpty && yEmpty) return 0;
+      if (xEmpty) return 1;
+      if (yEmpty) return -1;
+      if (typeof x === 'number' && typeof y === 'number') return (x - y) * sign;
+      return String(x).localeCompare(String(y), undefined, { numeric: true }) * sign;
+    });
+  }
+  return rows;
+}
+
+/* `baseColumns` replaces the standard set rather than extending it, for a table
+ * whose rows are not one-run-per-row -- the compare pivot, where a row is a shape
+ * and the run columns appear once per config. Sorting and filtering read
+ * view.columns, so they follow whatever is passed. */
+function renderTable(table, rows, extraColumns, baseColumns) {
+  const view = viewFor(table.id);
+  view.rows = rows;
+  view.columns = (baseColumns || COLUMNS).concat(extraColumns || []);
+  paintTable(view);
+}
+
+function paintTable(view) {
+  const table = $(view.id);
+  if (!table) return;
+  const shown = applyView(view);
   clear(table);
 
-  const head = table.createTHead().insertRow();
-  columns.forEach((column) => head.appendChild(el('th', column.left ? 'left' : null, column.title)));
+  const thead = table.createTHead();
+
+  // A group row above the sortable one, when any column claims a group: one
+  // label per config, spanning that config's columns.
+  const grouped = view.columns.some((column) => column.group);
+  if (grouped) {
+    const groupRow = thead.insertRow();
+    groupRow.className = 'group-head';
+    let index = 0;
+    while (index < view.columns.length) {
+      const group = view.columns[index].group;
+      const th = el('th');
+      if (group) {
+        // Consecutive columns of one config share a single spanning label.
+        let span = 1;
+        while (index + span < view.columns.length
+               && view.columns[index + span].group === group) span += 1;
+        th.textContent = group;
+        th.colSpan = span;
+        th.classList.add('group-start');
+        index += span;
+      } else {
+        // An ungrouped column gets a blank placeholder, one per column, and its
+        // real header in the row below. Spanning it down into that row instead
+        // would consume a slot there too and shift every label sideways.
+        index += 1;
+      }
+      groupRow.appendChild(th);
+    }
+  }
+
+  const head = thead.insertRow();
+  view.columns.forEach((column, index) => {
+    const th = el('th', column.left ? 'left' : null);
+    // The seam between one config's columns and the next.
+    if (grouped && column.group
+        && (index === 0 || view.columns[index - 1].group !== column.group)) {
+      th.classList.add('group-start');
+    }
+    th.appendChild(document.createTextNode(column.title));
+    // Headers double as the sort control: it is the affordance people reach for
+    // before they look for a menu.
+    th.classList.add('sortable');
+    th.tabIndex = 0;
+    th.setAttribute('role', 'button');
+    const sorted = view.sort.key === column.key;
+    if (sorted) {
+      th.classList.add('is-sorted');
+      th.setAttribute('aria-sort', view.sort.dir === 'asc' ? 'ascending' : 'descending');
+    }
+    th.appendChild(el('span', 'sort-caret', sorted && view.sort.dir === 'asc' ? '▲' : '▼'));
+    th.title = 'Sort by ' + column.title;
+    const toggle = () => {
+      if (view.sort.key === column.key) {
+        view.sort.dir = view.sort.dir === 'asc' ? 'desc' : 'asc';
+      } else {
+        view.sort.key = column.key;
+        // Numbers are most useful largest-first; names read A-Z.
+        view.sort.dir = column.type === 'num' ? 'desc' : 'asc';
+      }
+      paintTable(view);
+      if (menuState.id === view.id) syncMenu();
+    };
+    th.addEventListener('click', toggle);
+    th.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggle(); }
+    });
+    head.appendChild(th);
+  });
 
   const body = table.createTBody();
-  rows.forEach((row) => {
+  shown.forEach((row) => {
     const tr = body.insertRow();
     if (row.role === 'control') tr.className = 'is-context';
-    columns.forEach((column) => {
+    view.columns.forEach((column, index) => {
       const cell = tr.insertCell();
       if (column.left) cell.className = 'left';
+      if (grouped && column.group
+          && (index === 0 || view.columns[index - 1].group !== column.group)) {
+        cell.classList.add('group-start');
+      }
       if (column.render) column.render(cell, row);
       else fillCell(cell, column.key, row);
     });
   });
+
+  if (!shown.length && view.rows.length) {
+    const cell = body.insertRow().insertCell();
+    cell.colSpan = view.columns.length;
+    const empty = el('div', 'empty');
+    empty.appendChild(el('div', 'empty-glyph', '⊘'));
+    empty.appendChild(el('div', 'empty-title', 'No rows match the filter'));
+    empty.appendChild(el('div', 'empty-hint',
+      'All ' + view.rows.length + ' row' + (view.rows.length === 1 ? '' : 's')
+      + ' are still there — widen the filter or reset it to see them.'));
+    cell.appendChild(empty);
+  }
+
+  updateViewChrome(view, shown.length);
 }
 
+/* The button and the note above the table both have to say when a filter is on.
+ * A table that looks complete but is not would be this control's worst failure,
+ * so it is stated twice. */
+function updateViewChrome(view, shownCount) {
+  const button = document.querySelector('[data-view="' + view.id + '"]');
+  if (button) {
+    const count = activeFilterCount(view);
+    clear(button);
+    button.appendChild(document.createTextNode('Filter & sort'));
+    if (count) button.appendChild(el('span', 'btn-badge', String(count)));
+    button.classList.toggle('is-filtering', count > 0);
+  }
+
+  const note = $(view.id + '-note');
+  if (!note) return;
+  const filtering = viewIsFiltering(view);
+  const sortColumn = view.columns.find((c) => c.key === view.sort.key);
+  clear(note);
+  if (!filtering && !sortColumn) { note.hidden = true; return; }
+  note.hidden = false;
+
+  if (filtering) {
+    const tag = el('span', 'tag is-info');
+    tag.appendChild(document.createTextNode('filtered'));
+    note.appendChild(tag);
+    note.appendChild(document.createTextNode(
+      'showing ' + shownCount + ' of ' + view.rows.length + ' rows'));
+  }
+  if (sortColumn) {
+    note.appendChild(document.createTextNode(
+      (filtering ? ' · ' : '') + 'sorted by ' + sortColumn.title + ' '
+      + (view.sort.dir === 'asc' ? 'ascending' : 'descending')));
+  }
+  const reset = el('button', 'btn btn-sm', 'reset');
+  reset.style.marginLeft = 'auto';
+  reset.addEventListener('click', () => resetView(view.id));
+  note.appendChild(reset);
+}
+
+function resetView(id) {
+  Object.assign(tableViews[id], BLANK_VIEW());
+  repaint(id);
+  if (menuState.id === id) syncMenu();
+}
+
+/* --- the popover ---------------------------------------------------------- */
+
+const menuState = { id: null, button: null };
+
+/* Focus goes back to the button when the menu was dismissed from the keyboard
+ * or by the button itself. After a click elsewhere it does not: that click has
+ * already moved the user's attention, and yanking it back fights them. */
+function closeMenu(restoreFocus) {
+  const menu = $('view-menu');
+  menu.hidden = true;
+  if (menuState.button) {
+    menuState.button.setAttribute('aria-expanded', 'false');
+    if (restoreFocus) menuState.button.focus();
+  }
+  menuState.id = null;
+  menuState.button = null;
+}
+
+function openMenu(id, button) {
+  const menu = $('view-menu');
+  menuState.id = id;
+  menuState.button = button;
+  button.setAttribute('aria-expanded', 'true');
+  menu.hidden = false;
+  syncMenu();
+
+  // Measured from the button rather than an offsetParent, and flipped when it
+  // would leave the viewport.
+  const rect = button.getBoundingClientRect();
+  const width = menu.offsetWidth;
+  let left = rect.right - width;
+  if (left < 8) left = 8;
+  if (left + width > window.innerWidth - 8) left = window.innerWidth - width - 8;
+  let top = rect.bottom + 6;
+  const height = menu.offsetHeight;
+  if (top + height > window.innerHeight - 8) top = Math.max(8, rect.top - height - 6);
+  menu.style.left = left + 'px';
+  menu.style.top = top + 'px';
+  $('vm-text').focus();
+}
+
+/* The menu reads from whichever view is open; every control writes back and
+ * repaints, so the table is never out of step with what the menu shows. */
+function syncMenu() {
+  const view = tableViews[menuState.id];
+  if (!view) return;
+
+  const sortSelect = $('vm-sort');
+  clear(sortSelect);
+  sortSelect.appendChild(new Option('— none —', ''));
+  view.columns.forEach((column) => sortSelect.appendChild(new Option(column.title, column.key)));
+  sortSelect.value = view.sort.key || '';
+
+  document.querySelectorAll('#view-menu [data-dir]').forEach((button) =>
+    button.setAttribute('aria-pressed', String(button.dataset.dir === view.sort.dir)));
+  document.querySelectorAll('#view-menu [data-accuracy]').forEach((button) =>
+    button.setAttribute('aria-pressed', String(button.dataset.accuracy === view.accuracy)));
+
+  $('vm-text').value = view.text;
+
+  // Only offer states this table actually contains, so the control cannot
+  // filter everything away by naming something that is not there.
+  const stateSelect = $('vm-state');
+  const states = Array.from(new Set(view.rows.map((r) => r.status).filter(Boolean))).sort();
+  clear(stateSelect);
+  stateSelect.appendChild(new Option('any', ''));
+  states.forEach((value) => stateSelect.appendChild(new Option(value, value)));
+  stateSelect.value = states.includes(view.status) ? view.status : '';
+  $('vm-state-row').hidden = states.length < 2;
+
+  const numeric = view.columns.filter((c) => c.type === 'num');
+  const numSelect = $('vm-num');
+  clear(numSelect);
+  numeric.forEach((column) => numSelect.appendChild(new Option(column.title, column.key)));
+  if (!numeric.some((c) => c.key === view.numKey) && numeric.length) {
+    view.numKey = numeric[0].key;
+  }
+  numSelect.value = view.numKey;
+  $('vm-op').value = view.numOp;
+  $('vm-value').value = view.numValue;
+
+  // Accuracy is only a filter where some row has a verdict.
+  $('vm-accuracy-row').hidden = !view.rows.some((r) => r.accuracy !== null && r.accuracy !== undefined);
+
+  const shown = applyView(view).length;
+  $('vm-count').textContent = shown === view.rows.length
+    ? view.rows.length + ' rows'
+    : shown + ' of ' + view.rows.length + ' rows';
+}
+
+/* History has its own painter; everything else is a results table. */
+function repaint(id) {
+  const view = tableViews[id];
+  if (!view) return;
+  if (id === 'history-table') paintHistory(view); else paintTable(view);
+}
+
+function commitMenu(mutate) {
+  const view = tableViews[menuState.id];
+  if (!view) return;
+  mutate(view);
+  repaint(view.id);
+  syncMenu();
+}
+
+function setupTableMenu() {
+  const menu = $('view-menu');
+
+  document.querySelectorAll('[data-view]').forEach((button) => {
+    button.addEventListener('click', (event) => {
+      event.stopPropagation();
+      const id = button.dataset.view;
+      if (menuState.id === id) { closeMenu(true); return; }
+      if (menuState.id) closeMenu(false);
+      viewFor(id);
+      openMenu(id, button);
+    });
+  });
+
+  $('vm-sort').addEventListener('change', (e) =>
+    commitMenu((view) => { view.sort.key = e.target.value || null; }));
+  menu.querySelectorAll('[data-dir]').forEach((button) =>
+    button.addEventListener('click', () =>
+      commitMenu((view) => { view.sort.dir = button.dataset.dir; })));
+  menu.querySelectorAll('[data-accuracy]').forEach((button) =>
+    button.addEventListener('click', () =>
+      commitMenu((view) => { view.accuracy = button.dataset.accuracy; })));
+  $('vm-text').addEventListener('input', (e) =>
+    commitMenu((view) => { view.text = e.target.value.trim(); }));
+  $('vm-state').addEventListener('change', (e) =>
+    commitMenu((view) => { view.status = e.target.value; }));
+  $('vm-num').addEventListener('change', (e) =>
+    commitMenu((view) => { view.numKey = e.target.value; }));
+  $('vm-op').addEventListener('change', (e) =>
+    commitMenu((view) => { view.numOp = e.target.value; }));
+  $('vm-value').addEventListener('input', (e) =>
+    commitMenu((view) => { view.numValue = e.target.value; }));
+  $('vm-reset').addEventListener('click', () => { if (menuState.id) resetView(menuState.id); });
+
+  menu.addEventListener('click', (event) => event.stopPropagation());
+  document.addEventListener('click', () => { if (menuState.id) closeMenu(); });
+  window.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && menuState.id) { event.preventDefault(); closeMenu(true); }
+  });
+  // Reopening is cheaper than tracking the anchor through a scroll.
+  window.addEventListener('resize', () => { if (menuState.id) closeMenu(); });
+  document.querySelectorAll('.view').forEach((view) =>
+    view.addEventListener('scroll', () => { if (menuState.id) closeMenu(); }, true));
+}
+
+/* Copies the table as shown — filtered and sorted — because that is what the
+ * reader is looking at. The empty-state row is chrome, not data. */
 function tableToCSV(table) {
-  return Array.from(table.rows).map((row) =>
-    Array.from(row.cells).map((cell) => {
+  return Array.from(table.rows)
+    .filter((row) => !row.querySelector('.empty'))
+    .map((row) =>
+    // A group header spans several columns in one cell; pad it out so every
+    // line carries the same field count and the file opens straight in a sheet.
+    Array.from(row.cells).reduce((fields, cell) => {
       const text = cell.textContent.replace(/"/g, '""');
-      return /[",\n]/.test(text) ? '"' + text + '"' : text;
-    }).join(',')).join('\n');
+      fields.push(/[",\n]/.test(text) ? '"' + text + '"' : text);
+      for (let i = 1; i < (cell.colSpan || 1); i += 1) fields.push('');
+      return fields;
+    }, []).join(',')).join('\n');
 }
 
 /* --- the summary: hero, tiles, and the speedup bars ------------------------ */
@@ -560,7 +957,9 @@ function niceTicks(max) {
  * result rather than a smaller one, so it takes the critical status colour and
  * is called "slower" in the legend. The 1.0x parity rule is solid, not dashed:
  * dashes read as projection, and this is a real reference. */
-function renderBars(container, rows) {
+/* `labels` renames the legend for a chart that is not measuring the baseline --
+ * the compare view's bars are B against A. */
+function renderBars(container, rows, labels) {
   const scored = rows.filter((r) => typeof r.speedup === 'number' && r.speedup > 0);
   if (scored.length < 2) return false;
 
@@ -623,8 +1022,10 @@ function renderBars(container, rows) {
     node.appendChild(document.createTextNode(text));
     return node;
   };
-  legend.appendChild(item('is-mark', 'faster than the baseline'));
-  if (anyLoss) legend.appendChild(item('is-loss', 'slower than the baseline'));
+  const names = labels || { win: 'faster than the baseline',
+                           loss: 'slower than the baseline' };
+  legend.appendChild(item('is-mark', names.win));
+  if (anyLoss) legend.appendChild(item('is-loss', names.loss));
   legend.appendChild(item('is-rule', '1.0x parity'));
   wrap.appendChild(legend);
 
@@ -746,6 +1147,7 @@ function appendLog(node, lines, follow) {
 function startJob(key, jobId, ui) {
   stopPolling(key);
   state.jobs[key] = jobId;
+  state.uis[key] = ui;
   clear(ui.log);
   ui.status.textContent = 'queued';
   ui.status.className = 'status-line is-running';
@@ -753,25 +1155,43 @@ function startJob(key, jobId, ui) {
   ui.stop.disabled = false;
 
   let since = 0;
+  let consecutiveFailures = 0;
+
   const tick = async () => {
-    const { data } = await api('/api/job/' + jobId + '?since=' + since);
-    if (!data || data.error) { stopPolling(key); return; }
-
-    if (data.missed_lines) {
-      appendLog(ui.log, ['[dashboard] ... ' + data.missed_lines + ' earlier lines '
-        + 'dropped from this view; the full log is in dashboard/runs/' + jobId + '.log'],
-        ui.follow.checked);
+    let data;
+    try {
+      ({ data } = await api('/api/job/' + jobId + '?since=' + since));
+    } catch (err) {
+      // A dropped fetch is not the end of the job. Keep polling, but give up
+      // after a run of failures rather than spinning forever against a server
+      // that has gone away -- and hand the controls back when we do.
+      if (++consecutiveFailures >= 5) {
+        stopPolling(key);
+        releaseControls(ui, 'lost contact with the server', 'failed');
+        appendLog(ui.log, ['[dashboard] lost contact with the server; the '
+          + 'benchmark may still be running. Reload to reattach.'], true);
+      }
+      return;
     }
-    appendLog(ui.log, data.lines, ui.follow.checked);
-    since = data.next_line;
+    consecutiveFailures = 0;
 
-    const rows = data.steps.map(rowFromStep);
-    if (rows.length) {
-      ui.resultsCard.hidden = false;
-      ui.render(rows, data);
+    if (!data || data.error) {
+      // The job is gone from the server's memory; nothing more is coming.
+      stopPolling(key);
+      releaseControls(ui, 'job no longer available', 'failed');
+      return;
     }
 
     const finished = ['done', 'failed', 'stopped'].includes(data.status);
+
+    // Settle the controls BEFORE rendering. Rendering is the elaborate part and
+    // the part most likely to break in a future edit; if it throws, the buttons
+    // must already be in the right state rather than stranded disabled.
+    if (finished) {
+      stopPolling(key);
+      ui.go.disabled = false;
+      ui.stop.disabled = true;
+    }
     const settled = data.steps.filter((s) => ['done', 'failed', 'stopped'].includes(s.status)).length;
     const suffix = data.duration_s !== null ? ' · ' + data.duration_s + 's' : '';
     ui.status.textContent = finished
@@ -780,10 +1200,28 @@ function startJob(key, jobId, ui) {
         + '/' + data.steps.length + suffix;
     ui.status.className = 'status-line is-' + data.status;
 
+    try {
+      if (data.missed_lines) {
+        appendLog(ui.log, ['[dashboard] ... ' + data.missed_lines + ' earlier lines '
+          + 'dropped from this view; the full log is in dashboard/runs/' + jobId + '.log'],
+          ui.follow.checked);
+      }
+      appendLog(ui.log, data.lines, ui.follow.checked);
+      since = data.next_line;
+
+      const rows = data.steps.map(rowFromStep);
+      if (rows.length) {
+        ui.resultsCard.hidden = false;
+        ui.render(rows, data);
+      }
+    } catch (err) {
+      // Report it rather than swallowing it: a table that silently stopped
+      // updating is worse than one that says why.
+      appendLog(ui.log, ['[dashboard] could not render this update: ' + err], true);
+      if (window.console) console.error('render failed', err);
+    }
+
     if (finished) {
-      stopPolling(key);
-      ui.go.disabled = false;
-      ui.stop.disabled = true;
       if (data.error) appendLog(ui.log, ['[dashboard] ' + data.error], true);
       refreshQueue();
     }
@@ -796,6 +1234,38 @@ function startJob(key, jobId, ui) {
 
 function stopPolling(key) {
   if (state.polls[key]) { clearInterval(state.polls[key]); delete state.polls[key]; }
+}
+
+/* Hand the controls back. Used wherever a job stops being watched, so there is
+ * exactly one place that decides what "not running" looks like. */
+function releaseControls(ui, message, tone) {
+  ui.go.disabled = false;
+  ui.stop.disabled = true;
+  if (message) {
+    ui.status.textContent = message;
+    ui.status.className = 'status-line' + (tone ? ' is-' + tone : '');
+  }
+}
+
+/* The safety net.
+ *
+ * Run is disabled while a job is watched and re-enabled when the poll sees it
+ * finish. That chain has a single point of failure: if the poll ever stops --
+ * a dropped connection, a bug in a render, a tab suspended by the browser --
+ * the button stays disabled and the only way out is a reload.
+ *
+ * So the queue poll, which runs anyway, reconciles it: a view with no live poll
+ * has nothing to wait for, and its Run button is enabled no matter how it got
+ * into that state. */
+function reconcileControls() {
+  Object.keys(state.uis).forEach((key) => {
+    const ui = state.uis[key];
+    if (!ui || state.polls[key]) return;
+    if (ui.go.disabled) {
+      ui.go.disabled = false;
+      ui.stop.disabled = true;
+    }
+  });
 }
 
 /* Stop, with the answer read. Firing the POST and discarding the result made a
@@ -826,7 +1296,9 @@ async function requestStop(key, ui) {
     return;
   }
   if (data.stopped === false) {
-    ui.status.textContent = 'already finished';
+    // Nothing was running, so no poll is going to come along and re-enable Run.
+    stopPolling(key);
+    releaseControls(ui, 'already finished');
     appendLog(ui.log, ['[dashboard] stop had nothing to do; the job had already finished'], true);
     return;
   }
@@ -898,6 +1370,7 @@ function setupRun() {
     render: (rows) => { renderSummary($('run-summary'), rows); renderTable($('run-results'), rows); },
   };
 
+  state.uis['run'] = ui;
   $('run-go').addEventListener('click', () => submit('run', { mode: 'single', form }, ui));
   $('run-stop').addEventListener('click', () => requestStop('run', ui));
   preflight();
@@ -905,13 +1378,45 @@ function setupRun() {
 
 /* ---------------------------------------------------------- compare view -- */
 
-function mergedCompareForm(side) {
-  return Object.assign({}, state.forms.cmpShape, side, { env: side.env || {} });
+function mergedCompareForm(side, shape) {
+  const merged = Object.assign({}, state.forms.cmpShape, side, { env: side.env || {} });
+  // A ticked preset overrides the typed shape fields, exactly as the server
+  // merges it on submit, so the preview shows what will actually run.
+  if (shape) {
+    state.spec.shape_keys.forEach((key) => {
+      if (shape[key] !== undefined) merged[key] = shape[key];
+    });
+  }
+  return merged;
 }
 
 function setupCompare() {
   const a = state.forms.cmpA;
   const b = state.forms.cmpB;
+
+  let mode = 'single';
+  let picker = null;
+
+  /* In many-shape mode every shape has its own command line, so the preview
+   * shows the first ticked one. A preview quietly showing the typed shape while
+   * a different one runs would be worse than no preview at all. */
+  const previewShape = () => (mode === 'many' && picker ? picker.selected()[0] : null);
+
+  /* Say which shape the preview is of. Without this the command reads as the
+   * whole run rather than the first of several. */
+  const captionPreview = () => {
+    const shape = previewShape();
+    const note = (mode === 'many' && shape)
+      ? 'the command for ' + shape.name + '; every other ticked shape runs the '
+        + 'same flags with its own dimensions'
+      : '';
+    ['cmp-a-preview-note', 'cmp-b-preview-note'].forEach((id) => {
+      const node = $(id);
+      if (!node) return;
+      node.textContent = note;
+      node.hidden = !note;
+    });
+  };
 
   // Both sides are checked live and their issues merged, prefixed the way the
   // server prefixes them on submit - otherwise a setting that only breaks B
@@ -921,11 +1426,13 @@ function setupCompare() {
     sideIssues.A.map((i) => Object.assign({}, i, { message: 'A: ' + i.message }))
       .concat(sideIssues.B.map((i) => Object.assign({}, i, { message: 'B: ' + i.message }))));
 
-  const preA = makePreflight(() => mergedCompareForm(a), $('cmp-a-command'), null,
-    $('cmp-derived'), (data) => { sideIssues.A = data.issues || []; showIssues(); });
-  const preB = makePreflight(() => mergedCompareForm(b), $('cmp-b-command'), null,
-    null, (data) => { sideIssues.B = data.issues || []; showIssues(); });
-  const both = () => { preA(); preB(); };
+  const preA = makePreflight(() => mergedCompareForm(a, previewShape()),
+    $('cmp-a-command'), null, $('cmp-derived'),
+    (data) => { sideIssues.A = data.issues || []; showIssues(); });
+  const preB = makePreflight(() => mergedCompareForm(b, previewShape()),
+    $('cmp-b-command'), null, null,
+    (data) => { sideIssues.B = data.issues || []; showIssues(); });
+  const both = () => { captionPreview(); preA(); preB(); };
 
   renderGroup($('cmp-shape'), 'shape', state.forms.cmpShape, both);
   renderGroup($('cmp-timing'), 'timing', state.forms.cmpShape, both);
@@ -946,91 +1453,287 @@ function setupCompare() {
     });
   });
 
+  /* What is about to be queued. At two or three runs per shape the cost stops
+   * being obvious, so it is stated beside the button rather than discovered in
+   * the log. */
+  const restate = () => {
+    const perShape = $('cmp-control').checked ? 3 : 2;
+    const shapes = (mode === 'many' && picker) ? picker.selected().length : 1;
+    const total = shapes * perShape;
+    $('cmp-run-count').textContent = shapes === 0
+      ? 'no shapes ticked'
+      : (mode === 'many' ? shapes + ' shapes × ' + perShape + ' = ' : '')
+        + total + ' run' + (total === 1 ? '' : 's');
+    $('cmp-control-scope').textContent = mode === 'many' ? ', on every shape' : '';
+  };
+
+  picker = makeShapePicker($('cmp-shapes'), $('cmp-count'), $('cmp-all'), $('cmp-none'),
+    () => { restate(); both(); });
+  $('cmp-presets-path').textContent = presetsFileName();
+
+  const panes = $('panel-compare').querySelectorAll('[data-shape-pane]');
+  const setMode = (next) => {
+    mode = next;
+    panes.forEach((pane) => { pane.hidden = pane.dataset.shapePane !== next; });
+    $('cmp-shape-mode').querySelectorAll('button').forEach((button) => {
+      button.setAttribute('aria-pressed', String(button.dataset.shapeMode === next));
+    });
+    try { localStorage.setItem('cmp-shape-mode', next); } catch (err) { /* no store */ }
+    restate();
+    both();
+  };
+  $('cmp-shape-mode').addEventListener('click', (event) => {
+    const button = event.target.closest('[data-shape-mode]');
+    if (button) setMode(button.dataset.shapeMode);
+  });
+  $('cmp-control').addEventListener('change', restate);
+
+  let saved = null;
+  try { saved = localStorage.getItem('cmp-shape-mode'); } catch (err) { saved = null; }
+  setMode(saved === 'many' ? 'many' : 'single');
+
   const ui = {
     log: $('cmp-log'), status: $('cmp-job-status'), go: $('cmp-go'), stop: $('cmp-stop'),
     follow: $('cmp-follow'), issues: $('cmp-issues'), resultsCard: $('cmp-results-card'),
     render: renderCompareResults,
   };
 
-  $('cmp-go').addEventListener('click', () => submit('compare', {
-    mode: 'compare',
-    form_a: mergedCompareForm(a),
-    form_b: mergedCompareForm(b),
-    control: $('cmp-control').checked,
-  }, ui));
+  state.uis['compare'] = ui;
+  $('cmp-go').addEventListener('click', () => {
+    const payload = {
+      mode: 'compare',
+      form_a: mergedCompareForm(a),
+      form_b: mergedCompareForm(b),
+      control: $('cmp-control').checked,
+    };
+    if (mode === 'many') {
+      const shapes = picker.selected();
+      if (!shapes.length) {
+        renderIssues($('cmp-issues'), [{ level: 'error', message: 'no shapes ticked' }]);
+        return;
+      }
+      payload.shapes = shapes;
+    }
+    submit('compare', payload, ui);
+  });
   $('cmp-stop').addEventListener('click', () => requestStop('compare', ui));
   both();
 }
 
-/* B against A, with the control's own deviation from 1.000x as the bar the
- * difference has to clear before it is called a result. */
-function renderCompareResults(rows) {
-  const find = (role) => rows.find((row) => row.role === role);
-  const base = find('A');
+/* --- the pivot: a row is a shape, a column group is a config --------------- */
 
-  renderTable($('cmp-results'), rows, [{
-    key: 'vsA', title: 'vs A',
+/* Flat step rows in, one row per shape out, each holding its A, its B and the
+ * control that decides whether the gap between them is a result. One-shape mode
+ * is the same thing with a single group. */
+function pivotCompareRows(rows) {
+  const order = [];
+  const groups = {};
+  rows.forEach((row) => {
+    const key = row.preset || '';
+    if (!groups[key]) { groups[key] = []; order.push(key); }
+    groups[key].push(row);
+  });
+
+  // The row's state is the least finished of its runs: a shape with B still
+  // running is not "done" just because A is.
+  const overall = (members) => {
+    if (members.some((row) => row.status === 'failed')) return 'failed';
+    if (members.some((row) => row.status === 'running')) return 'running';
+    if (members.some((row) => row.status === 'stopped')) return 'stopped';
+    if (members.every((row) => row.status === 'done')) return 'done';
+    return 'queued';
+  };
+
+  return order.map((key) => {
+    const members = groups[key];
+    const side = (role) => members.find((row) => row.role === role) || null;
+    const a = side('A');
+    const b = side('B');
+    const control = side('control');
+
+    // Median latency, the same definition the single-shape view has always used.
+    const ratio = (a && b && a.optimized && b.optimized)
+      ? a.optimized / b.optimized : null;
+    const noise = (a && control && a.optimized && control.optimized)
+      ? Math.abs(a.optimized / control.optimized - 1) * 100 : null;
+    const gap = ratio === null ? null : Math.abs(ratio - 1) * 100;
+
+    let call = '';
+    if (ratio !== null) {
+      if (noise === null) call = 'no control';
+      else if (gap <= noise) call = 'noise';
+      else if (gap < noise * 2) call = 'marginal';
+      else call = ratio > 1 ? 'B faster' : 'A faster';
+    }
+
+    // Either side failing accuracy makes the row's ratio meaningless, so a row
+    // is never marked passing on the strength of the other half.
+    const judged = [a, b].filter((row) => row && row.accuracy !== null);
+    const accuracy = judged.length ? judged.every((row) => row.accuracy) : null;
+
+    const seconds = members.reduce((sum, row) => sum + (row.secs || 0), 0);
+
+    return {
+      label: key || (a && a.shape) || (a && a.label) || '',
+      a: a, b: b, control: control,
+      ratio: ratio, noise: noise, gap: gap, call: call,
+      // renderBars and the numeric filter both read `speedup`; here it is the
+      // B-against-A ratio, which is what this table is about.
+      speedup: ratio,
+      accuracy: accuracy,
+      status: overall(members),
+      secs: seconds || null,
+      errors: members.reduce((all, row) => all.concat(row.errors || []), []),
+    };
+  });
+}
+
+/* One config's column under a group header. The cell is drawn by the same
+ * fillCell the other tables use, so "median ms" formats identically here --
+ * including the /slice suffix on a streamed shape. */
+function compareSideColumn(side, key, group, title, type) {
+  return {
+    key: side + key.charAt(0).toUpperCase() + key.slice(1),
+    group: group,
+    title: title,
+    type: type,
+    value: (row) => (row[side] ? cellValue({ key: key }, row[side]) : null),
     render: (cell, row) => {
-      if (!base || row.role === 'A' || !base.optimized || !row.optimized) {
-        cell.textContent = '–'; cell.classList.add('is-muted'); return;
-      }
-      const ratio = base.optimized / row.optimized;
-      cell.textContent = ratio.toFixed(3) + 'x';
-      cell.classList.add('is-strong', ratio >= 1 ? 'is-good' : 'is-critical');
+      if (!row[side]) { cell.textContent = '–'; cell.classList.add('is-muted'); return; }
+      fillCell(cell, key, row[side]);
     },
-  }]);
+  };
+}
+
+const CALL_TONE = {
+  'B faster': 'is-good',
+  'A faster': 'is-critical',
+  'noise': 'is-warning',
+  'marginal': 'is-warning',
+  'no control': 'is-warning',
+};
+
+const CALL_HELP = {
+  'B faster': 'The gap is more than twice the noise floor measured on this shape.',
+  'A faster': 'The gap is more than twice the noise floor measured on this shape.',
+  'noise': 'The A-vs-B gap is inside this shape’s own control, so this run does '
+    + 'not separate the two configs.',
+  'marginal': 'Clears the control, but by less than 2x. Worth repeating before '
+    + 'trusting it.',
+  'no control': 'No control ran on this shape, so there is nothing to say whether '
+    + 'the gap is real.',
+};
+
+const COMPARE_COLUMNS = [
+  { key: 'label', title: 'shape', left: true, type: 'text' },
+  { key: 'status', title: 'state', type: 'text' },
+  compareSideColumn('a', 'optimized', 'Config A', 'median ms', 'num'),
+  compareSideColumn('a', 'speedup', 'Config A', 'vs base', 'num'),
+  compareSideColumn('a', 'accuracy', 'Config A', 'accuracy', 'text'),
+  compareSideColumn('b', 'optimized', 'Config B', 'median ms', 'num'),
+  compareSideColumn('b', 'speedup', 'Config B', 'vs base', 'num'),
+  compareSideColumn('b', 'accuracy', 'Config B', 'accuracy', 'text'),
+  {
+    key: 'ratio', title: 'B vs A', type: 'num',
+    value: (row) => row.ratio,
+    render: (cell, row) => {
+      if (row.ratio === null) { cell.textContent = '–'; cell.classList.add('is-muted'); return; }
+      cell.textContent = row.ratio.toFixed(3) + 'x';
+      cell.classList.add('is-strong', row.ratio >= 1 ? 'is-good' : 'is-critical');
+      cell.title = 'A median / B median. Above 1.000x means B is the faster of '
+        + 'the two on this shape.';
+    },
+  },
+  {
+    key: 'noise', title: 'control', type: 'num',
+    value: (row) => row.noise,
+    render: (cell, row) => {
+      if (row.noise === null) { cell.textContent = '–'; cell.classList.add('is-muted'); return; }
+      cell.textContent = row.noise.toFixed(1) + '%';
+      cell.classList.add('is-muted');
+      cell.title = 'Config A run twice on this shape. Its true ratio is 1.000x, so '
+        + 'this is how far off a repeat of the same code lands — the bar the '
+        + 'A-vs-B gap has to clear.';
+    },
+  },
+  {
+    key: 'call', title: 'verdict', type: 'text',
+    value: (row) => row.call,
+    render: (cell, row) => {
+      if (!row.call) { cell.textContent = '–'; cell.classList.add('is-muted'); return; }
+      const tone = CALL_TONE[row.call] || 'is-warning';
+      const tag = el('span', 'tag ' + tone);
+      tag.appendChild(el('span', null,
+        tone === 'is-good' ? '✓' : (tone === 'is-critical' ? '✖' : '⚠')));
+      tag.appendChild(document.createTextNode(row.call));
+      cell.appendChild(tag);
+      cell.title = CALL_HELP[row.call] || '';
+    },
+  },
+  { key: 'secs', title: 'took', type: 'num' },
+];
+
+function renderCompareResults(rows) {
+  const pivot = pivotCompareRows(rows);
+  renderTable($('cmp-results'), pivot, null, COMPARE_COLUMNS);
 
   const summary = $('cmp-summary');
   clear(summary);
-  const target = find('B');
-  const control = find('control');
-  if (!base || !target || !base.optimized || !target.optimized) return;
+  if (pivot.length === 1) renderCompareOne(summary, pivot[0]);
+  else if (pivot.length > 1) renderCompareMany(summary, pivot);
+}
 
-  const ratio = base.optimized / target.optimized;
-  const gapPct = Math.abs(ratio - 1) * 100;
+/* B against A on one shape, with the control's own deviation from 1.000x as the
+ * bar the difference has to clear before it is called a result. */
+function renderCompareOne(summary, row) {
+  if (!row.a || !row.b || !row.a.optimized || !row.b.optimized) return;
+  const ratio = row.ratio;
+  const gapPct = row.gap;
 
   const headline = el('div', 'headline');
   headline.appendChild(heroBlock(ratio.toFixed(3) + 'x', 'B relative to A'));
   const tiles = [
-    [fmt(base.optimized, 3) + ' ms', 'A median'],
-    [fmt(target.optimized, 3) + ' ms', 'B median'],
+    [fmt(row.a.optimized, 3) + ' ms', 'A median'],
+    [fmt(row.b.optimized, 3) + ' ms', 'B median'],
   ];
-  if (control && control.optimized) tiles.push([fmt(control.optimized, 3) + ' ms', 'control median']);
+  if (row.control && row.control.optimized) {
+    tiles.push([fmt(row.control.optimized, 3) + ' ms', 'control median']);
+  }
   headline.appendChild(tileRow(tiles));
   summary.appendChild(headline);
 
   const verdict = el('div', 'verdict');
   verdict.style.marginTop = '18px';
 
-  if (control && control.optimized) {
-    const controlRatio = base.optimized / control.optimized;
-    const noisePct = Math.abs(controlRatio - 1) * 100;
+  if (row.noise !== null) {
+    const controlRatio = row.a.optimized / row.control.optimized;
     const line = el('div');
     line.innerHTML = 'B is <b>' + ratio.toFixed(3) + 'x</b> config A, a gap of '
       + gapPct.toFixed(1) + '%. The control &mdash; A run twice, true value 1.000x '
       + '&mdash; came back at <b>' + controlRatio.toFixed(3) + 'x</b>, so the noise '
-      + 'floor on this machine right now is ' + noisePct.toFixed(1) + '%.';
+      + 'floor on this machine right now is ' + row.noise.toFixed(1) + '%.';
     verdict.appendChild(line);
 
     const call = el('div', 'v-call');
     let tone, glyph, text;
-    if (gapPct <= noisePct) {
+    if (gapPct <= row.noise) {
       tone = 'is-warning'; glyph = '⚠';
       text = 'Inside the noise. This run does not separate A from B — raise '
         + '--benchmark-rounds or --repeats, or accept that they measure the same.';
-    } else if (gapPct < noisePct * 2) {
+    } else if (gapPct < row.noise * 2) {
       tone = 'is-warning'; glyph = '⚠';
       text = 'Clears the control, but by less than 2x. Worth repeating before trusting.';
     } else {
-      tone = ratio > 1 ? 'is-critical' : 'is-good';
-      glyph = ratio > 1 ? '✖' : '✓';
+      // ratio is A/B, so above 1.000x is B finishing sooner.
+      tone = ratio > 1 ? 'is-good' : 'is-critical';
+      glyph = ratio > 1 ? '✓' : '✖';
       text = ratio > 1
-        ? 'B is the slower of the two, by comfortably more than the noise floor.'
-        : 'B is the faster of the two, by comfortably more than the noise floor.';
+        ? 'B is the faster of the two, by comfortably more than the noise floor.'
+        : 'B is the slower of the two, by comfortably more than the noise floor.';
     }
     const tag = el('span', 'tag ' + tone);
     tag.appendChild(el('span', null, glyph));
-    tag.appendChild(document.createTextNode(gapPct <= noisePct ? 'not a result' : 'real'));
+    tag.appendChild(document.createTextNode(gapPct <= row.noise ? 'not a result' : 'real'));
     call.appendChild(tag);
     call.appendChild(el('span', null, text));
     verdict.appendChild(call);
@@ -1045,23 +1748,112 @@ function renderCompareResults(rows) {
   summary.appendChild(verdict);
 }
 
+/* Many shapes: the headline is the geometric mean of the per-shape ratios, and
+ * the count of rows that actually cleared their own control -- a mean over rows
+ * that are mostly noise is a number with nothing behind it. */
+function renderCompareMany(summary, pivot) {
+  const scored = pivot.filter((row) => typeof row.ratio === 'number');
+  if (!scored.length) return;
+
+  const mean = geomean(scored.map((row) => row.ratio));
+  const best = scored.reduce((x, y) => (x.ratio > y.ratio ? x : y));
+  const worst = scored.reduce((x, y) => (x.ratio < y.ratio ? x : y));
+  const real = scored.filter((row) => row.call === 'B faster' || row.call === 'A faster');
+  const wins = real.filter((row) => row.ratio > 1).length;
+  const losses = real.length - wins;
+  const inside = scored.length - real.length;
+
+  const headline = el('div', 'headline');
+  headline.appendChild(heroBlock(mean.toFixed(3) + 'x',
+    'B relative to A, geometric mean over ' + scored.length + ' shape'
+      + (scored.length === 1 ? '' : 's'),
+    mean >= 1 ? 'good' : 'critical'));
+  headline.appendChild(tileRow([
+    [best.ratio.toFixed(3) + 'x', 'best — ' + best.label],
+    [worst.ratio.toFixed(3) + 'x', 'worst — ' + worst.label],
+    [real.length + ' of ' + scored.length, 'cleared their control',
+      'Rows whose A-vs-B gap is more than twice the noise floor measured on that '
+      + 'same shape.'],
+  ]));
+  summary.appendChild(headline);
+
+  const verdict = el('div', 'verdict');
+  verdict.style.marginTop = '18px';
+  const line = el('div');
+  line.textContent = 'Every shape carries its own control, so every row is judged '
+    + 'against the noise floor measured on that shape rather than a single figure '
+    + 'borrowed across the set. ' + wins + ' came back faster on B, ' + losses
+    + ' faster on A, and ' + inside + ' did not separate the two.';
+  verdict.appendChild(line);
+
+  if (inside === scored.length) {
+    const call = el('div', 'v-call');
+    const tag = el('span', 'tag is-warning');
+    tag.appendChild(el('span', null, '⚠'));
+    tag.appendChild(document.createTextNode('not a result'));
+    call.appendChild(tag);
+    call.appendChild(el('span', null, 'No shape separated the two configs. Raise '
+      + '--benchmark-rounds or --repeats, or accept that they measure the same.'));
+    verdict.appendChild(call);
+  } else if (wins && losses) {
+    const call = el('div', 'v-call');
+    const tag = el('span', 'tag is-warning');
+    tag.appendChild(el('span', null, '⚠'));
+    tag.appendChild(document.createTextNode('shape dependent'));
+    call.appendChild(tag);
+    call.appendChild(el('span', null, 'B wins on some shapes and loses on others, '
+      + 'so the geometric mean above hides a real reversal — read the rows.'));
+    verdict.appendChild(call);
+  }
+  summary.appendChild(verdict);
+
+  const judged = pivot.filter((row) => row.accuracy !== null);
+  if (judged.length) {
+    const failed = judged.filter((row) => row.accuracy === false);
+    const strip = el('div', 'btn-row');
+    strip.style.marginTop = '16px';
+    const tag = el('span', 'tag ' + (failed.length ? 'is-critical' : 'is-good'));
+    tag.appendChild(el('span', null, failed.length ? '✖' : '✓'));
+    tag.appendChild(document.createTextNode(failed.length
+      ? failed.length + ' of ' + judged.length + ' shapes failed accuracy'
+      : 'accuracy passed on all ' + judged.length));
+    strip.appendChild(tag);
+    summary.appendChild(strip);
+  }
+
+  if (scored.length > 1) {
+    const chart = el('div');
+    chart.style.marginTop = '20px';
+    // The caption goes in first: these bars are B against A, not the speedup
+    // against the baseline that the same bars mean everywhere else in the app.
+    const caption = el('div', 'prose');
+    caption.style.marginBottom = '10px';
+    caption.textContent = 'B relative to A per shape. The line at 1.000x is '
+      + 'parity; bars past it are shapes where B finished sooner.';
+    chart.appendChild(caption);
+    if (renderBars(chart, scored, { win: 'B faster than A',
+                                    loss: 'A faster than B' })) {
+      summary.appendChild(chart);
+    }
+  }
+}
+
+
 /* ------------------------------------------------------------ sweep view -- */
 
-function setupSweep() {
-  const form = state.forms.sweep;
-  const preflight = makePreflight(() => form, null, $('sweep-issues'), null);
+/* The tickable shape list, shared by Sweep and Compare.
+ *
+ * `onChange` fires whenever the selection moves, so a caller can restate what
+ * is about to be queued -- which matters more in Compare, where every ticked
+ * shape costs two or three runs rather than one.
+ */
+/* The tail of the presets path, for the "edit presets.json" pointers. */
+function presetsFileName() {
+  return state.spec.presets_path.split(/[\\/]/).slice(-2).join('/');
+}
 
-  renderGroup($('sweep-optimization'), 'optimization', form, preflight);
-  renderGroup($('sweep-timing'), 'timing', form, preflight);
-  renderEnv($('sweep-env'), form, preflight);
-
-  const list = $('sweep-shapes');
-  $('sweep-presets-path').textContent = state.spec.presets_path.split(/[\\/]/).slice(-2).join('/');
-
-  // Named so it can be re-run: saving in the Presets view changes which shapes
-  // exist, and a list still offering the old ones would queue shapes that are no
-  // longer in the file.
-  const buildList = () => {
+function makeShapePicker(list, count, allButton, noneButton, onChange) {
+  const build = () => {
     clear(list);
     state.spec.presets.forEach((preset, index) => {
       const row = el('label', 'pick' + (preset.blocked ? ' is-blocked' : ''));
@@ -1116,25 +1908,48 @@ function setupSweep() {
     });
   };
 
+  const selected = () => Array.from(list.querySelectorAll('input:checked'))
+    .map((box) => state.spec.presets[Number(box.dataset.index)]);
+
   const setAll = (checked) => list.querySelectorAll('input')
     .forEach((box) => { if (!box.disabled) box.checked = checked; });
 
-  const updateCount = () => {
+  const settle = () => {
     const chosen = list.querySelectorAll('input:checked').length;
     const blocked = state.spec.presets.filter((p) => p.blocked).length;
-    $('sweep-count').textContent = chosen === 0
-      ? 'nothing selected'
-      : chosen + ' shape' + (chosen === 1 ? '' : 's') + ' selected'
-        + (blocked ? ' · ' + blocked + ' cannot run' : '');
+    if (count) {
+      count.textContent = chosen === 0
+        ? 'nothing selected'
+        : chosen + ' shape' + (chosen === 1 ? '' : 's') + ' selected'
+          + (blocked ? ' · ' + blocked + ' cannot run' : '');
+    }
+    if (onChange) onChange(chosen);
   };
-  list.addEventListener('change', updateCount);
 
-  buildList();
-  rebuildShapeList = () => { buildList(); updateCount(); };
+  list.addEventListener('change', settle);
+  if (allButton) allButton.addEventListener('click', () => { setAll(true); settle(); });
+  if (noneButton) noneButton.addEventListener('click', () => { setAll(false); settle(); });
 
-  $('sweep-all').addEventListener('click', () => { setAll(true); updateCount(); });
-  $('sweep-none').addEventListener('click', () => { setAll(false); updateCount(); });
-  updateCount();
+  build();
+  settle();
+  // Saving in the Presets view changes which shapes exist; a list still
+  // offering the old ones would queue shapes no longer in the file.
+  shapeLists.push(() => { build(); settle(); });
+
+  return { selected, rebuild: () => { build(); settle(); } };
+}
+
+function setupSweep() {
+  const form = state.forms.sweep;
+  const preflight = makePreflight(() => form, null, $('sweep-issues'), null);
+
+  renderGroup($('sweep-optimization'), 'optimization', form, preflight);
+  renderGroup($('sweep-timing'), 'timing', form, preflight);
+  renderEnv($('sweep-env'), form, preflight);
+
+  $('sweep-presets-path').textContent = presetsFileName();
+  const picker = makeShapePicker($('sweep-shapes'), $('sweep-count'),
+    $('sweep-all'), $('sweep-none'));
 
   const ui = {
     log: $('sweep-log'), status: $('sweep-job-status'), go: $('sweep-go'),
@@ -1143,9 +1958,9 @@ function setupSweep() {
     render: (rows) => { renderSummary($('sweep-summary'), rows); renderTable($('sweep-results'), rows); },
   };
 
+  state.uis['sweep'] = ui;
   $('sweep-go').addEventListener('click', () => {
-    const shapes = Array.from(list.querySelectorAll('input:checked'))
-      .map((box) => state.spec.presets[Number(box.dataset.index)]);
+    const shapes = picker.selected();
     if (!shapes.length) {
       renderIssues($('sweep-issues'), [{ level: 'error', message: 'no shapes ticked' }]);
       return;
@@ -1185,6 +2000,7 @@ function setupScripts() {
     issues: el('div'), resultsCard: el('div'), render: () => {},
   };
 
+  state.uis['script'] = ui;
   $('script-go').addEventListener('click', () => {
     if (!state.selectedScript) return;
     submit('script', {
@@ -1359,7 +2175,7 @@ function refreshPresetConsumers() {
       select.appendChild(option);
     });
   });
-  if (rebuildShapeList) rebuildShapeList();
+  shapeLists.forEach((rebuild) => rebuild());
 }
 
 function setupPresets() {
@@ -1428,59 +2244,112 @@ function setupPresets() {
 
 /* ---------------------------------------------------------- history view -- */
 
-async function refreshHistory() {
-  const { data } = await api('/api/history?limit=60');
-  const table = $('history-table');
+const HISTORY_COLUMNS = [
+  { key: 'when', title: 'when', left: true, type: 'text' },
+  { key: 'label', title: 'job', left: true, type: 'text' },
+  { key: 'mode', title: 'mode', left: true, type: 'text' },
+  { key: 'status', title: 'status', left: true, type: 'text' },
+  { key: 'steps', title: 'steps', type: 'num' },
+  { key: 'best', title: 'best speedup', type: 'num' },
+  { key: 'secs', title: 'took', type: 'num' },
+];
+
+function paintHistory(view) {
+  const table = $(view.id);
+  const shown = applyView(view);
   clear(table);
-  const entries = (data && data.entries) || [];
 
   const head = table.createTHead().insertRow();
-  ['when', 'job', 'mode', 'status', 'steps', 'best speedup', 'took']
-    .forEach((title, index) => head.appendChild(el('th', index < 4 ? 'left' : null, title)));
+  view.columns.forEach((column) => {
+    const th = el('th', column.left ? 'left' : null);
+    th.appendChild(document.createTextNode(column.title));
+    th.classList.add('sortable');
+    th.tabIndex = 0;
+    th.setAttribute('role', 'button');
+    const sorted = view.sort.key === column.key;
+    if (sorted) {
+      th.classList.add('is-sorted');
+      th.setAttribute('aria-sort', view.sort.dir === 'asc' ? 'ascending' : 'descending');
+    }
+    th.appendChild(el('span', 'sort-caret', sorted && view.sort.dir === 'asc' ? '▲' : '▼'));
+    const toggle = () => {
+      if (view.sort.key === column.key) view.sort.dir = view.sort.dir === 'asc' ? 'desc' : 'asc';
+      else { view.sort.key = column.key; view.sort.dir = column.type === 'num' ? 'desc' : 'asc'; }
+      paintHistory(view);
+      if (menuState.id === view.id) syncMenu();
+    };
+    th.addEventListener('click', toggle);
+    th.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggle(); }
+    });
+    head.appendChild(th);
+  });
 
   const body = table.createTBody();
-  if (!entries.length) {
+  if (!shown.length) {
     const cell = body.insertRow().insertCell();
-    cell.colSpan = 7;
+    cell.colSpan = view.columns.length;
     const empty = el('div', 'empty');
-    empty.appendChild(el('div', 'empty-glyph', '○'));
-    empty.appendChild(el('div', 'empty-title', 'No finished jobs yet'));
-    empty.appendChild(el('div', 'empty-hint',
-      'Runs are recorded here once they finish, with their full logs kept beside '
-      + 'the index in dashboard/runs/.'));
+    empty.appendChild(el('div', 'empty-glyph', view.rows.length ? '⊘' : '○'));
+    empty.appendChild(el('div', 'empty-title',
+      view.rows.length ? 'No rows match the filter' : 'No finished jobs yet'));
+    empty.appendChild(el('div', 'empty-hint', view.rows.length
+      ? 'All ' + view.rows.length + ' rows are still there — widen the filter or reset it.'
+      : 'Runs are recorded here once they finish, with their full logs kept beside '
+        + 'the index in dashboard/runs/.'));
     cell.appendChild(empty);
+    updateViewChrome(view, 0);
     return;
   }
 
-  entries.forEach((entry) => {
+  shown.forEach((row) => {
     const tr = body.insertRow();
+    tr.title = row.title || '';
+    view.columns.forEach((column) => {
+      const cell = tr.insertCell();
+      if (column.left) cell.className = 'left';
+      const value = row[column.key];
+      if (column.key === 'best') {
+        cell.textContent = value === null ? '–' : value.toFixed(3) + 'x';
+        if (value !== null) cell.classList.add(value >= 1 ? 'is-good' : 'is-critical');
+      } else if (column.key === 'secs') {
+        cell.textContent = value === null || value === undefined ? '–' : value + 's';
+      } else if (column.key === 'status') {
+        cell.textContent = value;
+        cell.classList.add(value === 'done' ? 'is-good'
+          : (value === 'failed' ? 'is-critical' : 'is-muted'));
+      } else {
+        cell.textContent = value === null || value === undefined ? '–' : String(value);
+      }
+    });
+  });
+  updateViewChrome(view, shown.length);
+}
+
+async function refreshHistory() {
+  const { data } = await api('/api/history?limit=60');
+  const entries = (data && data.entries) || [];
+  const view = viewFor('history-table');
+  view.columns = HISTORY_COLUMNS;
+  view.rows = entries.map((entry) => {
     const speedups = (entry.steps || [])
       .map((step) => step.result && step.result.speedup)
       .filter((value) => typeof value === 'number');
-    const best = speedups.length ? Math.max.apply(null, speedups) : null;
-
-    [
-      new Date(entry.created_at * 1000).toLocaleString(),
-      entry.id,
-      entry.mode,
-      entry.status,
-      String((entry.steps || []).length),
-      best === null ? '–' : best.toFixed(3) + 'x',
-      entry.duration_s === null ? '–' : entry.duration_s + 's',
-    ].forEach((text, index) => {
-      const cell = tr.insertCell();
-      if (index < 4) cell.className = 'left';
-      cell.textContent = text;
-      if (index === 3) {
-        cell.classList.add(entry.status === 'done' ? 'is-good'
-          : (entry.status === 'failed' ? 'is-critical' : 'is-muted'));
-      }
-      if (index === 5 && best !== null) {
-        cell.classList.add(best >= 1 ? 'is-good' : 'is-critical');
-      }
-    });
-    tr.title = entry.title || '';
+    return {
+      when: new Date(entry.created_at * 1000).toLocaleString(),
+      // `label` so the popover's name filter works the same way it does on the
+      // results tables.
+      label: entry.id,
+      mode: entry.mode,
+      status: entry.status,
+      steps: (entry.steps || []).length,
+      best: speedups.length ? Math.max.apply(null, speedups) : null,
+      secs: entry.duration_s,
+      title: entry.title || '',
+      accuracy: null,
+    };
   });
+  paintHistory(view);
 }
 
 /* ---------------------------------------------------------------- chrome -- */
@@ -1526,6 +2395,7 @@ async function refreshGPU() {
 }
 
 async function refreshQueue() {
+  reconcileControls();
   const { data } = await api('/api/queue');
   if (!data) return;
   const pill = $('queue-pill');
@@ -1638,6 +2508,7 @@ async function boot() {
   showExtension(data.extension);
 
   setupChrome();
+  setupTableMenu();
   setupRun();
   setupCompare();
   setupSweep();
