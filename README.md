@@ -261,7 +261,7 @@ The harness compares against `BaselineTransformer` element by element:
 abs(user - ref) <= atol   OR   abs(user - ref) <= rtol * abs(ref)
 ```
 
-with `atol=0.001`, `rtol=0.01` by default. Every element must satisfy one of the two. That
+with `atol=0.002`, `rtol=0.02` by default. Every element must satisfy one of the two. That
 makes several baseline details load-bearing rather than incidental:
 
 - **Pre-norm residuals** — `x = x + Attn(norm1(x))`, then `x = x + FFN(norm2(x))`. The
