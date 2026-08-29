@@ -29,13 +29,15 @@ ATTENTION_BACKEND = "auto"
 #                from head_dim 128 up, where the wmma kernel is correct and
 #                slower. See run_kernel() in csrc/attention_dispatch.cuh.
 #   "scalar"     force the scalar kernel (no tensor cores, no TF32 rounding);
-#                head_dim in {8,16,32,64,128}, and raises on anything else. It
+#                head_dim in {8,16,32,64,128,256}, and raises on anything
+#                else. It
 #                used to fall through to ATen instead, which meant --attn-impl
 #                scalar at a head_dim it did not cover timed ATen and called it
 #                the scalar kernel.
 #   "wmma"       force the tensor-core kernel; raises on shapes it misses
 #   "tile"       force the cuTile kernel, fp32 operands: exact, CUDA cores.
-#                float32 and head_dim in {8,16,32,64}, and needs a build that
+#                float32 and head_dim in {8,16,32,64,128,256}, and needs a
+#                build that
 #                found CUDA 13.3+. Never picked by "auto".
 #   "tile-tf32"  the cuTile kernel with its GEMMs narrowed to tf32, which is
 #                what puts them on the tensor cores. Same arithmetic cuBLAS

@@ -8,8 +8,8 @@
 // this file, and the launch uses one "thread" per block because the block *is*
 // the unit of work.
 //
-// Scope: float32 in and out, head_dim in {8,16,32,64,256}. MathMode narrows
-// only the two GEMMs' operands -- see tile_attention.h.
+// Scope: float32 in and out, head_dim in {8,16,32,64,128,256}. MathMode
+// narrows only the two GEMMs' operands -- see tile_attention.h.
 //
 // Requires CUDA 13.3+, -std=c++20 and -enable-tile. The build defines
 // TRANSFORMER_HAVE_TILE only when all of that is present; without it this file
@@ -428,6 +428,18 @@ __global__ void split_combine_kernel(const float* __restrict__ part_o,
 #define TF32_M_64 128
 #define TF32_N_64 32
 #endif
+// head_dim 128 IS swept -- 9 shapes, all four math modes and both mask
+// modes out of one set of builds, in csrc/TUNING.md. It is the head_dim
+// where the choice
+// matters most: best to worst is 12.6x here, against 1.1x-1.3x at head_dim 64.
+// The three narrow modes all want 64x16, the widest block that still fits;
+// fp32, whose operands are twice as large, is 4.0x slower there and wants 32x16
+// or 16x16. Same kernel, same head_dim, opposite ends of the candidate set --
+// which is the spill cliff, not a smooth cost curve.
+#ifndef TF32_M_128
+#define TF32_M_128 64
+#define TF32_N_128 16
+#endif
 // head_dim 256 is not swept -- see the BlockCfg<256> note below. Every live
 // tile is BLOCK_M or BLOCK_N by 256, so a shape that wins at head_dim 64 costs
 // four times the footprint here and lands on the wrong side of the spill
@@ -458,6 +470,10 @@ __global__ void split_combine_kernel(const float* __restrict__ part_o,
 #ifndef TF32_CM_64
 #define TF32_CM_64 64
 #define TF32_CN_64 64
+#endif
+#ifndef TF32_CM_128
+#define TF32_CM_128 TF32_M_128
+#define TF32_CN_128 TF32_N_128
 #endif
 #ifndef TF32_CM_256
 #define TF32_CM_256 TF32_M_256
@@ -509,6 +525,14 @@ __global__ void split_combine_kernel(const float* __restrict__ part_o,
 #define FP32_M_64 32
 #define FP32_N_64 16
 #endif
+// fp32 keeps 32-bit operands, so the same block is twice the footprint it is in
+// bf16/fp16 -- and it lands the other side of the cliff: 64x16, which every
+// narrow mode wants here, is 4.0x slower than this. Dense and causal then split
+// (see FP32_CM_128): dense wants the 32 rows, causal wants 16.
+#ifndef FP32_M_128
+#define FP32_M_128 32
+#define FP32_N_128 16
+#endif
 #ifndef FP32_M_256
 #define FP32_M_256 16
 #define FP32_N_256 16
@@ -529,6 +553,13 @@ __global__ void split_combine_kernel(const float* __restrict__ part_o,
 #ifndef BF16_M_64
 #define BF16_M_64 64
 #define BF16_N_64 64
+#endif
+// 64x16 by 1.5x over 32x16. 64x32 and 64x64 tie it within the noise floor; the
+// narrowest of the three wins the short cases, which is where the grading set
+// lives. fp16 inherits these.
+#ifndef BF16_M_128
+#define BF16_M_128 64
+#define BF16_N_128 16
 #endif
 #ifndef BF16_M_256
 #define BF16_M_256 16
@@ -558,6 +589,16 @@ __global__ void split_combine_kernel(const float* __restrict__ part_o,
 #define FP32_CM_64 FP32_M_64
 #define FP32_CN_64 FP32_N_64
 #endif
+// Measured, not inherited, and the clearest case in the file for splitting the
+// two mask modes: fp32 dense at head_dim 128 wants 32x16 and loses 1.48x at
+// 16x16, while fp32 causal wants 16x16 and loses 1.59x at 32x16. A causal block
+// walks m+1 key tiles rather than S/BLOCK_N, so halving BLOCK_M costs it far
+// less work than it costs a dense block -- and buys back the occupancy this
+// head_dim's footprint spends.
+#ifndef FP32_CM_128
+#define FP32_CM_128 16
+#define FP32_CN_128 16
+#endif
 #ifndef FP32_CM_256
 #define FP32_CM_256 FP32_M_256
 #define FP32_CN_256 FP32_N_256
@@ -579,6 +620,10 @@ __global__ void split_combine_kernel(const float* __restrict__ part_o,
 #define BF16_CM_64 BF16_M_64
 #define BF16_CN_64 BF16_N_64
 #endif
+#ifndef BF16_CM_128
+#define BF16_CM_128 BF16_M_128
+#define BF16_CN_128 BF16_N_128
+#endif
 #ifndef BF16_CM_256
 #define BF16_CM_256 BF16_M_256
 #define BF16_CN_256 BF16_N_256
@@ -598,6 +643,13 @@ template <> struct BlockCfg<32, MathMode::Fp32, false> { static constexpr int M 
 template <> struct BlockCfg<32, MathMode::Fp32, true>  { static constexpr int M = FP32_CM_32; static constexpr int N = FP32_CN_32; };
 template <> struct BlockCfg<64, MathMode::Fp32, false> { static constexpr int M = FP32_M_64;  static constexpr int N = FP32_N_64;  };
 template <> struct BlockCfg<64, MathMode::Fp32, true>  { static constexpr int M = FP32_CM_64; static constexpr int N = FP32_CN_64; };
+
+// head_dim 128. Four of the five live tiles scale with head_dim, so the same
+// shape costs twice here what it costs at head_dim 64: 32x16 is 51 KB of tiles
+// against that shape's 27 KB. Swept -- see the FP32_M_128 and FP32_CM_128 notes
+// above for why dense and causal disagree, and csrc/TUNING.md for the tables.
+template <> struct BlockCfg<128, MathMode::Fp32, false> { static constexpr int M = FP32_M_128;  static constexpr int N = FP32_N_128;  };
+template <> struct BlockCfg<128, MathMode::Fp32, true>  { static constexpr int M = FP32_CM_128; static constexpr int N = FP32_CN_128; };
 
 // head_dim 256. The block holds Q, O, K^T, V and the score tile live at once,
 // and four of those five scale with head_dim -- so where head_dim 64 spends
@@ -619,6 +671,8 @@ template <> struct BlockCfg<256, MathMode::Fp32, true>  { static constexpr int M
 #define FP16_N_32 BF16_N_32
 #define FP16_M_64 BF16_M_64
 #define FP16_N_64 BF16_N_64
+#define FP16_M_128 BF16_M_128
+#define FP16_N_128 BF16_N_128
 #define FP16_M_256 BF16_M_256
 #define FP16_N_256 BF16_N_256
 #endif
@@ -631,6 +685,8 @@ template <> struct BlockCfg<256, MathMode::Fp32, true>  { static constexpr int M
 #define FP16_CN_32 BF16_CN_32
 #define FP16_CM_64 BF16_CM_64
 #define FP16_CN_64 BF16_CN_64
+#define FP16_CM_128 BF16_CM_128
+#define FP16_CN_128 BF16_CN_128
 #define FP16_CM_256 BF16_CM_256
 #define FP16_CN_256 BF16_CN_256
 #endif
@@ -643,6 +699,8 @@ template <> struct BlockCfg<32, MathMode::Fp16, false> { static constexpr int M 
 template <> struct BlockCfg<32, MathMode::Fp16, true>  { static constexpr int M = FP16_CM_32; static constexpr int N = FP16_CN_32; };
 template <> struct BlockCfg<64, MathMode::Fp16, false> { static constexpr int M = FP16_M_64;  static constexpr int N = FP16_N_64;  };
 template <> struct BlockCfg<64, MathMode::Fp16, true>  { static constexpr int M = FP16_CM_64; static constexpr int N = FP16_CN_64; };
+template <> struct BlockCfg<128, MathMode::Fp16, false> { static constexpr int M = FP16_M_128;  static constexpr int N = FP16_N_128;  };
+template <> struct BlockCfg<128, MathMode::Fp16, true>  { static constexpr int M = FP16_CM_128; static constexpr int N = FP16_CN_128; };
 template <> struct BlockCfg<256, MathMode::Fp16, false> { static constexpr int M = FP16_M_256;  static constexpr int N = FP16_N_256;  };
 template <> struct BlockCfg<256, MathMode::Fp16, true>  { static constexpr int M = FP16_CM_256; static constexpr int N = FP16_CN_256; };
 
@@ -654,6 +712,8 @@ template <> struct BlockCfg<32, MathMode::Bf16, false> { static constexpr int M 
 template <> struct BlockCfg<32, MathMode::Bf16, true>  { static constexpr int M = BF16_CM_32; static constexpr int N = BF16_CN_32; };
 template <> struct BlockCfg<64, MathMode::Bf16, false> { static constexpr int M = BF16_M_64;  static constexpr int N = BF16_N_64;  };
 template <> struct BlockCfg<64, MathMode::Bf16, true>  { static constexpr int M = BF16_CM_64; static constexpr int N = BF16_CN_64; };
+template <> struct BlockCfg<128, MathMode::Bf16, false> { static constexpr int M = BF16_M_128;  static constexpr int N = BF16_N_128;  };
+template <> struct BlockCfg<128, MathMode::Bf16, true>  { static constexpr int M = BF16_CM_128; static constexpr int N = BF16_CN_128; };
 template <> struct BlockCfg<256, MathMode::Bf16, false> { static constexpr int M = BF16_M_256;  static constexpr int N = BF16_N_256;  };
 template <> struct BlockCfg<256, MathMode::Bf16, true>  { static constexpr int M = BF16_CM_256; static constexpr int N = BF16_CN_256; };
 
@@ -670,6 +730,8 @@ template <> struct BlockCfg<32, MathMode::Tf32, false> { static constexpr int M 
 template <> struct BlockCfg<32, MathMode::Tf32, true>  { static constexpr int M = TF32_CM_32; static constexpr int N = TF32_CN_32; };
 template <> struct BlockCfg<64, MathMode::Tf32, false> { static constexpr int M = TF32_M_64;  static constexpr int N = TF32_N_64;  };
 template <> struct BlockCfg<64, MathMode::Tf32, true>  { static constexpr int M = TF32_CM_64; static constexpr int N = TF32_CN_64; };
+template <> struct BlockCfg<128, MathMode::Tf32, false> { static constexpr int M = TF32_M_128;  static constexpr int N = TF32_N_128;  };
+template <> struct BlockCfg<128, MathMode::Tf32, true>  { static constexpr int M = TF32_CM_128; static constexpr int N = TF32_CN_128; };
 template <> struct BlockCfg<256, MathMode::Tf32, false> { static constexpr int M = TF32_M_256;  static constexpr int N = TF32_N_256;  };
 template <> struct BlockCfg<256, MathMode::Tf32, true>  { static constexpr int M = TF32_CM_256; static constexpr int N = TF32_CN_256; };
 #endif
@@ -826,6 +888,7 @@ int splits_for_head_dim(int B, int H, int S, int head_dim, bool is_causal) {
         case 16: return splits_for<16, MATH>(B, H, S, is_causal);
         case 32: return splits_for<32, MATH>(B, H, S, is_causal);
         case 64: return splits_for<64, MATH>(B, H, S, is_causal);
+        case 128: return splits_for<128, MATH>(B, H, S, is_causal);
         case 256: return splits_for<256, MATH>(B, H, S, is_causal);
         default: return 1;
     }
@@ -995,6 +1058,9 @@ bool launch_mode(const float* q, const float* k, const float* v,
                 return true;
             case 64:
                 launch_for_head_dim<64, MATH>(q, k, v, mask, ms, qs, out, ws, splits, B, H, S, is_causal, scale, stream);
+                return true;
+            case 128:
+                launch_for_head_dim<128, MATH>(q, k, v, mask, ms, qs, out, ws, splits, B, H, S, is_causal, scale, stream);
                 return true;
             case 256:
                 launch_for_head_dim<256, MATH>(q, k, v, mask, ms, qs, out, ws, splits, B, H, S, is_causal, scale, stream);

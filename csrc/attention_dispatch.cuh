@@ -467,8 +467,8 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
                     at::cuda::getCurrentDeviceProperties()->minor,
                     ". scalar needs head_dim in {8,16,32,64,128,256} and enough "
                     "shared memory for its key tiles (float64 runs out past 16); "
-                    "wmma needs SM 8.0+ and head_dim in {8,16,32,64,128,256}; the "
-                    "tile kernels need float32 and head_dim in {8,16,32,64,256}. "
+                    "wmma needs SM 8.0+ and head_dim in {8,16,32,64,128,256}; "
+                    "the tile kernels need float32 and the same head_dim set. "
                     "Use impl=0 (auto) to fall back to SDPA for this shape.");
 
         // The strided views, not .contiguous() copies -- a measured tie, not an

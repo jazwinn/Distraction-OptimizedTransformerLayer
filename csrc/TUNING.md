@@ -1765,8 +1765,282 @@ So this is coverage: `--attn-impl wmma` (or scalar, or any tile mode) now runs
 at head_dim 256 and reports its own honest time instead of refusing, which is
 what the A/B tooling needs. It is not a speedup, and Auto does not take it.
 
-### One coverage gap left, deliberately
+### The coverage gap that was left, since closed
 
-The tile kernels now cover `{8,16,32,64,256}` -- 128 is still missing, as it was
-before. Nothing here needed it and nothing measured it; it is a `BlockCfg<128>`
-away if a shape ever wants it.
+The tile kernels covered `{8,16,32,64,256}` after this pass -- 128 was still
+missing. It is covered now; see "Tile kernel: head_dim 128" below.
+
+
+## Tile kernel: head_dim 128
+
+The last head_dim the tile kernels did not cover. Nothing in the kernel is
+head_dim-specific -- it is a template parameter, and the body reads `HEAD_DIM`
+through `ct::extents` -- so this was `BlockCfg<128, MODE, CAUSAL>` for the four
+math modes, a `case 128:` in `splits_for_head_dim` and `launch_mode`, and the
+macro block the sweep drives. No kernel change.
+
+The shapes are where the work was. head_dim 128 is the head_dim where the choice
+matters most: best to worst across nine candidates is **12.6x**, against
+1.1x-1.3x at head_dim 64. Four of the five live tiles (Q, the accumulator,
+K^T, V) scale with head_dim and only the score tile does not, so the spill
+cliff sits inside the candidate set instead of at its edge.
+
+### One set of builds, eight scores
+
+`tune_block_shapes.py` builds once per (backend, mask mode, candidate) -- 9
+candidates x 4 math modes x 2 mask modes would be 72 builds at ~2.5 minutes
+each. But every build already contains all four math modes and both mask modes;
+only the macros pick the shape. Pinning `FP32_*`, `BF16_*`, `TF32_*` and their
+`_CM_`/`_CN_` causal twins to the same (M, N) in one `-D` set makes one build
+serve all eight scores. 9 builds, not 72.
+
+Scored as a geometric mean of per-case ratios against the best candidate on that
+case, not a sum of raw milliseconds: seq 2048 is 30x seq 128 here, and summing
+lets a shape that tanks the short cases win on the long one (rule 2 at the top
+of this file). Dense cases: b8h8s128, b4h8s512, b1h8s2048. Causal adds
+b64h1s128, which is grading shape 9.
+
+### The narrow modes want the widest block that fits
+
+| geo mean, dense  | tf32 | bf16 | fp16 |
+|:-----------------|-----:|-----:|-----:|
+| **64x16**        | **1.00** | **1.01** | 1.04 |
+| 64x32            | 1.07 | 1.03 | 1.04 |
+| 64x64            | 1.08 | 1.01 | **1.01** |
+| 32x16            | 1.27 | 1.52 | 1.55 |
+| 16x32            | 1.92 | 1.83 | 1.83 |
+| 16x16            | 8.54 | 12.61 | 12.48 |
+
+| geo mean, causal | tf32 | bf16 | fp16 |
+|:-----------------|-----:|-----:|-----:|
+| **64x16**        | **1.02** | **1.00** | **1.00** |
+| 64x32            | 1.10 | 1.02 | 1.03 |
+| 32x16            | 1.07 | 1.26 | 1.25 |
+| 16x32            | 1.56 | 1.38 | 1.40 |
+| 16x16            | 6.14 | 8.13 | 7.79 |
+
+64x16 for all three, both mask modes. The three shapes with BLOCK_M 64 finish
+within noise of each other and everything below them loses by 25% or more, so
+what this measures is a *row count*, not a shape: the block needs 64 query rows
+to have enough work in flight, and N past 16 buys nothing because the key tile
+is already `HEAD_DIM x BLOCK_N` = 128x16. fp16 dense nominally prefers 64x64 by
+3%, inside the 4.3% floor, and it inherits bf16's macros anyway.
+
+16x16 is not merely last, it is 8-12x last. That is the cliff, and it is why the
+head_dim 256 coverage shape was a bad prior to start from.
+
+### fp32 splits on the mask mode, and by more than anything else in this file
+
+| geo mean | dense | causal |
+|:---------|------:|-------:|
+| 32x16    | **1.00** | 1.59 |
+| 16x16    | 1.48 | **1.00** |
+| 16x32    | 1.21 | 1.83 |
+| 32x32    | 1.59 | 4.31 |
+| 64x16    | (4.0x worse than 32x16) | 3.98 |
+
+fp32 keeps 32-bit operands, so 64x16 -- every narrow mode's winner -- is 4x
+slower here. It lands on the other side of the cliff, and dense and causal then
+disagree about where to stand: dense wants 32 query rows, causal wants 16, and
+each loses ~1.5x taking the other's. A causal block walks m+1 key tiles instead
+of S/BLOCK_N, so halving BLOCK_M costs it much less work than it costs a dense
+block, while buying back the same occupancy. This is the clearest case in the
+file for `FP32_CM_*` existing separately from `FP32_M_*`.
+
+The fp32 dense row was measured in a second run of the same sweep. Cross-run
+numbers are not comparable (rule 1), so it is reported as its own ranking; the
+causal ranking reproduced across both runs to within 2% (32x16 read 14.11 and
+14.34 ms at b1h8s2048), which is what makes the two tables trustworthy side by
+side rather than the ratios between them.
+
+### Against wmma and SDPA
+
+Interleaved, one process, min of rounds, fp32 in and out. `control` is SDPA
+timed a second time under another name: its true ratio is exactly 1.000x, so
+what it reports is this run's noise floor.
+
+| case (head_dim 128)   | control | wmma | tile-fp16 | tile-tf32 | tile (fp32) |
+|:----------------------|--------:|-----:|----------:|----------:|------------:|
+| b64 h1 s128 causal (shape 9) | 1.00x | **1.11x** | 0.90x | 0.64x | 0.32x |
+| b8 h8 s128 causal     | 0.94x | **1.04x** | 0.85x | 0.64x | 0.29x |
+| b8 h8 s128 dense      | 0.96x | **1.06x** | 0.79x | 0.60x | 0.11x |
+| b8 h8 s128 causal+pad | 0.91x | **1.01x** | 0.83x | 0.60x | 0.14x |
+| b4 h8 s512 causal     | 1.01x | 1.25x | **1.28x** | 0.82x | 0.20x |
+| b4 h8 s512 dense      | 1.07x | **1.31x** | 1.30x | 0.78x | 0.11x |
+| b1 h8 s2048 causal    | 1.03x | 1.50x | **1.67x** | 0.96x | 0.18x |
+| b1 h8 s2048 dense     | 0.98x | 1.19x | **1.50x** | 0.87x | 0.11x |
+
+Ratios are against SDPA; >1 is faster. Three things follow:
+
+* **The crossover is around seq 512.** Below it wmma wins and tile-fp16 is
+  slower than SDPA; at 512 they tie; at 2048 tile-fp16 is 1.12x (causal) to
+  1.26x (dense) faster than wmma. Same shape as the head_dim 64 story -- the
+  tile kernel needs a long key loop before its scheduling pays for itself.
+* **Auto is unchanged.** It routes head_dim 128 to wmma, and wmma wins the two
+  shapes that matter for grading (seq 128). `wmma_preferred_by_auto` did not
+  move; nothing here is a default-path change.
+* **tile-tf32 is dead at this head_dim.** 0.60x-0.96x, never a win, and
+  tile-fp16 matches its accuracy exactly (9.0e-4 against the same reference)
+  while running 1.3x-1.7x faster. Same 10 mantissa bits, half the operand width
+  -- the fp16-vs-tf32 result from head_dim 64, reproduced.
+
+`tile` (fp32) is 0.11x-0.32x and is coverage, not a candidate: it is the only
+mode that does not round its operands, which is what `--attn-impl tile` is for.
+Its error column reads 2.2e-3 in this table only because the reference is
+computed with `allow_tf32` on, matching the harness baseline -- that number is
+the *reference's* rounding, not the kernel's. Against an exact reference
+`verify_kernel.py` reads 7.2e-7.
+
+### Where tile-fp16 overtakes wmma: seq ~512, and it is sequence length
+
+The table above samples three sequence lengths and reads "crossover somewhere
+around 512". Swept finely, at three grid shapes, `tile-fp16 / wmma` (>1 means
+the tile kernel wins):
+
+| seq | b8h8 caus | b8h8 dense | b1h8 caus | b1h8 dense | b64h1 caus | b64h1 dense |
+|----:|----------:|-----------:|----------:|-----------:|-----------:|------------:|
+| 128 | 0.81 | 0.74 | -- | -- | 0.84 | 0.75 |
+| 192 | 0.86 | 0.78 | -- | -- | -- | -- |
+| 256 | 0.92 | 0.88 | 0.70 | 0.85 | 0.90 | 0.89 |
+| 320 | 0.93 | 0.98 | -- | -- | -- | -- |
+| 384 | 0.94 | 0.97 | 1.05 | 0.81 | 0.97 | 0.98 |
+| 448 | 0.99 | **1.03** | -- | -- | -- | -- |
+| 512 | 0.97 | **1.03** | 0.98 | 0.73 | 0.97 | 0.95 |
+| 640 | **1.07** | **1.14** | 0.98 | 1.16 | -- | -- |
+| 768 | 1.01 | **1.15** | **1.14** | **1.07** | 1.00 | **1.08** |
+| 896 | 0.98 | **1.06** | -- | -- | -- | -- |
+| 1024 | **1.08** | **1.07** | **1.20** | **1.08** | 0.96 | **1.08** |
+| 1536 | -- | -- | **1.16** | 1.01 | -- | -- |
+| 2048 | -- | -- | **1.10** | **1.20** | -- | -- |
+
+The control column deviated up to 4.6% in this run, so +-5% is a tie. That makes
+it a band, not a point: wmma wins outright to seq 256 (0.70-0.92, far outside
+noise), 384-512 is a tie at 0.93-1.03, and from 768 up tile-fp16 leads in 9 of
+11 rows by 1.07x-1.20x.
+
+**It is sequence length, not grid size**, which is the part worth measuring
+rather than assuming. The two kernels run different BLOCK_M -- 64 in the tile
+kernel, 32 in wmma (`WMMA_M_128`) -- so they never put the same number of blocks
+on the device at a given seq, and a threshold quoted in seq alone could really
+have been a threshold in occupancy. Two comparisons separate them:
+
+* At an identical 128 tile-blocks, `b8h8 s128` reads 0.81 and `b1h8 s1024` reads
+  1.20. Same occupancy, opposite verdict.
+* At seq 512 the ratio is 0.97 / 0.97 / 0.98 across grids of 512, 512 and 64
+  blocks. Same seq, 8x the block count, same answer.
+
+So what the tile kernel needs is a long key loop to amortise its scheduling, not
+a starved grid -- the opposite of the split-KV story, where a starved grid was
+exactly the problem. Which also means this threshold is not a candidate for a
+dispatch rule keyed on block count.
+
+`b1h8` is the noisiest series: 64-128 blocks is under one wave on 46 SMs, so it
+is latency-bound, and its 384 (1.05) and 512 (0.73) dense rows disagree with
+their neighbours by more than the trend does. Past the threshold the win is
+modest -- 1.1x typical, against the 1.5x tile-fp16 posts over SDPA in the same
+rows, because wmma is beating SDPA by 1.2x-1.4x there too.
+
+Auto is unaffected either way: every grading shape is seq 128 or seq 1024, and
+the seq-1024 one is head_dim 32.
+
+### Past the threshold: dense is a reliable win, causal is a tie on big grids
+
+"tile-fp16 wins above seq 512" is true of the dense kernel and much weaker than
+that of the causal one. 40 (shape, mask) combinations above seq 512, each timed
+in THREE independent passes -- one number per shape cannot separate a 7% win
+from run-to-run variance. Ratio is `wmma_ms / tile-fp16_ms`, so >1 means the
+tile kernel wins; `spread` is max-min across the three passes, which is the
+honest error bar on the row.
+
+|          | shapes | median | range | verdict |
+|:---------|-------:|-------:|:------|:--------|
+| dense    | 20 | **1.090** | 1.054 - 1.184 | wins all 20, every one outside noise |
+| causal   | 20 | 1.012 | 0.947 - 1.203 | 6 wins, 13 ties, 1 loss |
+
+Dense, seq 640-4096, grids from 8 to 64 `b*h`: every median between 1.054 and
+1.184, spread under 0.09 on all but one row, and the tightest repeat to three
+digits (`b1 h8 s1024` read 1.075 / 1.077 / 1.077). There is nothing ambiguous
+in the dense half of this table.
+
+Causal sorts by grid size, not by sequence length:
+
+| causal, by `b*h` | rows | ratios |
+|:-----------------|-----:|:-------|
+| 64  | 9  | 0.985 - 1.022, median 1.005 -- a tie, every row |
+| <=32 | 11 | mostly 1.04 - 1.20; two exceptions, `b2 h8 s2048` 0.974 and `b1 h8 s4096` 0.947 |
+
+`b1 h8 s4096` causal is the only real loss in 40 shapes.
+
+The mechanism is wmma getting better, not the tile kernel getting worse:
+`wmma/sdpa` under causal climbs from ~1.20x at 8 blocks-per-head to 1.42x-1.53x
+at 64, while `tile-fp16/sdpa` sits flat near 1.40x throughout. wmma runs
+`WMMA_M_128` = 32 against the tile kernel's 64, so it has twice the blocks with
+which to fill a large causal grid -- and causal is the mask mode where block
+cost varies most, so more, smaller blocks schedule better.
+
+This refines the subsection above rather than contradicting it. "Sequence
+length, not grid size" is about *where the crossover sits*, and that still holds
+-- at seq 512 the ratio was 0.97-0.98 across grids of 64, 512 and 512 blocks.
+What grid size decides is *how large the win is once past it*, and under causal
+that is the difference between a tie and 1.1x-1.2x.
+
+One caveat on reading the raw table: several causal rows carry a control
+deviation of 9%-12% while their own three passes agree to within 0.01 (`b2 h8
+s1024` read 1.103 / 1.103 / 1.097 against a 12.1% control). That is SDPA's
+variance between two timings of itself, and the `wmma/fp16` ratio does not go
+through SDPA at all -- which is why `spread` is the error bar to read here and
+the control only gates the `*/sdpa` columns.
+
+### Routing Auto to tile-fp16 at head_dim 128: measured, and NOT done
+
+The op-level tables above say tile-fp16 beats wmma by 1.05x-1.18x on dense
+attention above seq 512. That is a real measurement and it is not a reason to
+route to it. End to end -- 4 layers, `ffn_dim = d_model`, one process, impls
+interleaved, `--attn-impl` forcing exactly the path a routing rule would pick:
+
+| head_dim 128, e2e | causal | dense |
+|:------------------|-------:|------:|
+| b8 h4 s512        | 0.961x | 0.936x |
+| b8 h4 s1024       | 0.968x | 0.988x |
+| b16 h4 s1024      | 0.958x | 0.981x |
+| b4 h4 s2048       | 0.986x | **1.031x** |
+| b2 h8 s2048       | 0.988x | **1.042x** |
+| b1 h8 s4096       | 0.953x | **1.073x** |
+
+Control column 0.987x-1.015x. Causal loses in all six cases: the op-level tie
+becomes a 1.2%-4.7% regression. Dense survives only from seq 2048, at 3%-7%
+rather than the 5%-18% the op promised.
+
+Two things eat it, and neither amortises:
+
+* **The repack.** The tile kernels cannot write `[B, S, H*head_dim]`, so
+  `fused_attention_forward` allocates `[B,H,S,D]` and calls `to_bshd()` -- a
+  full transpose + reshape + allocation, once per layer. wmma writes the flat
+  layout from its epilogue for free. That cost scales with the same tensor the
+  win does.
+* **Amdahl.** Attention shares the layer with four projections, an FFN, two
+  LayerNorms and the residuals. 1.09x on the op is ~1%-2% on the model -- and
+  `ffn_dim = d_model` is already the attention-favourable setting. A 4x FFN
+  would be worse.
+
+There is also a trap for whoever tries this anyway. `tile_mode` is derived from
+the REQUESTED impl (attention_dispatch.cuh, `const bool tile_mode =`), and it
+decides two things *before* `run_kernel` is reached: the causal->mask fold, and
+`kernel_writes_bshd`. Routing Auto to a tile kernel from inside `run_kernel`
+would allocate a `[B,S,H*D]` output and then let the tile epilogue write
+`[B,H,S,D]` into it -- silently scrambled, not an error. Auto's choice has to be
+resolved before the allocation, which makes this a dispatch refactor rather than
+a clause in `wmma_preferred_by_auto`.
+
+So Auto keeps sending head_dim 128 to wmma. A workload that really is long dense
+attention at this head_dim can ask for `--attn-impl tile-fp16` and get the 3%-7%
+without putting a new way to mis-lay-out the output into the default path.
+
+### Measurement note
+
+Part of this pass was measured while a second process was using the same GPU.
+It was caught by the control column (0.44x on one row, where the true value is
+1.000x) and by SDPA itself reading 4x its quiet time, and those runs were
+discarded and re-run. Every number above comes from a run whose control column
+sits inside 0.91x-1.07x. This is what the control row is for; a table without
+one would have shipped the contaminated ranking.

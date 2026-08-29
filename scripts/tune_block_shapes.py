@@ -182,21 +182,34 @@ class Backend:
     def macros(self, dtype, head_dim: int, m: int, n: int, causal: bool) -> dict:
         """-D overrides pinning `head_dim` to (m, n) and every other head_dim to
         a shape known to compile, so one bad candidate cannot fail the build for
-        reasons unrelated to the shape under test."""
+        reasons unrelated to the shape under test.
+
+        The safe shape is head_dim-dependent for the same reason the defaults
+        are: four of the five live tiles scale with head_dim, so the tile
+        backends' 64x64 is 27 KB at head_dim 8 and 205 KB at head_dim 128. A
+        head_dim not under test still gets compiled into every candidate build,
+        so pinning it to a shape that spills would tax -- or fail -- every build
+        in the sweep for a kernel this run never times."""
         mp = f"{self.prefix}_{'CM' if causal else 'M'}"
         np_ = f"{self.prefix}_{'CN' if causal else 'N'}"
-        safe_m, safe_n = (32, 16) if self.name == "wmma" else (64, 64)
         out = {}
         for d in self.head_dims:
+            if self.name == "wmma":
+                safe_m, safe_n = 32, 16
+            else:
+                safe_m, safe_n = (16, 16) if d >= 128 else (64, 64)
             out[f"{mp}_{d}"] = m if d == head_dim else safe_m
             out[f"{np_}_{d}"] = n if d == head_dim else safe_n
         return out
 
 
 BACKENDS = {
-    "tile-fp32": Backend("tile-fp32", 3, "FP32", (8, 16, 32, 64), True,  (torch.float32,)),
-    "tile-bf16": Backend("tile-bf16", 4, "BF16", (8, 16, 32, 64), True,  (torch.float32,)),
-    "tile-tf32": Backend("tile-tf32", 5, "TF32", (8, 16, 32, 64), True,  (torch.float32,)),
+    "tile-fp32": Backend("tile-fp32", 3, "FP32", (8, 16, 32, 64, 128), True,
+                         (torch.float32,)),
+    "tile-bf16": Backend("tile-bf16", 4, "BF16", (8, 16, 32, 64, 128), True,
+                         (torch.float32,)),
+    "tile-tf32": Backend("tile-tf32", 5, "TF32", (8, 16, 32, 64, 128), True,
+                         (torch.float32,)),
     "wmma":      Backend("wmma",      2, "WMMA", (8, 16, 32, 64, 128), False,
                          (torch.float32, torch.float16, torch.bfloat16)),
 }

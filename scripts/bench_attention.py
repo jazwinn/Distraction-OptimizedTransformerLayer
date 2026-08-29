@@ -72,9 +72,10 @@ def main() -> int:
     torch.backends.cuda.matmul.allow_tf32 = True
 
     # Tile modes are optional columns: each raises rather than falling back on
-    # a shape it does not specialize (head_dim 128 in this table), and the whole
-    # tile kernel is absent from builds that found no CUDA 13.3+. Both show as
-    # n/a. Kept as a list so a new math mode is one entry, not another set of
+    # a shape it does not specialize, and the whole tile kernel is absent from
+    # builds that found no CUDA 13.3+. Both show as n/a. Every head_dim in this
+    # table is specialized now, so an n/a here means the build, not the shape.
+    # Kept as a list so a new math mode is one entry, not another set of
     # hand-written column branches.
     #
     # The scalar column is optional for the same reason: it covers every
@@ -142,14 +143,13 @@ def main() -> int:
                         for n, _ in TILE_COLS))
 
     print("-" * len(head))
-    print("ratios >1 mean the custom kernel is faster than sdpa. scalar and "
-          "wmma now cover")
-    print("every head_dim in the table; the tile columns report n/a at head_dim "
-          "128, which")
-    print("they do not specialize. tile runs on the CUDA cores; tile-tf32 and "
-          "tile-bf16 are")
-    print("the same kernel with its GEMM operands narrowed onto the tensor "
-          "cores.")
+    print("ratios >1 mean the custom kernel is faster than sdpa. Every impl "
+          "covers every")
+    print("head_dim in the table, so an n/a is a build without tile support "
+          "rather than a")
+    print("shape. tile runs on the CUDA cores; tile-tf32, tile-bf16 and "
+          "tile-fp16 are the")
+    print("same kernel with its GEMM operands narrowed onto the tensor cores.")
     return 0
 
 

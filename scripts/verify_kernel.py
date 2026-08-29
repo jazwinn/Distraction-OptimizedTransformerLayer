@@ -49,6 +49,7 @@ CASES = [
     ("long seq causal",   1,  8, 2048, 64, True,  False),
     ("odd shape",         3,  5,  37, 32, True,  True),
     ("wide head_dim",     2,  4,  64, 128, False, False),
+    ("wide caus+pad",     2,  4, 128, 128, True,  True),
     ("head_dim 256",      2,  4,  64, 256, False, False),
     ("head_dim 256 caus", 2,  4, 128, 256, True,  True),
 ]
