@@ -1,0 +1,176 @@
+{
+  "_comment": [
+    "The 14 official grading shapes, from Appendix: Test Shapes.",
+    "",
+    "The appendix column 'QKV Dim' is d_model here, and ffn_dim equals it in",
+    "every shape -- so there is no 4x FFN expansion anywhere in the set, and",
+    "attention plus per-layer overhead dominates rather than the FFN.",
+    "",
+    "All 14 are causal. Layers is 4 everywhere except shape 14, which is 2.",
+    "Shape 1 is the base; 2-6 vary batch, 7-8 vary d_model, 9-11 vary heads,",
+    "12-13 vary seq_len, and 14 is its own thing.",
+    "",
+    "head_dim = d_model / heads decides which attention kernel can run:",
+    "wmma and scalar cover {8,16,32,64,128}, the tile kernels {8,16,32,64}.",
+    "",
+    "This file is re-read on every request, so edits appear on the next page",
+    "load with no restart. Keys: name, batch_size, seq_len, d_model, heads,",
+    "ffn_dim, layers, causal, note. Anything else is ignored."
+  ],
+  "presets": [
+    {
+      "name": "1 - base",
+      "batch_size": 64,
+      "seq_len": 128,
+      "d_model": 128,
+      "heads": 4,
+      "ffn_dim": 128,
+      "layers": 4,
+      "causal": true,
+      "note": "head_dim 32. The reference point the other twelve vary one axis from."
+    },
+    {
+      "name": "2 - batch 1",
+      "batch_size": 1,
+      "seq_len": 128,
+      "d_model": 128,
+      "heads": 4,
+      "ffn_dim": 128,
+      "layers": 4,
+      "causal": true,
+      "note": "head_dim 32. Smallest work per launch in the set, so kernel launch overhead dominates and CUDA graph capture pays most here."
+    },
+    {
+      "name": "3 - batch 4",
+      "batch_size": 4,
+      "seq_len": 128,
+      "d_model": 128,
+      "heads": 4,
+      "ffn_dim": 128,
+      "layers": 4,
+      "causal": true,
+      "note": "head_dim 32. Still launch-bound."
+    },
+    {
+      "name": "4 - batch 16",
+      "batch_size": 16,
+      "seq_len": 128,
+      "d_model": 128,
+      "heads": 4,
+      "ffn_dim": 128,
+      "layers": 4,
+      "causal": true,
+      "note": "head_dim 32."
+    },
+    {
+      "name": "5 - batch 128",
+      "batch_size": 128,
+      "seq_len": 128,
+      "d_model": 128,
+      "heads": 4,
+      "ffn_dim": 128,
+      "layers": 4,
+      "causal": true,
+      "note": "head_dim 32. Enough blocks to fill the card."
+    },
+    {
+      "name": "6 - batch 10000",
+      "batch_size": 10000,
+      "seq_len": 128,
+      "d_model": 128,
+      "heads": 4,
+      "ffn_dim": 128,
+      "layers": 4,
+      "causal": true,
+      "note": "head_dim 32. The largest runnable shape: ~3 GiB, most of it the baseline's [B,H,S,S] scores. Slow, but it fits."
+    },
+    {
+      "name": "7 - d_model 32",
+      "batch_size": 64,
+      "seq_len": 128,
+      "d_model": 32,
+      "heads": 4,
+      "ffn_dim": 32,
+      "layers": 4,
+      "causal": true,
+      "note": "head_dim 8, the narrowest in the set."
+    },
+    {
+      "name": "8 - d_model 1024",
+      "batch_size": 64,
+      "seq_len": 128,
+      "d_model": 1024,
+      "heads": 4,
+      "ffn_dim": 1024,
+      "layers": 4,
+      "causal": true,
+      "note": "head_dim 256 -- outside every custom kernel (wmma/scalar stop at 128, tile at 64), so attention falls back to SDPA. Forcing any --attn-impl here will be refused."
+    },
+    {
+      "name": "9 - 1 head",
+      "batch_size": 64,
+      "seq_len": 128,
+      "d_model": 128,
+      "heads": 1,
+      "ffn_dim": 128,
+      "layers": 4,
+      "causal": true,
+      "note": "head_dim 128 -- wmma and scalar cover it, the tile kernels do not."
+    },
+    {
+      "name": "10 - 2 heads",
+      "batch_size": 64,
+      "seq_len": 128,
+      "d_model": 128,
+      "heads": 2,
+      "ffn_dim": 128,
+      "layers": 4,
+      "causal": true,
+      "note": "head_dim 64, the widest the tile kernels reach."
+    },
+    {
+      "name": "11 - 16 heads",
+      "batch_size": 64,
+      "seq_len": 128,
+      "d_model": 128,
+      "heads": 16,
+      "ffn_dim": 128,
+      "layers": 4,
+      "causal": true,
+      "note": "head_dim 8."
+    },
+    {
+      "name": "12 - seq 32",
+      "batch_size": 64,
+      "seq_len": 32,
+      "d_model": 128,
+      "heads": 4,
+      "ffn_dim": 128,
+      "layers": 4,
+      "causal": true,
+      "note": "head_dim 32. Shortest sequence in the set; the regime split-KV targets."
+    },
+    {
+      "name": "13 - seq 1024",
+      "batch_size": 64,
+      "seq_len": 1024,
+      "d_model": 128,
+      "heads": 4,
+      "ffn_dim": 128,
+      "layers": 4,
+      "causal": true,
+      "note": "head_dim 32. Longest runnable sequence here; the baseline's scores are 1 GiB, and attention starts to dominate."
+    },
+    {
+      "name": "14 - seq 100000",
+      "batch_size": 32,
+      "seq_len": 100000,
+      "d_model": 1024,
+      "heads": 16,
+      "ffn_dim": 1024,
+      "layers": 2,
+      "causal": true,
+      "note": "head_dim 64, 2 layers. Runs: the harness streams the batch (32 slices of 1 row) because the full 12.2 GiB input does not fit, and skips the baseline, whose scores are 596 GiB even one row at a time. So this reports real latencies with no speedup and no accuracy verdict -- there is no reference to compare against."
+    }
+  ]
+}

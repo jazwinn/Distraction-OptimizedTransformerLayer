@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transformer Benchmark</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="shell">
+
+  <!-- The rail keeps GPU state, extension state and the theme control in view on
+       every screen. They apply to the whole dashboard rather than to one tab, and
+       memory headroom is worth seeing while a shape is being configured. -->
+  <aside class="rail">
+    <div class="rail-head">
+      <span class="brandmark" aria-hidden="true">TB</span>
+      <div style="min-width:0">
+        <h1>Benchmark</h1>
+        <div class="sub" id="repo-path">&nbsp;</div>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav" role="tablist" aria-label="Sections">
+      <button class="nav-item" role="tab" data-tab="run" aria-selected="true">
+        <span class="glyph" aria-hidden="true">&#9654;</span> Run</button>
+      <button class="nav-item" role="tab" data-tab="compare" aria-selected="false">
+        <span class="glyph" aria-hidden="true">&#8646;</span> Compare</button>
+      <button class="nav-item" role="tab" data-tab="sweep" aria-selected="false">
+        <span class="glyph" aria-hidden="true">&#9776;</span> Sweep</button>
+      <button class="nav-item" role="tab" data-tab="scripts" aria-selected="false">
+        <span class="glyph" aria-hidden="true">&gt;_</span> Scripts</button>
+      <button class="nav-item" role="tab" data-tab="presets" aria-selected="false">
+        <span class="glyph" aria-hidden="true">&#9635;</span> Presets</button>
+      <button class="nav-item" role="tab" data-tab="history" aria-selected="false">
+        <span class="glyph" aria-hidden="true">&#8635;</span> History</button>
+    </nav>
+
+    <div class="rail-foot">
+      <div class="gauge" id="gpu-chip">
+        <div class="gauge-top">
+          <span class="gauge-name" id="gpu-name">detecting GPU&hellip;</span>
+          <span class="gauge-pct" id="gpu-util"></span>
+        </div>
+        <div class="track"><div class="track-fill" id="gpu-meter"></div></div>
+        <div class="gauge-foot">
+          <span id="gpu-mem">&nbsp;</span>
+          <span id="gpu-temp"></span>
+        </div>
+      </div>
+
+      <div class="rail-chip" id="ext-chip"
+           title="Whether the CUDA extension loads, and whether it was built with cuTile support">
+        <span class="dot" id="ext-dot"></span>
+        <span id="ext-text">extension: not probed</span>
+        <button class="btn btn-sm" id="ext-probe">probe</button>
+      </div>
+
+      <div class="theme-toggle" role="group" aria-label="Colour theme">
+        <button data-theme-choice="light" aria-pressed="false">Light</button>
+        <button data-theme-choice="system" aria-pressed="true">Auto</button>
+        <button data-theme-choice="dark" aria-pressed="false">Dark</button>
+      </div>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="topbar-titles">
+        <h1 id="view-title">Run</h1>
+        <p id="view-sub">One configuration on one shape</p>
+      </div>
+      <div class="topbar-actions">
+        <span class="queue-pill" id="queue-pill"><span class="pulse"></span><span id="queue-text">idle</span></span>
+      </div>
+    </header>
+
+    <!-- ============================= RUN ============================= -->
+    <section class="view is-active" id="panel-run" role="tabpanel">
+      <div class="grid-2">
+        <div class="stack">
+
+          <section class="card">
+            <div class="card-head">
+              <h2>Shape</h2>
+              <select id="run-preset" class="btn btn-sm" style="height:26px"
+                      title="Load a saved shape from presets.json">
+                <option value="">load preset&hellip;</option>
+              </select>
+            </div>
+            <div class="card-body">
+              <div class="fields is-tight" id="run-shape"></div>
+              <div class="derived" id="run-derived"></div>
+            </div>
+          </section>
+
+          <section class="card">
+            <div class="card-head"><h2>Optimizations</h2></div>
+            <div class="card-body"><div class="fields" id="run-optimization"></div></div>
+            <details class="disclosure">
+              <summary>Kernel switches <span class="tag is-info" id="run-env-count" hidden></span></summary>
+              <div class="disclosure-body">
+                <p class="prose" style="margin-bottom:12px">Environment variables the
+                  extension reads at startup. They go to the benchmark's child
+                  process, so they need no change to <code>csrc/</code>.</p>
+                <div class="fields" id="run-env"></div>
+              </div>
+            </details>
+          </section>
+
+          <section class="card">
+            <div class="card-head">
+              <h2>Measurement</h2>
+              <div class="btn-row">
+                <button class="btn btn-sm" data-speed="quick"
+                        title="warmup 5, repeats 20, 1 round, 2 accuracy trials. Enough to see a large difference in seconds; too noisy to separate two close configurations.">quick</button>
+                <button class="btn btn-sm" data-speed="full"
+                        title="Clear the overrides so the run uses the counts written in torch_transformer_benchmark.py: warmup 20, repeats 100, 3 rounds, 5 accuracy trials.">full</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="fields" id="run-timing"></div>
+              <div class="fields" id="run-accuracy" style="margin-top:12px"></div>
+            </div>
+            <details class="disclosure">
+              <summary>Data &amp; torch settings</summary>
+              <div class="disclosure-body">
+                <div class="fields" id="run-data"></div>
+                <div class="fields" id="run-torch" style="margin-top:12px"></div>
+                <div class="fields" id="run-other" style="margin-top:12px"></div>
+              </div>
+            </details>
+          </section>
+        </div>
+
+        <div class="stack">
+          <section class="card">
+            <div class="card-head">
+              <h2>Command</h2>
+              <button class="btn btn-sm" id="run-copy-cmd">copy</button>
+            </div>
+            <div class="card-body">
+              <pre class="command" id="run-command">&nbsp;</pre>
+              <div class="issues" id="run-issues" style="margin-top:12px"></div>
+              <div class="btn-row" style="margin-top:14px">
+                <button class="btn btn-primary" id="run-go">Run benchmark</button>
+                <button class="btn btn-danger" id="run-stop" disabled>Stop</button>
+                <span class="status-line" id="run-job-status">no job yet</span>
+              </div>
+            </div>
+          </section>
+        </div>
+      </div>
+
+      <div class="stack" style="margin-top:16px">
+        <section class="card" id="run-results-card" hidden>
+          <div class="card-head">
+            <h2>Result</h2>
+            <button class="btn btn-sm" data-csv="run-results">copy CSV</button>
+          </div>
+          <div class="card-body" id="run-summary"></div>
+          <div class="card-body scroll-x" style="padding:0"><table class="data" id="run-results"></table></div>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <h2>Log</h2>
+            <label class="checkline"><input type="checkbox" id="run-follow" checked> follow</label>
+          </div>
+          <pre class="log" id="run-log"></pre>
+        </section>
+      </div>
+    </section>
+
+    <!-- =========================== COMPARE =========================== -->
+    <section class="view" id="panel-compare" role="tabpanel">
+      <div class="stack">
+        <section class="card">
+          <div class="card-head">
+            <h2>Shape</h2>
+            <span class="sub">shared by both sides, so the comparison is like for like</span>
+            <select id="cmp-preset" class="btn btn-sm" style="height:26px">
+              <option value="">load preset&hellip;</option>
+            </select>
+          </div>
+          <div class="card-body">
+            <div class="fields is-tight" id="cmp-shape"></div>
+            <div class="derived" id="cmp-derived"></div>
+            <div class="fields" id="cmp-timing" style="margin-top:14px"></div>
+          </div>
+        </section>
+
+        <div class="grid-ab">
+          <section class="card">
+            <div class="card-head">
+              <h2><span class="role is-a">A</span>Config A</h2>
+              <button class="btn btn-sm" id="cmp-copy-ab">copy A &rarr; B</button>
+            </div>
+            <div class="card-body"><div class="fields" id="cmp-a-optimization"></div></div>
+            <details class="disclosure">
+              <summary>Kernel switches</summary>
+              <div class="disclosure-body"><div class="fields" id="cmp-a-env"></div></div>
+            </details>
+            <div class="card-body"><pre class="command is-compact" id="cmp-a-command">&nbsp;</pre></div>
+          </section>
+
+          <section class="card">
+            <div class="card-head"><h2><span class="role is-b">B</span>Config B</h2></div>
+            <div class="card-body"><div class="fields" id="cmp-b-optimization"></div></div>
+            <details class="disclosure">
+              <summary>Kernel switches</summary>
+              <div class="disclosure-body"><div class="fields" id="cmp-b-env"></div></div>
+            </details>
+            <div class="card-body"><pre class="command is-compact" id="cmp-b-command">&nbsp;</pre></div>
+          </section>
+        </div>
+
+        <section class="card">
+          <div class="card-body">
+            <div class="issues" id="cmp-issues" style="margin-bottom:12px"></div>
+            <label class="checkline"><input type="checkbox" id="cmp-control" checked>
+              Run a control &mdash; config A a second time</label>
+            <p class="prose" style="margin-top:8px">A and B are timed in separate
+              processes, so the gap between them carries run-to-run noise. The
+              control's A/A ratio has a true value of <strong>1.000x</strong>, so
+              whatever it comes back as is the bar an A-vs-B difference has to clear
+              before it means anything. Every A/B script in <code>scripts/</code>
+              prints the same column, and <code>csrc/TUNING.md</code> puts the floor
+              near 4.3%.</p>
+            <div class="btn-row" style="margin-top:14px">
+              <button class="btn btn-primary" id="cmp-go">Run comparison</button>
+              <button class="btn btn-danger" id="cmp-stop" disabled>Stop</button>
+              <span class="status-line" id="cmp-job-status">no job yet</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="card" id="cmp-results-card" hidden>
+          <div class="card-head">
+            <h2>Result</h2>
+            <button class="btn btn-sm" data-csv="cmp-results">copy CSV</button>
+          </div>
+          <div class="card-body" id="cmp-summary"></div>
+          <div class="card-body scroll-x" style="padding:0"><table class="data" id="cmp-results"></table></div>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <h2>Log</h2>
+            <label class="checkline"><input type="checkbox" id="cmp-follow" checked> follow</label>
+          </div>
+          <pre class="log" id="cmp-log"></pre>
+        </section>
+      </div>
+    </section>
+
+    <!-- ============================ SWEEP ============================ -->
+    <section class="view" id="panel-sweep" role="tabpanel">
+      <div class="grid-2">
+        <section class="card">
+          <div class="card-head">
+            <h2>Shapes</h2>
+            <div class="btn-row">
+              <button class="btn btn-sm" id="sweep-all">all</button>
+              <button class="btn btn-sm" id="sweep-none">none</button>
+            </div>
+          </div>
+          <div class="card-body" style="padding-bottom:12px">
+            <p class="prose">One child process per shape, queued and run
+              <strong>one at a time</strong> &mdash; two benchmarks sharing the card
+              would contend for it and both would report meaningless numbers. Rows
+              fill in as each finishes. Edit
+              <code id="sweep-presets-path">presets.json</code> in the Presets view
+              to change this list.</p>
+          </div>
+          <div class="picklist" id="sweep-shapes"></div>
+          <div class="listfoot"><span id="sweep-count"></span></div>
+        </section>
+
+        <div class="stack">
+          <section class="card">
+            <div class="card-head">
+              <h2>Configuration</h2>
+              <span class="sub">applied to every shape</span>
+            </div>
+            <div class="card-body"><div class="fields" id="sweep-optimization"></div></div>
+            <details class="disclosure">
+              <summary>Kernel switches</summary>
+              <div class="disclosure-body"><div class="fields" id="sweep-env"></div></div>
+            </details>
+            <div class="card-body">
+              <div class="fields" id="sweep-timing"></div>
+              <div class="issues" id="sweep-issues" style="margin-top:12px"></div>
+              <div class="btn-row" style="margin-top:14px">
+                <button class="btn btn-primary" id="sweep-go">Run sweep</button>
+                <button class="btn btn-danger" id="sweep-stop" disabled>Stop</button>
+                <span class="status-line" id="sweep-job-status">no job yet</span>
+              </div>
+            </div>
+          </section>
+        </div>
+      </div>
+
+      <div class="stack" style="margin-top:16px">
+        <section class="card" id="sweep-results-card" hidden>
+          <div class="card-head">
+            <h2>Results</h2>
+            <button class="btn btn-sm" data-csv="sweep-results">copy CSV</button>
+          </div>
+          <div class="card-body" id="sweep-summary"></div>
+          <div class="card-body scroll-x" style="padding:0"><table class="data" id="sweep-results"></table></div>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <h2>Log</h2>
+            <label class="checkline"><input type="checkbox" id="sweep-follow" checked> follow</label>
+          </div>
+          <pre class="log" id="sweep-log"></pre>
+        </section>
+      </div>
+    </section>
+
+    <!-- =========================== SCRIPTS =========================== -->
+    <section class="view" id="panel-scripts" role="tabpanel">
+      <div class="grid-2">
+        <section class="card">
+          <div class="card-head"><h2>scripts/</h2></div>
+          <div class="card-body" style="padding-bottom:12px">
+            <p class="prose">The repository's own A/B, tuning and verification
+              scripts. Output is streamed raw &mdash; each prints its own table, and
+              this does not try to reinterpret them.</p>
+          </div>
+          <div class="scriptlist" id="script-list"></div>
+        </section>
+
+        <section class="card">
+          <div class="card-head"><h2 id="script-title">Select a script</h2></div>
+          <div class="card-body">
+            <p class="prose" id="script-summary">Pick one from the list to see its arguments.</p>
+            <div class="fields" id="script-fields" style="margin-top:14px"></div>
+            <label class="field" style="margin-top:12px">
+              <span class="field-label">extra arguments</span>
+              <input type="text" id="script-extra" placeholder="--rounds 1">
+            </label>
+            <p class="prose" style="margin-top:6px">Appended verbatim, split like a
+              shell would but never handed to one. The escape hatch for scripts with
+              no argparse.</p>
+            <pre class="command is-compact" id="script-command" style="margin-top:12px">&nbsp;</pre>
+            <div class="btn-row" style="margin-top:14px">
+              <button class="btn btn-primary" id="script-go" disabled>Run script</button>
+              <button class="btn btn-danger" id="script-stop" disabled>Stop</button>
+              <span class="status-line" id="script-job-status">no job yet</span>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <section class="card" style="margin-top:16px">
+        <div class="card-head">
+          <h2>Output</h2>
+          <label class="checkline"><input type="checkbox" id="script-follow" checked> follow</label>
+        </div>
+        <pre class="log" id="script-log"></pre>
+      </section>
+    </section>
+
+    <!-- =========================== PRESETS =========================== -->
+    <section class="view" id="panel-presets" role="tabpanel">
+      <section class="card">
+        <div class="card-head">
+          <h2>Presets</h2>
+          <span class="sub">the shapes every other view picks from</span>
+          <div class="btn-row">
+            <button class="btn btn-sm" id="presets-add">add shape</button>
+            <button class="btn btn-sm" id="presets-revert">revert</button>
+          </div>
+        </div>
+        <div class="card-body" style="padding-bottom:12px">
+          <p class="prose">Written to <code id="presets-path">presets.json</code> on
+            Save, with the previous file kept as <code>presets.json.bak</code>.
+            Nothing is written until every row is valid, so a rejected save leaves
+            the file exactly as it was. You can also edit the file directly &mdash;
+            it is re-read on every page load.</p>
+        </div>
+        <div class="card-body scroll-x" style="padding-top:0"><table class="editor" id="presets-table"></table></div>
+        <div class="card-body">
+          <div class="issues" id="presets-issues" style="margin-bottom:12px"></div>
+          <div class="btn-row">
+            <button class="btn btn-primary" id="presets-save">Save</button>
+            <span class="status-line" id="presets-status"></span>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <!-- =========================== HISTORY =========================== -->
+    <section class="view" id="panel-history" role="tabpanel">
+      <section class="card">
+        <div class="card-head">
+          <h2>Finished jobs</h2>
+          <button class="btn btn-sm" id="history-refresh">refresh</button>
+        </div>
+        <div class="card-body" style="padding-bottom:12px">
+          <p class="prose">Newest first, from <code>dashboard/runs/history.jsonl</code>.
+            Full logs sit beside it as <code>&lt;job&gt;.log</code>.</p>
+        </div>
+        <div class="card-body scroll-x" style="padding:0"><table class="data" id="history-table"></table></div>
+      </section>
+    </section>
+
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
