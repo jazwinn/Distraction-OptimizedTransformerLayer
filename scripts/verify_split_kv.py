@@ -80,11 +80,11 @@ CASES = [
 # against a gross error only.
 PATH_AGREEMENT = {
     "tile": 5e-6,
-    "tile-tf32": 3e-3,
-    "tile-bf16": 3e-2,
+    "tile tf32": 3e-3,
+    "tile bf16": 3e-2,
 }
 
-TILE_IMPLS = [(code, name, tol) for code, name, tol in IMPLS
+TILE_IMPLS = [(code, prec, name, tol) for code, prec, name, tol in IMPLS
               if name in PATH_AGREEMENT]
 
 # Which (impl, mask mode) pairs the launcher is expected to split at all, so
@@ -98,15 +98,15 @@ TILE_IMPLS = [(code, name, tol) for code, name, tol in IMPLS
 # measurement, not to make this file go green.
 EXPECTED_COVERAGE = {
     "tile": {"none", "causal", "explicit"},
-    "tile-tf32": {"none", "causal", "explicit"},
-    "tile-bf16": {"causal"},
+    "tile tf32": {"none", "causal", "explicit"},
+    "tile bf16": {"causal"},
 }
 
 
-def run(kernels, impl, q, k, v, attn_mask, is_causal, scale, split):
+def run(kernels, impl, prec, q, k, v, attn_mask, is_causal, scale, split):
     kernels.tile_set_split_kv(enabled=split)
     return kernels.fused_attention_forward(
-        q, k, v, attn_mask, is_causal, scale, impl
+        q, k, v, attn_mask, is_causal, scale, impl, 0, prec
     )
 
 
@@ -164,9 +164,9 @@ def main() -> int:
         with torch.inference_mode():
             ref = reference_attention(q, k, v, attn_mask, is_causal, scale)
 
-            for impl, name, ref_tol in TILE_IMPLS:
+            for impl, prec, name, ref_tol in TILE_IMPLS:
                 ws = kernels.tile_workspace_bytes(
-                    B=b, H=h, S=s, head_dim=d, is_causal=is_causal, impl=impl
+                    B=b, H=h, S=s, head_dim=d, is_causal=is_causal, precision=prec
                 )
                 if ws == 0:
                     # This impl's block shape leaves the grid full enough that
@@ -179,9 +179,9 @@ def main() -> int:
                 covered.add((name, mask_mode))
 
                 try:
-                    single = run(kernels, impl, q, k, v, attn_mask,
+                    single = run(kernels, impl, prec, q, k, v, attn_mask,
                                  is_causal, scale, split=False)
-                    split = run(kernels, impl, q, k, v, attn_mask,
+                    split = run(kernels, impl, prec, q, k, v, attn_mask,
                                 is_causal, scale, split=True)
                 except RuntimeError as exc:
                     print(row.format(label, name, "RAISED", str(exc)[:11],
@@ -192,9 +192,9 @@ def main() -> int:
                 d_path = (split.float() - single.float()).abs().max().item()
                 d_ref = (split.float() - ref.float()).abs().max().item()
 
-                t_one = timed(lambda: run(kernels, impl, q, k, v, attn_mask,
+                t_one = timed(lambda: run(kernels, impl, prec, q, k, v, attn_mask,
                                           is_causal, scale, split=False))
-                t_spl = timed(lambda: run(kernels, impl, q, k, v, attn_mask,
+                t_spl = timed(lambda: run(kernels, impl, prec, q, k, v, attn_mask,
                                           is_causal, scale, split=True))
 
                 bad_path = d_path > PATH_AGREEMENT[name]
@@ -213,8 +213,8 @@ def main() -> int:
     print("-" * 92)
     q, k, v, mask, is_causal, scale = dead_row_case(device)
     with torch.inference_mode():
-        for impl, name, ref_tol in TILE_IMPLS:
-            split = run(kernels, impl, q, k, v, mask, is_causal, scale, True)
+        for impl, prec, name, ref_tol in TILE_IMPLS:
+            split = run(kernels, impl, prec, q, k, v, mask, is_causal, scale, True)
             dead = split[:, :, split.shape[2] // 2:, :]
             ok = torch.isfinite(split).all().item() and (dead == 0).all().item()
             print(f"dead rows / {name:<10} "
@@ -230,8 +230,8 @@ def main() -> int:
             2, 2, 1024, 8, True, False, device, torch.float32
         )
         ref = reference_attention(q, k, v, attn_mask, is_causal, 8 ** -0.5)
-        for impl, name, ref_tol in TILE_IMPLS:
-            split = run(kernels, impl, q, k, v, attn_mask, is_causal,
+        for impl, prec, name, ref_tol in TILE_IMPLS:
+            split = run(kernels, impl, prec, q, k, v, attn_mask, is_causal,
                         8 ** -0.5, True)
             first = (split[:, :, :16, :].float()
                      - ref[:, :, :16, :].float()).abs().max().item()
@@ -248,7 +248,7 @@ def main() -> int:
     # when it was not expected to is also reported, since that is a silent
     # behaviour change in the opposite direction.
     print("-" * 92)
-    for _, name, _ in TILE_IMPLS:
+    for _, _, name, _ in TILE_IMPLS:
         for mode in ("none", "causal", "explicit"):
             want = mode in EXPECTED_COVERAGE[name]
             got = (name, mode) in covered

@@ -211,7 +211,7 @@ def model_section(K, args):
                                       causal=True)
         base = bench.BaselineTransformer(cfg)
         models = {}
-        for name in ("tf32", "auto"):
+        for name in ("tf32", "fp16"):
             opt = bench.UserOptimizedTransformer(cfg)
             bench.copy_model_weights(base, opt)
             models[name] = opt.to(dev).eval()
@@ -220,7 +220,7 @@ def model_section(K, args):
                                           padding_ratio=0.0, input_scale=1.0)
 
         def run(name, iters):
-            config.ATTENTION_FP16 = name
+            config.ATTENTION_PRECISION = name
             with torch.inference_mode():
                 torch.cuda.synchronize()
                 st = torch.cuda.Event(enable_timing=True)
@@ -232,33 +232,33 @@ def model_section(K, args):
                 torch.cuda.synchronize()
             return st.elapsed_time(en) / iters
 
-        for name in ("tf32", "auto"):
+        for name in ("tf32", "fp16"):
             run(name, 5)   # warm, and capture outside the timed region
 
-        best = {"tf32": math.inf, "auto": math.inf}
+        best = {"tf32": math.inf, "fp16": math.inf}
         ctrl = math.inf
         for rnd in range(args.rounds):
-            t = {"tf32": [], "auto": []}
-            for name in balanced_order(("tf32", "auto"), rnd):
+            t = {"tf32": [], "fp16": []}
+            for name in balanced_order(("tf32", "fp16"), rnd):
                 t[name].append(run(name, args.iters))
-            for name in ("tf32", "auto"):
+            for name in ("tf32", "fp16"):
                 best[name] = min([best[name]] + t[name])
             ctrl = min(ctrl, abs(t["tf32"][0] / t["tf32"][1] - 1.0))
         worst_ctrl = max(worst_ctrl, ctrl)
 
         outs = {}
-        for name in ("tf32", "auto"):
-            config.ATTENTION_FP16 = name
+        for name in ("tf32", "fp16"):
+            config.ATTENTION_PRECISION = name
             with torch.inference_mode():
                 outs[name] = models[name](x, m).clone()
-        err = (outs["auto"] - outs["tf32"]).abs().max().item()
+        err = (outs["fp16"] - outs["tf32"]).abs().max().item()
 
-        r = best["tf32"] / best["auto"]
+        r = best["tf32"] / best["fp16"]
         gains.append(r)
-        print(f"  {label:<22} {best['tf32']:9.3f} {best['auto']:9.3f} "
+        print(f"  {label:<22} {best['tf32']:9.3f} {best['fp16']:9.3f} "
               f"{r:7.3f}x {ctrl*100:5.1f}% {err:9.2e}")
 
-    config.ATTENTION_FP16 = "auto"
+    config.ATTENTION_PRECISION = "auto"
     gm = math.exp(sum(math.log(g) for g in gains) / len(gains))
     print(f"\n  geometric mean over {len(gains)} shapes: {gm:.3f}x")
     print(f"  worst control this run: +/-{worst_ctrl*100:.1f}%")

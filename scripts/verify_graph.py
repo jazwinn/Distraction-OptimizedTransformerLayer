@@ -305,11 +305,13 @@ def main() -> int:
     # the ones that matter by default. The cuTile impls are opt-in because they
     # are never selected automatically, not because anything is wrong with them
     # under capture; they are bit-exact, and --include-tile shows it.
-    impls = ["scalar", "wmma"]
+    # (impl, precision) now that the two are separate arguments.
+    impls = [("scalar", "auto"), ("wmma", "auto")]
     if args.include_tile:
-        impls += ["tile", "tile-tf32"]
-    for impl in impls:
+        impls += [("tile", "auto"), ("tile", "tf32")]
+    for impl, prec in impls:
         config.ATTENTION_IMPL = impl
+        config.ATTENTION_PRECISION = prec
         try:
             cfg, _, opt = build(2, 128, 512, 8, 2048, 6, False)
             xi, mi = case_data(cfg, 0.0, seed=51)

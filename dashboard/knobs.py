@@ -76,7 +76,8 @@ ENV_KNOBS: List[Dict[str, Any]] = [
         "source": "csrc/attention_wmma.cuh",
         "help": "Contract fp32 q/k/v in fp16 fragments rather than tf32. Same "
                 "10-bit mantissa, so the same accuracy, but faster tensor cores. "
-                "--attn-fp16 sets the same thing through config; prefer the flag "
+                "--attn-precision fp16/tf32 sets the same thing per call; prefer "
+                "the flag "
                 "and leave this alone unless comparing the two paths.",
     },
     {
@@ -197,16 +198,49 @@ ENV_BY_NAME = {knob["name"]: knob for knob in ENV_KNOBS}
 # csrc/attention_dispatch.cuh. A forced --attn-impl outside its own set does
 # not fall back -- it raises, by design, so that "--attn-impl scalar" can never
 # quietly time ATen and report it as the scalar kernel.
+# head_dims an impl will actually RUN. Keyed by impl alone now that precision is
+# a separate axis: every precision a given kernel has covers the same head_dims,
+# because the shared-memory budget that sets the coverage is decided per kernel
+# rather than per math mode.
+#
+# scalar is deliberately absent: it has a generic kernel behind its six tuned
+# instantiations that takes ANY head_dim up to SCALAR_MAX_HEAD_DIM, so a set of
+# six would block shapes that run fine. It used to be listed here with the same
+# six as the others, which stopped being true when that kernel landed.
 HEAD_DIM_COVERAGE = {
-    "scalar": {8, 16, 32, 64, 128, 256},
     "wmma": {8, 16, 32, 64, 128, 256},
     "tile": {8, 16, 32, 64, 128, 256},
-    "tile-bf16": {8, 16, 32, 64, 128, 256},
-    "tile-tf32": {8, 16, 32, 64, 128, 256},
-    "tile-fp16": {8, 16, 32, 64, 128, 256},
 }
 
-TILE_IMPLS = ("tile", "tile-bf16", "tile-tf32", "tile-fp16")
+# Past this a query row's threads outgrow a warp and the generic scalar kernel's
+# score butterfly stops working, so it declines -- csrc/attention_scalar.cuh.
+# This is also auto's ceiling, since auto ends on the same kernel.
+SCALAR_MAX_HEAD_DIM = 2048
+
+TILE_IMPLS = ("tile",)
+
+# Which arithmetic each kernel has. Mirrors the table in csrc/kernel_common.cuh
+# and the impl_supports() gate in csrc/attention_dispatch.cuh -- if those change,
+# this has to change with them, or the dashboard will block a run the kernel
+# would have accepted (or wave through one it refuses).
+PRECISION_SUPPORT = {
+    "auto": {"auto", "fp32", "tf32", "fp16", "bf16"},
+    "scalar": {"auto", "fp32"},
+    "wmma": {"auto", "tf32", "fp16", "bf16"},
+    "tile": {"auto", "fp32", "tf32", "fp16", "bf16"},
+}
+
+# Why, in the kernel's own terms, so the message says something more useful than
+# "unsupported combination".
+PRECISION_REFUSAL = {
+    "scalar": "the scalar kernel accumulates everything in fp32 and that is the "
+              "point of it -- 5e-6 against an exact reference, three orders "
+              "tighter than the tensor-core paths. Narrowing it would just make "
+              "a slower wmma",
+    "wmma": "no shipped tensor core does a full fp32 matmul, so this is a "
+            "category error rather than a missing instantiation. tf32 is the "
+            "closest thing wmma has",
+}
 
 DTYPE_BYTES = {"float32": 4, "float16": 2, "bfloat16": 2}
 
@@ -350,6 +384,7 @@ def preflight(form: Dict[str, Any], tile_available: Optional[bool],
     causal = bool(form.get("causal"))
     dtype = form.get("dtype") or "float32"
     impl = form.get("attn_impl")
+    precision = form.get("attn_precision")
     linear_gelu = form.get("linear_gelu")
 
     if min(batch, seq, d_model, heads, integer("layers", 6)) < 1:
@@ -362,13 +397,49 @@ def preflight(form: Dict[str, Any], tile_available: Optional[bool],
 
     head_dim = d_model // heads
 
+    # --- kernel x precision ----------------------------------------------
+    # Checked before coverage, because a pair the kernel has no arithmetic for
+    # never gets as far as being asked about a head_dim.
+    if precision and precision != "auto":
+        allowed = PRECISION_SUPPORT.get(impl or "auto")
+        if allowed is not None and precision not in allowed:
+            reason = PRECISION_REFUSAL.get(impl)
+            has = sorted(p for p in allowed if p != "auto")
+            error(f"--attn-impl {impl} has no {precision} arithmetic, so this "
+                  f"run would raise rather than produce a number. It supports "
+                  f"{', '.join(has)}"
+                  + (f" -- {reason}" if reason else "")
+                  + f". Note this is the MATH type, not the tensor dtype: to "
+                    f"feed {impl} {precision} tensors, set dtype instead.")
+
+    # bf16 runs everywhere it is offered and fails the accuracy gate almost
+    # everywhere, which is a warning rather than an error -- measuring how far
+    # off it is is the only reason it is exposed at all.
+    if precision == "bf16":
+        warn("bf16 carries 8 significand bits and does not clear the harness's "
+             "2e-3 accuracy gate (measured 2.9e-3 on wmma at d_model 512). "
+             "Expect this run to report FAIL; it is exposed for measurement, "
+             "not as something to ship.")
+
     # --- kernel coverage -------------------------------------------------
-    if impl and impl != "auto":
+    # auto is included now. It used to be skipped on the grounds that auto
+    # always finds something, which stopped being true at the top end: auto
+    # ends on the generic scalar kernel, and that kernel has a ceiling.
+    if impl in (None, "", "auto", "scalar"):
+        if head_dim > SCALAR_MAX_HEAD_DIM:
+            error(f"head_dim {head_dim} (d_model {d_model} / heads {heads}) is "
+                  f"past every kernel's reach. The generic scalar kernel is the "
+                  f"catch-all and stops at {SCALAR_MAX_HEAD_DIM}, where a query "
+                  f"row's threads would outgrow a warp.")
+    else:
         covered = HEAD_DIM_COVERAGE.get(impl, set())
         if head_dim not in covered:
+            hint = ("" if impl not in ("wmma", "tile")
+                    else "; --attn-impl scalar takes any head_dim to "
+                         f"{SCALAR_MAX_HEAD_DIM}, and auto falls back to it")
             error(f"--attn-impl {impl} does not cover head_dim {head_dim} "
                   f"(d_model {d_model} / heads {heads}); it handles "
-                  f"{sorted(covered)} and raises on anything else")
+                  f"{sorted(covered)} and raises on anything else{hint}")
 
     if impl in TILE_IMPLS and tile_available is False:
         error(f"--attn-impl {impl} needs a build with cuTile support, and this "

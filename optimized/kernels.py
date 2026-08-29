@@ -22,8 +22,15 @@ _fp16_pushed = None
 
 
 def _sync_attention_precision(kernels) -> None:
+    """Keep the wmma kernel's process-wide fp16 knob in step with the config.
+
+    The precision is passed per call now, so this only matters for
+    ATTENTION_PRECISION == "auto", which is where the kernel falls back to this
+    knob (and to the WMMA_FP16 environment variable the A/B scripts drive). An
+    explicit precision goes straight through the call and ignores it.
+    """
     global _fp16_pushed
-    want = config.ATTENTION_FP16 == "auto"
+    want = config.ATTENTION_PRECISION in ("auto", "fp16")
     if _fp16_pushed != want:
         kernels.wmma_set_fp16(want)
         _fp16_pushed = want
@@ -156,4 +163,5 @@ def _attention_dispatch(
         q, k, v, attn_mask, is_causal, scale,
         config._IMPL_CODE[config.ATTENTION_IMPL],
         config._OUT_LAYOUT_BSHD,
+        config._PRECISION_CODE[config.ATTENTION_PRECISION],
     )

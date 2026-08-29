@@ -32,19 +32,24 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--attn-impl",
-        choices=("auto", "scalar", "wmma", "tile", "tile-bf16", "tile-tf32",
-                 "tile-fp16"),
+        choices=("auto", "scalar", "wmma", "tile"),
         default=None,
-        help="override ATTENTION_IMPL for this run only: which kernel inside "
-             "the custom extension runs attention",
+        help="override ATTENTION_IMPL for this run only: WHICH kernel inside "
+             "the custom extension runs attention. What arithmetic it uses is "
+             "--attn-precision (the tile-bf16 / tile-tf32 / tile-fp16 "
+             "spellings were the two axes tangled into one and are gone)",
     )
     parser.add_argument(
-        "--attn-fp16",
-        choices=("auto", "tf32"),
+        "--attn-precision",
+        choices=("auto", "fp32", "tf32", "fp16", "bf16"),
         default=None,
-        help="override ATTENTION_FP16 for this run only: whether the wmma "
-             "attention kernel contracts fp32 q/k/v in fp16 fragments (auto) "
-             "or tf32. Same 10-bit mantissa either way; fp16 is faster",
+        help="override ATTENTION_PRECISION for this run only: the arithmetic "
+             "the attention kernel contracts q/k/v in, independent of the "
+             "tensor dtype (--dtype). 'auto' is each kernel's preference -- "
+             "wmma fp16, scalar and tile fp32. Not every pair exists: scalar "
+             "is fp32 only, wmma has no fp32; a forced impl asking for one it "
+             "lacks raises. bf16 is for measurement only, it fails the "
+             "accuracy gate",
     )
     parser.add_argument(
         "--linear-gelu",
@@ -71,8 +76,8 @@ def apply_overrides(args: argparse.Namespace) -> None:
         config.ATTENTION_BACKEND = args.attn_backend
     if args.attn_impl is not None:
         config.ATTENTION_IMPL = args.attn_impl
-    if args.attn_fp16 is not None:
-        config.ATTENTION_FP16 = args.attn_fp16
+    if args.attn_precision is not None:
+        config.ATTENTION_PRECISION = args.attn_precision
     if args.linear_gelu is not None:
         config.LINEAR_GELU = args.linear_gelu
     if args.cuda_graph is not None:

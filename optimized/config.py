@@ -25,56 +25,56 @@ run; see optimized/cli.py.
 # attention, use the benchmark scripts, which are not the model.
 ATTENTION_BACKEND = "custom"
 
-# Which kernel inside the extension handles attention; only meaningful when the
-# custom backend is in play. --attn-impl overrides this for a single run.
+# WHICH kernel inside the extension handles attention. What arithmetic it uses
+# is ATTENTION_PRECISION, below -- the two are separate axes, and used to not
+# be: "tile-fp16" named a kernel and a precision at once, while wmma's
+# precision lived in its own ATTENTION_FP16 setting that no other backend
+# shared. --attn-impl overrides this for a single run.
 #
-#   "auto"       the first kernel that covers the shape: the tensor-core
-#                kernel wherever it applies, the scalar kernel where that is
-#                all there is, and an error where neither does. It used to
-#                prefer SDPA from head_dim 128 up, which is gone -- see
-#                run_kernel() in csrc/attention_dispatch.cuh.
-#   "scalar"     force the scalar kernel (no tensor cores, no TF32 rounding);
-#                head_dim in {8,16,32,64,128,256}, and raises on anything
-#                else. It
-#                used to fall through to ATen instead, which meant --attn-impl
-#                scalar at a head_dim it did not cover timed ATen and called it
-#                the scalar kernel.
-#   "wmma"       force the tensor-core kernel; raises on shapes it misses
-#   "tile"       force the cuTile kernel, fp32 operands: exact, CUDA cores.
-#                float32 and head_dim in {8,16,32,64,128,256}, and needs a
-#                build that
-#                found CUDA 13.3+. Never picked by "auto".
-#   "tile-tf32"  the cuTile kernel with its GEMMs narrowed to tf32, which is
-#                what puts them on the tensor cores. Same arithmetic cuBLAS
-#                gives the baseline under allow_tf32 (~1e-3), so this is the
-#                tensor-core mode to reach for first.
-#   "tile-bf16"  as above, narrowed to bfloat16 -- 8 mantissa bits, ~4e-3.
-#                Expect it to fail the accuracy gate where "tile" passes.
-#   "tile-fp16"  narrowed to float16: 10 mantissa bits, the same as tf32, so
-#                the same ~1e-3 -- but 16-bit operands, so it runs at bf16's
-#                speed rather than tf32's. This is the one tile mode that is
-#                both accurate enough and fast enough to be worth considering
-#                against wmma; see csrc/TUNING.md for where it wins.
+#   "auto"     the first kernel that covers the shape: the tensor-core kernel
+#              wherever it applies, the scalar kernel where that is all there
+#              is. It used to prefer SDPA from head_dim 128 up, which is gone
+#              -- see run_kernel() in csrc/attention_dispatch.cuh.
+#   "scalar"   force the scalar kernel: no tensor cores, everything accumulated
+#              in fp32, 5e-6 against an exact reference. Six tuned head_dims
+#              plus a generic kernel that takes any head_dim to 2048.
+#   "wmma"     force the tensor-core kernel; raises on shapes it misses.
+#   "tile"     force the cuTile kernel -- the same math written against the
+#              CUDA tile programming model instead of per-thread. float32
+#              tensors, head_dim in {8,16,32,64,128,256}, and a build that
+#              found CUDA 13.3+. Never picked by "auto": it is a separate
+#              programming model whose performance you should opt into.
 ATTENTION_IMPL = "auto"
 
-_IMPL_CODE = {"auto": 0, "scalar": 1, "wmma": 2, "tile": 3, "tile-bf16": 4,
-              "tile-tf32": 5, "tile-fp16": 6}
+_IMPL_CODE = {"auto": 0, "scalar": 1, "wmma": 2, "tile": 3}
 
-# Precision the wmma attention kernel contracts fp32 q/k/v in. --attn-fp16
-# overrides this for a single run.
+# The arithmetic that kernel contracts q/k/v in. Independent of the tensor
+# dtype, which is --dtype: this is what the multiply-accumulate is done in
+# after the operands are staged, and narrowing it does not change what is
+# stored. --attn-precision overrides this for a single run.
 #
-#   "auto"   fp16 fragments. tf32 and fp16 carry the SAME 10-bit mantissa, so
-#            this is not an accuracy trade: measured against an fp64 reference
-#            the two agree to three significant figures at every shape swept
-#            (scripts/ab_attention_fp16.py prints both columns). What fp16 buys
-#            is that its tensor cores run 2.0x-2.25x tf32 on this card and a
-#            16x16x16 fragment contracts twice the K of tf32's 16x16x8.
-#   "tf32"   the old path, for re-running that comparison.
+#   "auto"   each kernel's own preference. wmma picks fp16, scalar and tile
+#            pick fp32 -- which reproduces exactly what the old "wmma" and
+#            plain "tile" spellings did, so the default is unchanged.
+#   "fp32"   true single precision on the CUDA cores. ~1e-6. Under "auto" this
+#            also rules wmma out, since it has no fp32 arithmetic to give, so
+#            `--attn-precision fp32` means "the exact one" without having to
+#            know which kernel that is.
+#   "tf32"   tensor cores, 10 mantissa bits, ~1e-3. The same arithmetic cuBLAS
+#            gives the baseline under allow_tf32.
+#   "fp16"   tensor cores, also 10 mantissa bits, so the same ~1e-3 -- but
+#            16-bit operands, so the fragments contract twice the K per step
+#            and run 2.0x-2.25x tf32 on this card. The default for wmma.
+#   "bf16"   tensor cores, 8 mantissa bits, ~4e-3. Measurement only: it ran
+#            425%-622% of the harness's 2e-3 budget. Exposed so the comparison
+#            can be re-run, not because anything should ship on it.
 #
-# The tensors stay fp32 either way -- only the shared tiles and the fragments
-# narrow. bf16 is not offered: 8 mantissa bits measured 425%-622% of the
-# harness's 2e-3 budget.
-ATTENTION_FP16 = "auto"
+# Not every pair exists. scalar is fp32 only, wmma has no fp32, tile has all
+# four. A forced impl asking for one it does not have raises and names what it
+# does have; "auto" treats the precision as a preference instead.
+ATTENTION_PRECISION = "auto"
+
+_PRECISION_CODE = {"auto": 0, "fp32": 1, "tf32": 2, "fp16": 3, "bf16": 4}
 
 # Ask the kernel for [B, S, H*head_dim] rather than [B, H, S, head_dim].
 # out_proj wants the flattened layout, and the transpose+reshape that used to

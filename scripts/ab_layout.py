@@ -53,7 +53,9 @@ def ab(fns, iters=200):
 CASES = [("default", 8, 8, 128, 64), ("long seq", 1, 8, 2048, 64),
          ("small", 1, 8, 32, 64), ("wide hd", 2, 4, 64, 128),
          ("uncovered hd", 8, 8, 128, 96)]
-IMPLS = [(0, "auto"), (1, "scalar"), (2, "wmma"), (3, "tile"), (5, "tile-tf32")]
+# (impl code, precision code, label) -- two axes now; precision 0 is auto.
+IMPLS = [(0, 0, "auto"), (1, 0, "scalar"), (2, 0, "wmma"), (3, 0, "tile"),
+         (3, 2, "tile tf32")]
 
 print(f"{'case':<14}{'impl':>10}{'contig_ms':>11}{'packed_ms':>11}"
       f"{'ratio':>8}{'control':>9}")
@@ -66,16 +68,16 @@ for label, b, h, s, d in CASES:
     q2, k2, v2 = q.clone(), k.clone(), v.clone()
     scale = d ** -0.5
     with torch.inference_mode():
-        for impl, name in IMPLS:
+        for impl, prec, name in IMPLS:
             try:
-                K.fused_attention_forward(q, k, v, None, False, scale, impl)
+                K.fused_attention_forward(q, k, v, None, False, scale, impl, 0, prec)
             except RuntimeError:
                 print(f"{label:<14}{name:>10}{'n/a':>11}")
                 continue
 
             def call(a, bb, c, impl=impl):
                 return lambda: K.fused_attention_forward(
-                    a, bb, c, None, False, scale, impl)
+                    a, bb, c, None, False, scale, impl, 0, prec)
 
             tc, tp, tc2 = ab([call(q, k, v), call(qp, kp, vp), call(q2, k2, v2)])
             print(f"{label:<14}{name:>10}{tc:>11.4f}{tp:>11.4f}"

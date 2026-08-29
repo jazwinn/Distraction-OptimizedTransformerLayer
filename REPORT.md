@@ -1538,18 +1538,33 @@ To A/B attention alone, vary `--attn-impl`. Same shape, same everything else:
 
 ### Choosing the kernel inside the custom backend
 
-`ATTENTION_IMPL` (or `--attn-impl` for one run) picks which of the custom kernels handles
-attention:
+`ATTENTION_IMPL` (or `--attn-impl` for one run) picks **which** kernel handles attention;
+`ATTENTION_PRECISION` (`--attn-precision`) picks **what arithmetic** it uses. These were one
+axis until recently: `tile-fp16` named a kernel and a precision at once, and wmma's precision
+lived in a separate `--attn-fp16` flag that no other backend shared. Splitting them removed
+four impl values and one flag without removing a single reachable combination.
 
 | Value | Behavior |
 | --- | --- |
 | `auto` | Tensor-core kernel where it applies, scalar kernel otherwise. |
 | `scalar` | Force the scalar kernel. No tensor cores, no TF32 rounding. Six tuned instantiations at `head_dim` in {8,16,32,64,128,256}; anything else drops to the generic scalar kernel in the same file, which takes `head_dim` 1 to 2048 in every dtype. Either way it is this project's own code, so ATen still cannot be timed under its name. |
 | `wmma` | Force the tensor-core kernel; raises on shapes it does not cover, so a silent substitution cannot be mistaken for a slow kernel. |
-| `tile` | Force the cuTile kernel — the same math written against the CUDA tile programming model instead of per-thread. float32, `head_dim` in {8,16,32,64,128,256}. Raises rather than falling back. |
-| `tile-tf32` | The same cuTile kernel with its two GEMMs narrowed to TF32, which is what puts them on the tensor cores. Same arithmetic `wmma` uses for fp32 inputs and the same ~1e-3 accuracy, so it clears the harness gate wherever `wmma` does. The tensor-core tile mode to reach for first. |
-| `tile-bf16` | As above but narrowed to bfloat16 — 8 mantissa bits. Marginally faster than `tile-tf32` on some shapes and far less accurate; fails the harness gate on most configs. |
-| `tile-fp16` | The same cuTile kernel narrowed to float16 — tf32's 10 mantissa bits at twice the tensor-core rate, accumulated in fp32. The fastest tile mode, and it clears the harness gate wherever `tile-tf32` does. |
+| `tile` | Force the cuTile kernel — the same math written against the CUDA tile programming model instead of per-thread. float32 tensors, `head_dim` in {8,16,32,64,128,256}. Raises rather than falling back. |
+
+And the precision:
+
+| Value | Behavior |
+| --- | --- |
+| `auto` | Each kernel's own preference: `wmma` fp16, `scalar` and `tile` fp32. Reproduces exactly what the old `wmma` and plain `tile` spellings did, so the default is unchanged. |
+| `fp32` | True single precision on the CUDA cores, ~1e-6. Under `auto` this also rules `wmma` out — it has no fp32 arithmetic to give — so `--attn-precision fp32` means "the exact one" without having to name the kernel. |
+| `tf32` | Tensor cores, 10 mantissa bits, ~1e-3. The arithmetic cuBLAS gives the baseline under `allow_tf32`. |
+| `fp16` | Tensor cores, also 10 mantissa bits and so the same ~1e-3, but 16-bit operands: the fragments contract twice the K per step and run 2.0x-2.25x tf32 on this card. The default for `wmma`. |
+| `bf16` | Tensor cores, 8 mantissa bits, ~4e-3. **Measurement only** — it fails the harness gate (measured max_abs 2.9e-3 against a 2e-3 budget at `wmma`+bf16). Exposed so the comparison can be re-run, not because anything should ship on it. |
+
+Not every pair exists. `scalar` is fp32 only, because its accumulators are float and that is the
+whole point of it; `wmma` has no fp32, because no shipped tensor core does a full fp32 matmul;
+`tile` has all four. A forced impl asking for one it lacks raises and names what it does have.
+`auto` treats the precision as a preference instead, since choosing is what `auto` is for.
 
 The tensor-core kernel covers `head_dim` 8, 16, 32, 64, 128 and 256 in float32, float16 and
 bfloat16, on compute capability 8.0 and up — every head_dim the harness can produce, since
@@ -1584,6 +1599,7 @@ and the slowest kernel here.
 | Script | Purpose |
 | --- | --- |
 | `scripts/verify_kernel.py` | Every kernel against a float64 reference across 14 shapes. Fails fast and names the shape that broke. The `packed` column reruns each case through the non-contiguous views the model actually produces and demands a *bit-identical* result, not one within tolerance. It also exports `reference_attention_f64`, which the A/B scripts use as their yardstick — one expression evaluated the same way every time, rather than a library call that picks a backend per shape. |
+| `scripts/verify_attn_axes.py` | The impl x precision matrix. Which pairs exist is written down three times — the table in `csrc/kernel_common.cuh`, `impl_supports()` in `csrc/attention_dispatch.cuh`, and `PRECISION_SUPPORT` in `dashboard/knobs.py` — so this asks the kernel and the dashboard about every pair and fails on any disagreement, rather than checking either against a fourth list. A dashboard that blocks a runnable pair is as wrong as one that queues a refused one. |
 | `scripts/verify_generic_scalar.py` | The generic scalar catch-all across 14 uncovered head_dims (1 to 2048), four dtypes and six mask/shape combinations, against the same float64 reference. Run again with `SCALAR_FORCE_GENERIC=1` and it also serves the six head_dims the specializations own, which is how the generalization is checked to be the same arithmetic and not merely a close one. |
 | `scripts/verify_split_kv.py` | Checks the tile kernel's split-KV path against its own single-pass path, and asserts the split actually fired. |
 | `scripts/verify_graph.py` | Checks that graph replay is *bit-identical* to eager — tolerance exactly zero — and that the graph actually fired rather than silently declining. `--test-failure` also exercises the capture-failure path; `--include-tile` adds the cuTile impls. |

@@ -76,7 +76,11 @@ CASES = [
     (2, 2, 2048, 32, False, True),
 ]
 
-IMPLS = ((3, "tile"), (4, "tile-bf16"), (5, "tile-tf32"))
+# (precision code, label). All three are the SAME impl now -- the tile kernel
+# -- differing only in the arithmetic, which is what the split-KV gate cares
+# about since operand width moves the block-shape cliff.
+TILE_IMPL = 3
+IMPLS = ((0, "tile fp32"), (4, "tile bf16"), (2, "tile tf32"))
 
 
 # Below this, a single launch is dominated by launch overhead and CUDA event
@@ -120,7 +124,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--rounds", type=int, default=5)
     ap.add_argument("--impl", default=None,
-                    help="restrict to one impl name, e.g. tile-tf32")
+                    help="restrict to one impl name, e.g. 'tile tf32'")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -148,17 +152,18 @@ def main() -> int:
         )
         scale = d ** -0.5
         mode = "explicit" if padded else ("causal" if causal else "dense")
-        for impl, name in impls:
+        for prec, name in impls:
             ws = kernels.tile_workspace_bytes(
-                B=b, H=h, S=s, head_dim=d, is_causal=is_causal, impl=impl
+                B=b, H=h, S=s, head_dim=d, is_causal=is_causal, precision=prec
             )
             splits = 0 if ws == 0 else ws // (b * h * s * (d + 2) * 4)
 
-            def make(split, impl=impl, q=q, k=k, v=v, m=attn_mask,
+            def make(split, prec=prec, q=q, k=k, v=v, m=attn_mask,
                      c=is_causal, sc=scale):
                 def go():
                     kernels.tile_set_split_kv(enabled=split)
-                    kernels.fused_attention_forward(q, k, v, m, c, sc, impl)
+                    kernels.fused_attention_forward(
+                        q, k, v, m, c, sc, TILE_IMPL, 0, prec)
                 return go
 
             work.append({

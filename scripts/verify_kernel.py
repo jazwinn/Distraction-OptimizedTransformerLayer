@@ -151,26 +151,34 @@ def timed(fn, iters=30):
 # does for the baseline; on unit-scale inputs that is worth ~1e-3.
 # The tile kernel does its matmuls in plain fp32, so it holds the same budget
 # as the scalar kernel rather than the tensor-core one.
-# tile-tf32 rounds the same operands the wmma kernel does to the same 10
+# tile tf32 rounds the same operands the wmma kernel does to the same 10
 # mantissa bits, so it gets the same budget.
-# tile-bf16 narrows both GEMM operands to bfloat16 (8 significand bits), so
+# tile bf16 narrows both GEMM operands to bfloat16 (8 significand bits), so
 # its budget is an order of magnitude looser than the tf32 paths', not tighter.
-# tile-fp16 narrows to float16, which has 10 significand bits like tf32 and
+# tile fp16 narrows to float16, which has 10 significand bits like tf32 and
 # accumulates into fp32 -- so it gets the tf32 budget, not bf16's. Holding it to
 # 3e-3 is the point: if fp16 needed a looser bound it would not be worth having.
 # Impls that raise on a case they do not cover rather than falling back, so a
 # raise from one of these is coverage rather than a failure. That is now every
 # forced impl: the scalar kernel used to fall through to ATen silently at
 # head_dim 128, which reported ATen's time under the scalar kernel's name.
-DECLINING_IMPLS = frozenset({1, 2, 3, 4, 5, 6})
+DECLINING_IMPLS = frozenset({1, 2, 3})
 
+# (impl code, precision code, label, tolerance). The kernel and the arithmetic
+# are two arguments now, so what used to be four tile impls is one tile impl at
+# four precisions -- see optimized/config.py. Precision 0 is "auto", each
+# kernel's own preference: fp32 for scalar and tile, fp16 for wmma.
 IMPLS = (
-    (1, "scalar", 5e-6),
-    (2, "wmma", 3e-3),
-    (3, "tile", 5e-6),
-    (5, "tile-tf32", 3e-3),
-    (4, "tile-bf16", 3e-2),
-    (6, "tile-fp16", 3e-3),
+    (1, 0, "scalar", 5e-6),
+    (2, 0, "wmma", 3e-3),
+    # Newly reachable: wmma always had bf16 fragments, they were just not
+    # spellable before the precision axis existed. 8 significand bits, so it
+    # gets bf16's budget and is here to be measured, not shipped.
+    (2, 4, "wmma bf16", 3e-2),
+    (3, 0, "tile", 5e-6),
+    (3, 2, "tile tf32", 3e-3),
+    (3, 4, "tile bf16", 3e-2),
+    (3, 3, "tile fp16", 3e-3),
 )
 
 
@@ -206,10 +214,10 @@ def main() -> int:
         with torch.inference_mode():
             ref = reference_attention(q, k, v, attn_mask, is_causal, scale)
 
-            for impl, name, tol in IMPLS:
+            for impl, prec, name, tol in IMPLS:
                 try:
                     custom = kernels.fused_attention_forward(
-                        q, k, v, attn_mask, is_causal, scale, impl
+                        q, k, v, attn_mask, is_causal, scale, impl, 0, prec
                     )
                 except RuntimeError as exc:
                     if impl in DECLINING_IMPLS:
@@ -231,7 +239,7 @@ def main() -> int:
 
                 # The same call on the layout the model actually produces.
                 packed = kernels.fused_attention_forward(
-                    qp, kp, vp, attn_mask, is_causal, scale, impl
+                    qp, kp, vp, attn_mask, is_causal, scale, impl, 0, prec
                 )
                 if torch.equal(packed, custom):
                     packed_cell = "exact"
@@ -242,7 +250,7 @@ def main() -> int:
 
                 d_ref = (custom.float() - ref.float()).abs().max().item()
                 t_custom = timed(lambda: kernels.fused_attention_forward(
-                    q, k, v, attn_mask, is_causal, scale, impl))
+                    q, k, v, attn_mask, is_causal, scale, impl, 0, prec))
 
                 bad = d_ref > tol or not torch.isfinite(custom).all()
                 if bad:

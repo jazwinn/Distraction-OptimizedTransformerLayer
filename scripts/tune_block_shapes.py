@@ -158,7 +158,8 @@ def _wmma_candidates(frag, head_dim: int):
 # ---------------------------------------------------------------------------
 
 class Backend:
-    """One sweepable kernel: its impl code, macro prefix, and shape space.
+    """One sweepable kernel: its impl + precision codes, macro prefix, and
+    shape space.
 
     `mask_split` is False for wmma, whose kernel takes is_causal at run time and
     so cannot carry a per-mask shape. That is not a gap in the macros; it is a
@@ -166,9 +167,10 @@ class Backend:
     for half of what it actually runs.
     """
 
-    def __init__(self, name, impl, prefix, head_dims, mask_split, dtypes):
+    def __init__(self, name, impl, prec, prefix, head_dims, mask_split, dtypes):
         self.name = name
         self.impl = impl
+        self.prec = prec
         self.prefix = prefix
         self.head_dims = head_dims
         self.mask_split = mask_split
@@ -204,13 +206,14 @@ class Backend:
 
 
 BACKENDS = {
-    "tile-fp32": Backend("tile-fp32", 3, "FP32", (8, 16, 32, 64, 128), True,
+    # impl 3 is the tile kernel for all three; what differs is the precision.
+    "tile-fp32": Backend("tile-fp32", 3, 1, "FP32", (8, 16, 32, 64, 128), True,
                          (torch.float32,)),
-    "tile-bf16": Backend("tile-bf16", 4, "BF16", (8, 16, 32, 64, 128), True,
+    "tile-bf16": Backend("tile-bf16", 3, 4, "BF16", (8, 16, 32, 64, 128), True,
                          (torch.float32,)),
-    "tile-tf32": Backend("tile-tf32", 5, "TF32", (8, 16, 32, 64, 128), True,
+    "tile-tf32": Backend("tile-tf32", 3, 2, "TF32", (8, 16, 32, 64, 128), True,
                          (torch.float32,)),
-    "wmma":      Backend("wmma",      2, "WMMA", (8, 16, 32, 64, 128), False,
+    "wmma":      Backend("wmma",      2, 0, "WMMA", (8, 16, 32, 64, 128), False,
                          (torch.float32, torch.float16, torch.bfloat16)),
 }
 
@@ -288,20 +291,21 @@ def make_cases(head_dim: int, dtype, cases):
     return out
 
 
-def time_round(mod, cases, impl: int) -> float:
+def time_round(mod, cases, impl: int, prec: int) -> float:
     """One pass over every case; total ms, or inf if this build declines them."""
     total = 0.0
     try:
         with torch.inference_mode():
             for (q, k, v), causal, scale in cases:
                 total += time_ms(lambda: mod.fused_attention_forward(
-                    q, k, v, None, causal, scale, impl), iters=15)
+                    q, k, v, None, causal, scale, impl, 0, prec), iters=15)
     except RuntimeError:
         return float("inf")
     return total
 
 
-def score_all(mods: dict, head_dim: int, dtype, cases, impl: int, rounds: int = 5) -> dict:
+def score_all(mods: dict, head_dim: int, dtype, cases, impl: int, prec: int,
+              rounds: int = 5) -> dict:
     """Time every candidate round-robin; return each one's best round.
 
     Timing candidate A to completion and then candidate B measures whatever
@@ -317,7 +321,7 @@ def score_all(mods: dict, head_dim: int, dtype, cases, impl: int, rounds: int = 
     best = {name: float("inf") for name in mods}
     for _ in range(rounds):
         for name, mod in mods.items():
-            best[name] = min(best[name], time_round(mod, materialised, impl))
+            best[name] = min(best[name], time_round(mod, materialised, impl, prec))
     return best
 
 
@@ -358,7 +362,7 @@ def sweep_backend(be: Backend, dtype, frag, head_dims, causal: bool,
                 print(f"  {f'{m}x{n}':>10}  build failed: {str(exc)[:60]}")
 
         if mods:
-            scores = score_all(mods, hd, dtype, cases, be.impl, rounds)
+            scores = score_all(mods, hd, dtype, cases, be.impl, be.prec, rounds)
             print(f"  {'M x N':>10}{'best ms':>12}")
             for name, t in sorted(scores.items(), key=lambda kv: kv[1]):
                 shown = f"{t:.3f}" if t != float("inf") else "declined"
@@ -448,7 +452,7 @@ def main(argv) -> int:
             have = ", ".join(map(str, be.head_dims))
             print(f"\n=== {name} === skipped: supports head_dim {{{have}}}")
             continue
-        # The tile backends pick their math mode by impl, not by WMMA_FP16, so
+        # The tile backends pick their math mode by precision, not by WMMA_FP16, so
         # their budget is the tensor dtype's either way.
         be_frag = frag if be.name == "wmma" else dtype
         results[name] = sweep_backend(be, dtype, be_frag, head_dims, args.causal,

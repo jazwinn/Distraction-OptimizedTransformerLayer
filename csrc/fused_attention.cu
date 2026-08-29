@@ -176,24 +176,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "elements, override included",
           pybind11::arg("D"));
     m.def("tile_workspace_bytes",
-          [](int B, int H, int S, int head_dim, bool is_causal, int impl) {
-              // impl codes match fused_attention_forward's: 3 tile-fp32,
-              // 4 tile-bf16, 5 tile-tf32, 6 tile-fp16. Non-zero means the launcher intends
-              // to split the key range for this shape, so a test can assert
-              // that it is really exercising the split path rather than
-              // silently passing on the single-pass one.
-              tile_attn::MathMode math = tile_attn::MathMode::Fp32;
-              if (impl == 4) math = tile_attn::MathMode::Bf16;
-              if (impl == 5) math = tile_attn::MathMode::Tf32;
-              if (impl == 6) math = tile_attn::MathMode::Fp16;
+          [](int B, int H, int S, int head_dim, bool is_causal, int precision) {
+              // Takes a PRECISION code now, matching fused_attention_forward's
+              // second axis: 0 auto/fp32, 2 tf32, 3 fp16, 4 bf16. It used to
+              // take the old compound impl code, where 4/5/6 each named one
+              // tile kernel. Non-zero output means the launcher intends to
+              // split the key range for this shape, so a test can assert it is
+              // really exercising the split path rather than silently passing
+              // on the single-pass one.
               return static_cast<int64_t>(tile_attn::workspace_bytes(
-                  B, H, S, head_dim, is_causal, math));
+                  B, H, S, head_dim, is_causal,
+                  tile_math_for(static_cast<AttnPrecision>(precision))));
           },
           "Scratch bytes the tile kernel would take for this shape; 0 when it "
           "will not split the key range",
           pybind11::arg("B"), pybind11::arg("H"), pybind11::arg("S"),
           pybind11::arg("head_dim"), pybind11::arg("is_causal"),
-          pybind11::arg("impl"));
+          pybind11::arg("precision"));
     m.def("tile_set_split_kv", &tile_attn::set_split_kv,
           "Enable/disable the tile kernel's split-KV (Flash-Decoding) path. "
           "Runtime-settable so both paths can be timed in one process.",
@@ -333,5 +332,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("is_causal") = false,
           pybind11::arg("scale"),
           pybind11::arg("impl") = 0,
-          pybind11::arg("out_layout") = 0);
+          pybind11::arg("out_layout") = 0,
+          pybind11::arg("precision") = 0);
 }

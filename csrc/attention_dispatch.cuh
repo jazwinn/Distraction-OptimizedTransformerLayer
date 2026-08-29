@@ -23,27 +23,38 @@
 
 namespace {
 
+// WHICH kernel. What arithmetic it uses is AttnPrecision, a separate argument
+// -- see the table in kernel_common.cuh. These used to be one axis: `tile-fp16`
+// named both at once, and there were four Impl values for one kernel, while
+// wmma's precision lived in a --attn-fp16 flag that named no kernel at all. The
+// combinations that gained nothing by being spelled out (tile-bf16 as a
+// distinct *implementation*) were exactly the ones hardest to describe.
 enum class Impl : int64_t {
-    Auto     = 0,
-    Scalar   = 1,
-    Wmma     = 2,
-    Tile     = 3,   // cuTile, fp32 operands -- CUDA cores,   ~1e-6
-    TileBf16 = 4,   // cuTile, bf16 operands -- tensor cores, ~4e-3
-    TileTf32 = 5,   // cuTile, tf32 operands -- tensor cores, ~1e-3
-    TileFp16 = 6,   // cuTile, fp16 operands -- tensor cores, ~1e-3
+    Auto   = 0,
+    Scalar = 1,
+    Wmma   = 2,
+    Tile   = 3,
 };
 
 const char* impl_name(Impl impl) {
     switch (impl) {
-        case Impl::Auto:     return "auto";
-        case Impl::Scalar:   return "scalar";
-        case Impl::Wmma:     return "wmma";
-        case Impl::Tile:     return "tile";
-        case Impl::TileBf16: return "tile-bf16";
-        case Impl::TileTf32: return "tile-tf32";
-        case Impl::TileFp16: return "tile-fp16";
+        case Impl::Auto:   return "auto";
+        case Impl::Scalar: return "scalar";
+        case Impl::Wmma:   return "wmma";
+        case Impl::Tile:   return "tile";
     }
     return "?";
+}
+
+// The tile kernels carry their own MathMode enum, so this is the one place the
+// two vocabularies meet.
+tile_attn::MathMode tile_math_for(AttnPrecision prec) {
+    switch (prec) {
+        case AttnPrecision::Bf16: return tile_attn::MathMode::Bf16;
+        case AttnPrecision::Tf32: return tile_attn::MathMode::Tf32;
+        case AttnPrecision::Fp16: return tile_attn::MathMode::Fp16;
+        default:                  return tile_attn::MathMode::Fp32;
+    }
 }
 
 // One bundle so the launchers do not each take a dozen positional arguments.
@@ -66,6 +77,7 @@ struct AttnArgs {
     int head_dim;
     bool is_causal;
     double scale;
+    AttnPrecision prec;
 };
 
 // The scalar family, tuned instantiations first and the generic catch-all
@@ -115,12 +127,13 @@ bool launch_wmma(const AttnArgs& a) {
         a.q.scalar_type(), "launch_wmma", [&] {
             launched = dispatch_wmma<scalar_t>(
                 a.q, a.k, a.v, a.mask_ptr, a.ms, a.qs, a.out,
-                a.B, a.H, a.S, a.head_dim, a.is_causal, a.scale);
+                a.B, a.H, a.S, a.head_dim, a.is_causal, a.scale, a.prec);
         });
     return launched;
 }
 
-bool launch_tile(const AttnArgs& a, tile_attn::MathMode math) {
+bool launch_tile(const AttnArgs& a) {
+    const tile_attn::MathMode math = tile_math_for(a.prec);
     // Unlike the other two, these are hard requirements rather than coverage
     // gaps: a caller asking for the tile kernel on a build or dtype that cannot
     // have it wants to hear so, not to be quietly given a different kernel.
@@ -202,7 +215,50 @@ bool launch_tile(const AttnArgs& a, tile_attn::MathMode math) {
 // covers the case and is preferred for it, which is not always the first one
 // that covers it. Returning false means "the caller's fallback should serve
 // this", and what that fallback is gets decided there, not here.
+// Which precisions each kernel actually has arithmetic for. Auto always
+// passes: it means "your preference", and every kernel has one.
+bool impl_supports(Impl impl, AttnPrecision prec) {
+    if (prec == AttnPrecision::Auto) {
+        return true;
+    }
+    switch (impl) {
+        // Accumulators are float and that is the kernel's entire reason to
+        // exist -- 5e-6 against an exact reference, three orders tighter than
+        // the tensor-core paths. Narrowing them would make it a slower wmma.
+        case Impl::Scalar: return prec == AttnPrecision::Fp32;
+        // No shipped tensor core does a full fp32 matmul, so Fp32 here is a
+        // category error rather than a missing instantiation.
+        case Impl::Wmma:   return prec != AttnPrecision::Fp32;
+        case Impl::Tile:   return true;   // all four modes exist
+        case Impl::Auto:   return true;
+    }
+    return false;
+}
+
+const char* supported_precisions(Impl impl) {
+    switch (impl) {
+        case Impl::Scalar: return "fp32";
+        case Impl::Wmma:   return "tf32, fp16, bf16";
+        case Impl::Tile:   return "fp32, tf32, fp16, bf16";
+        case Impl::Auto:   return "fp32, tf32, fp16, bf16";
+    }
+    return "";
+}
+
 bool run_kernel(Impl impl, const AttnArgs& a) {
+    // A forced impl means that kernel exactly, so a precision it does not have
+    // is an error rather than a silent nearest-neighbour. Auto is exempt: there
+    // the precision is a preference that narrows which kernels are eligible,
+    // which is what "auto" means.
+    if (impl != Impl::Auto) {
+        TORCH_CHECK(impl_supports(impl, a.prec),
+                    "fused_attention_forward: --attn-impl ", impl_name(impl),
+                    " has no ", precision_name(a.prec), " arithmetic. It "
+                    "supports: ", supported_precisions(impl), ". Note this is "
+                    "the MATH type, not the tensor dtype -- to feed ",
+                    impl_name(impl), " ", precision_name(a.prec),
+                    " tensors, use --dtype.");
+    }
     switch (impl) {
         // The scalar ALGORITHM, not one of its six tuned instantiations: an
         // uncovered head_dim falls to the generic kernel inside launch_scalar
@@ -212,10 +268,7 @@ bool run_kernel(Impl impl, const AttnArgs& a) {
         // the scalar kernel's name.
         case Impl::Scalar:   return launch_scalar(a);
         case Impl::Wmma:     return launch_wmma(a);
-        case Impl::Tile:     return launch_tile(a, tile_attn::MathMode::Fp32);
-        case Impl::TileBf16: return launch_tile(a, tile_attn::MathMode::Bf16);
-        case Impl::TileTf32: return launch_tile(a, tile_attn::MathMode::Tf32);
-        case Impl::TileFp16: return launch_tile(a, tile_attn::MathMode::Fp16);
+        case Impl::Tile:     return launch_tile(a);
         // Tile is deliberately absent here: it covers only float32 and is a
         // separate programming model whose performance the caller should opt
         // into deliberately rather than inherit.
@@ -235,6 +288,15 @@ bool run_kernel(Impl impl, const AttnArgs& a) {
             // kernel that takes any head_dim to 2048, declining is now rare
             // enough to be a genuine statement about the shape rather than
             // about this build's coverage.
+            //
+            // The precision narrows the field rather than being applied after
+            // the fact: an explicit fp32 rules wmma out entirely, because it
+            // has no fp32 arithmetic to give, and the request lands on scalar.
+            // That makes `--attn-precision fp32` mean "the exact one" without
+            // needing to also know which kernel that is.
+            if (a.prec == AttnPrecision::Fp32) {
+                return launch_scalar(a);
+            }
             return launch_wmma(a) || launch_scalar(a);
     }
     return false;
@@ -273,14 +335,29 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
                                       bool is_causal,
                                       double scale,
                                       int64_t impl,
-                                      int64_t out_layout) {
+                                      int64_t out_layout,
+                                      // Last, not next to `impl` where it
+                                      // belongs conceptually, because a dozen
+                                      // A/B scripts already pass
+                                      // (..., impl, out_layout) positionally.
+                                      // Slotting it in between would have
+                                      // silently read their layout as a
+                                      // precision and their precision as a
+                                      // default -- a wrong answer, not an
+                                      // error. Defaults to Auto, so every one
+                                      // of those calls keeps its old meaning.
+                                      int64_t precision) {
     TORCH_CHECK(out_layout == 0 || out_layout == 1,
                 "fused_attention_forward: out_layout must be 0 ([B,H,S,head_dim]) "
                 "or 1 ([B,S,H*head_dim])");
-    TORCH_CHECK(impl >= 0 && impl <= 6,
+    TORCH_CHECK(impl >= 0 && impl <= 3,
                 "fused_attention_forward: impl must be 0 (auto), 1 (scalar), "
-                "2 (wmma), 3 (tile), 4 (tile-bf16), 5 (tile-tf32) or "
-                "6 (tile-fp16)");
+                "2 (wmma) or 3 (tile). The compound tile-bf16 / tile-tf32 / "
+                "tile-fp16 values are gone -- pass the kernel here and the "
+                "arithmetic in `precision`.");
+    TORCH_CHECK(precision >= 0 && precision <= 4,
+                "fused_attention_forward: precision must be 0 (auto), "
+                "1 (fp32), 2 (tf32), 3 (fp16) or 4 (bf16)");
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(),
                 "fused_attention_forward: q/k/v must be CUDA tensors");
     TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
@@ -315,9 +392,8 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
     // for them; the cost does.
 
     const Impl mode = static_cast<Impl>(impl);
-    const bool tile_mode =
-        (mode == Impl::Tile || mode == Impl::TileBf16 || mode == Impl::TileTf32 ||
-         mode == Impl::TileFp16);
+    const AttnPrecision prec = static_cast<AttnPrecision>(precision);
+    const bool tile_mode = (mode == Impl::Tile);
 
     // Every kernel addresses q/k/v through explicit (batch, head, sequence)
     // strides and assumes only that head_dim is stride-1. That is exactly what
@@ -399,7 +475,7 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
                                   qc.options());
 
     const AttnArgs args{qc, kc, vc, mask_ptr, ms, qs, out,
-                        B, H, S, head_dim, causal, scale};
+                        B, H, S, head_dim, causal, scale, prec};
 
     if (!run_kernel(mode, args)) {
         // Auto now reaches here exactly one way: nothing covers the case. It
@@ -414,7 +490,8 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
         // float64 past head_dim 16, and any head_dim nobody specialises.
         TORCH_CHECK(false,
                     "fused_attention_forward: impl=", impl, " (", impl_name(mode),
-                    ") does not cover dtype=", qc.scalar_type(),
+                    "), precision=", precision_name(prec),
+                    " does not cover dtype=", qc.scalar_type(),
                     ", head_dim=", head_dim, " on compute capability ",
                     at::cuda::getCurrentDeviceProperties()->major, ".",
                     at::cuda::getCurrentDeviceProperties()->minor,

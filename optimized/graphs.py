@@ -95,7 +95,7 @@ class _GraphRunner:
 def _graph_key(x: torch.Tensor, use_mask: bool) -> Tuple:
     """What makes two calls interchangeable to one captured graph.
 
-    ATTENTION_IMPL/LINEAR_GELU/ATTENTION_FP16 are in the key because a capture
+    ATTENTION_IMPL/LINEAR_GELU/ATTENTION_PRECISION are in the key because a capture
     freezes whichever kernel they selected; without them, an in-process A/B
     script flipping the global would silently do nothing on a captured model.
     ATTENTION_BACKEND is not: it has one legal value now, so it can never make
@@ -106,7 +106,7 @@ def _graph_key(x: torch.Tensor, use_mask: bool) -> Tuple:
     for every layout of x.
     """
     return (x.shape, x.dtype, x.device.index, use_mask,
-            config.ATTENTION_IMPL, config.LINEAR_GELU, config.ATTENTION_FP16)
+            config.ATTENTION_IMPL, config.LINEAR_GELU, config.ATTENTION_PRECISION)
 
 
 def _graph_pool_cap_bytes(device: torch.device) -> int:

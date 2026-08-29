@@ -18,6 +18,43 @@ namespace {
 
 namespace wm = nvcuda::wmma;
 
+// The arithmetic a kernel contracts q/k/v in, independent of what dtype the
+// tensors themselves are. The two used to be tangled together: `tile-fp16` named
+// a kernel and a precision at once, while wmma's precision lived in a separate
+// --attn-fp16 flag that no other backend shared. They are orthogonal, so they
+// are two arguments now.
+//
+// Not every pair exists, and the ones that do not are refused rather than
+// quietly rounded to a neighbour:
+//
+//              Fp32           Tf32          Fp16          Bf16
+//   scalar     yes            -             -             -
+//   wmma       -              yes           yes           yes (testing only)
+//   tile       yes            yes           yes           yes
+//
+// wmma has no Fp32 because no shipped tensor core does a full fp32 matmul --
+// asking for it there is a category error, not a missing instantiation. scalar
+// has only Fp32 because its accumulators are float and that is the whole point
+// of it; feeding it narrower TENSORS is a separate axis (--dtype) and works.
+enum class AttnPrecision : int64_t {
+    Auto = 0,   // each kernel's own preference -- wmma fp16, scalar and tile fp32
+    Fp32 = 1,
+    Tf32 = 2,
+    Fp16 = 3,
+    Bf16 = 4,
+};
+
+inline const char* precision_name(AttnPrecision p) {
+    switch (p) {
+        case AttnPrecision::Auto: return "auto";
+        case AttnPrecision::Fp32: return "fp32";
+        case AttnPrecision::Tf32: return "tf32";
+        case AttnPrecision::Fp16: return "fp16";
+        case AttnPrecision::Bf16: return "bf16";
+    }
+    return "?";
+}
+
 // Where row (b, h, i) of the output starts, for either output layout.
 //
 //   out_bshd == false  ->  [B, H, S, D], the natural per-head layout.

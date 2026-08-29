@@ -87,7 +87,9 @@ def main() -> int:
     # head_dim in this table now, but it declines rather than falling through
     # to ATen on ones it does not, which is what used to put ATen's time in
     # this table under the scalar kernel's name.
-    TILE_COLS = (("tile-tf32", 5), ("tile-bf16", 4), ("tile-fp16", 6))
+    # (label, precision code) -- one tile impl, three precisions.
+    TILE_IMPL = 3
+    TILE_COLS = (("tile tf32", 2), ("tile bf16", 4), ("tile fp16", 3))
 
     head = (f"{'case':<18}{'scalar':>10}{'wmma':>10}"
             + "".join(f"{name:>10}" for name, _ in TILE_COLS)
@@ -102,8 +104,9 @@ def main() -> int:
                                      torch.device("cuda"), torch.float32)
         scale = d ** -0.5
 
-        def run(impl):
-            return kernels.fused_attention_forward(q, k, v, am, ic, scale, impl)
+        def run(impl, prec=0):
+            return kernels.fused_attention_forward(
+                q, k, v, am, ic, scale, impl, 0, prec)
 
         with torch.inference_mode():
             ref = reference_attention(q, k, v, am, ic, scale).float()
@@ -116,15 +119,16 @@ def main() -> int:
                 timed["scalar"] = lambda: run(1)
             except RuntimeError:
                 errs["scalar"] = None
-            for name, impl in TILE_COLS:
+            for name, prec in TILE_COLS:
                 try:
-                    errs[name] = (run(impl).float() - ref).abs().max().item()
+                    errs[name] = (run(TILE_IMPL, prec).float()
+                                  - ref).abs().max().item()
                 except RuntimeError:
                     errs[name] = None
                     continue
-                # Bind impl per iteration; a bare closure over the loop
-                # variable would time the last mode under every name.
-                timed[name] = (lambda i: lambda: run(i))(impl)
+                # Bind the precision per iteration; a bare closure over the
+                # loop variable would time the last mode under every name.
+                timed[name] = (lambda p: lambda: run(TILE_IMPL, p))(prec)
             t = bench(timed)
 
         def cell(name, width, fmt):
@@ -146,8 +150,8 @@ def main() -> int:
           "covers every")
     print("head_dim in the table, so an n/a is a build without tile support "
           "rather than a")
-    print("shape. tile runs on the CUDA cores; tile-tf32, tile-bf16 and "
-          "tile-fp16 are the")
+    print("shape. tile fp32 runs on the CUDA cores; tf32, bf16 and "
+          "fp16 are the")
     print("same kernel with its GEMM operands narrowed onto the tensor cores.")
     return 0
 

@@ -40,8 +40,10 @@ BACKENDS = (
     ("custom scalar", ["--attn-backend", "custom", "--attn-impl", "scalar"]),
     ("custom wmma",   ["--attn-backend", "custom", "--attn-impl", "wmma"]),
     ("custom tile",   ["--attn-backend", "custom", "--attn-impl", "tile"]),
-    ("custom tile-tf32", ["--attn-backend", "custom", "--attn-impl", "tile-tf32"]),
-    ("custom tile-bf16", ["--attn-backend", "custom", "--attn-impl", "tile-bf16"]),
+    ("custom tile tf32", ["--attn-backend", "custom", "--attn-impl", "tile",
+                          "--attn-precision", "tf32"]),
+    ("custom tile bf16", ["--attn-backend", "custom", "--attn-impl", "tile",
+                          "--attn-precision", "bf16"]),
 )
 
 # A full sweep is len(CASES) * len(BACKENDS) harness invocations, so restrict the

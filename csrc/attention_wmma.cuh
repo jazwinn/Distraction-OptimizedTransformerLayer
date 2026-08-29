@@ -1529,13 +1529,37 @@ template <typename scalar_t, int HEAD_DIM>
 bool maybe_launch_wmma(const torch::Tensor& q, const torch::Tensor& k,
                        const torch::Tensor& v, const bool* mask_ptr,
                        const int64_t* ms, const int64_t* qs, torch::Tensor& out,
-                       int B, int H, int S, bool is_causal, double scale) {
-    // Only an fp32 tensor has a choice to make; half and bfloat16 contract in
-    // the type they already are.
+                       int B, int H, int S, bool is_causal, double scale,
+                       AttnPrecision prec) {
+    // Only an fp32 tensor has a choice to make. A tensor that is ALREADY half
+    // or bfloat16 contracts in the type it is: narrowing further is not
+    // possible and widening it back would buy nothing, since the mantissa it
+    // lost is lost. So the precision argument is a request about fp32 inputs,
+    // and fused_attention_forward is where a conflicting one is refused --
+    // here it is simply not consulted.
     if constexpr (std::is_same<scalar_t, float>::value) {
-        if (wmma_fp16_flag()) {
-            return maybe_launch_wmma_as<scalar_t, __half, HEAD_DIM>(
-                q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
+        // Auto defers to the process-wide knob, which is what WMMA_FP16 and
+        // wmma_set_fp16() drive; the A/B scripts built on those keep working
+        // without knowing this argument exists. An explicit precision wins over
+        // the knob, because it came from the caller rather than the environment.
+        AttnPrecision want = prec;
+        if (want == AttnPrecision::Auto) {
+            want = wmma_fp16_flag() ? AttnPrecision::Fp16 : AttnPrecision::Tf32;
+        }
+        switch (want) {
+            case AttnPrecision::Fp16:
+                return maybe_launch_wmma_as<scalar_t, __half, HEAD_DIM>(
+                    q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
+            case AttnPrecision::Bf16:
+                // Exposed for measurement only. 8 significand bits ran 425%-622%
+                // of the harness's 2e-3 budget when this was last measured, so
+                // it is a thing to compare against, not a thing to ship.
+                return maybe_launch_wmma_as<scalar_t, __nv_bfloat16, HEAD_DIM>(
+                    q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
+            default:
+                // Tf32. compute_t == float IS the tf32 path: FragTraits<float>
+                // is the 16x16x8 tf32 fragment, not an fp32 matmul.
+                break;
         }
     }
     if constexpr (WmmaCfg<scalar_t, HEAD_DIM>::SUPPORTED) {
@@ -1589,21 +1613,21 @@ bool dispatch_wmma(const torch::Tensor& q, const torch::Tensor& k,
                    const torch::Tensor& v, const bool* mask_ptr,
                    const int64_t* ms, const int64_t* qs, torch::Tensor& out,
                    int B, int H, int S, int head_dim,
-                   bool is_causal, double scale) {
+                   bool is_causal, double scale, AttnPrecision prec) {
     using scalar_t = typename DevType<c10_t>::type;
     switch (head_dim) {
         case 8:
-            return maybe_launch_wmma<scalar_t, 8>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
+            return maybe_launch_wmma<scalar_t, 8>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale, prec);
         case 16:
-            return maybe_launch_wmma<scalar_t, 16>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
+            return maybe_launch_wmma<scalar_t, 16>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale, prec);
         case 32:
-            return maybe_launch_wmma<scalar_t, 32>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
+            return maybe_launch_wmma<scalar_t, 32>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale, prec);
         case 64:
-            return maybe_launch_wmma<scalar_t, 64>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
+            return maybe_launch_wmma<scalar_t, 64>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale, prec);
         case 128:
-            return maybe_launch_wmma<scalar_t, 128>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
+            return maybe_launch_wmma<scalar_t, 128>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale, prec);
         case 256:
-            return maybe_launch_wmma<scalar_t, 256>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
+            return maybe_launch_wmma<scalar_t, 256>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale, prec);
         default:
             return false;
     }
