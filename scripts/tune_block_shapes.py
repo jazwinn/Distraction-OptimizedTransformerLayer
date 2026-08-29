@@ -11,6 +11,7 @@ numbers it prints go back into those macro defaults.
     python scripts/tune_block_shapes.py --backend wmma 64    # one backend, one head_dim
     python scripts/tune_block_shapes.py --causal             # the causal shapes instead
     python scripts/tune_block_shapes.py --backend wmma --dtype float16
+    python scripts/tune_block_shapes.py --backend wmma --frag tf32   # pre-fp16
 
 Four backends, and they are not interchangeable:
 
@@ -20,6 +21,16 @@ Four backends, and they are not interchangeable:
                                         one mode where the two pressures pull
                                         apart, so it inherits neither's shapes.
   wmma        nvcuda::wmma fragments.   The shipping default for every dtype.
+
+wmma has a third axis the other three do not: the tensors it is handed and the
+fragments it contracts them in are different types. `maybe_launch_wmma` narrows
+an fp32 tensor to __half whenever `wmma_fp16_flag()` is set -- which is the
+kernel's DEFAULT -- and instantiates `WmmaCfg` on __half. So `--dtype float32`
+alone does not say what the shared-memory budget is; `--frag` does, and it is
+what the candidate filter models. Getting this wrong does not produce a wrong
+timing, it produces a wrong SEARCH: a run that filtered on the 4-byte budget
+while the kernel ran 2-byte fragments never built (32,64) or (32,80) at head_dim
+64, both of which fit. `--frag tf32` gets the old behaviour back.
 
 Two structural differences the flags have to respect:
 
@@ -76,8 +87,9 @@ _TILE_CANDIDATES = tuple(itertools.product((16, 32, 64, 128), (16, 32, 64, 128))
 _WMMA_M = (16, 32, 64, 128)
 _WMMA_N = (16, 32, 48, 64, 80, 96, 112, 128)
 
-# Bytes per element and fragment K/pad, keyed by the dtype the sweep runs at.
-# Mirrors FragTraits in csrc/attention_wmma.cuh.
+# Bytes per element and fragment K/pad, keyed by the type the fragments
+# CONTRACT IN -- not by the dtype of the tensors handed to the kernel. Mirrors
+# FragTraits in csrc/attention_wmma.cuh.
 _FRAG = {
     torch.float32:  (4, 8, 4),    # tf32 fragments: 16x16x8, ldm % 4 == 0
     torch.float16:  (2, 16, 8),   # ldm % 8 == 0
@@ -85,8 +97,24 @@ _FRAG = {
 }
 
 
-def _wmma_smem(dtype, head_dim: int, m: int, n: int):
-    """(total, scratch) shared bytes WmmaCfg<scalar_t, HEAD_DIM> asks for here.
+def frag_dtype(dtype, fp16_frags: bool):
+    """The type the fragments contract in, which is what sizes every staged tile.
+
+    Only an fp32 tensor has a choice to make: maybe_launch_wmma narrows it to
+    __half when wmma_fp16_flag() is set, and WmmaCfg is then instantiated on
+    __half -- so an fp32 run under the fp16 flag has a 2-byte budget, not a
+    4-byte one, and shapes the 4-byte model rejects are legal. half and
+    bfloat16 tensors contract in the type they already are. Mirrors
+    maybe_launch_wmma in csrc/attention_wmma.cuh.
+    """
+    return torch.float16 if (dtype is torch.float32 and fp16_frags) else dtype
+
+
+def _wmma_smem(frag, head_dim: int, m: int, n: int):
+    """(total, scratch) shared bytes WmmaCfg<compute_t, HEAD_DIM> asks for here.
+
+    `frag` is compute_t, the fragment type -- see frag_dtype. The kernel asks
+    SUPPORTED of compute_t, so that is the type this model has to mirror.
 
     `scratch` is the QO/K/V/S span the accumulator probe borrows before the
     first key tile is staged; SUPPORTED requires it to cover PROBE_BYTES.
@@ -96,23 +124,23 @@ def _wmma_smem(dtype, head_dim: int, m: int, n: int):
     the kernel's own SUPPORTED check is still what decides, and a shape that
     slips through anyway declines at run time and scores as `inf`.
     """
-    esz, _, pad = _FRAG[dtype]
+    esz, _, pad = _FRAG[frag]
     pdim = 16 if head_dim < 16 else head_dim
     kv_ld, o_ld, s_ld = pdim + pad, pdim + 4, n + pad
     qo = max(esz * m * kv_ld, 4 * m * o_ld)
     kv = esz * n * kv_ld
     s_bytes = 4 * m * s_ld
-    p_bytes = 0 if dtype is torch.float32 else esz * m * s_ld   # p aliases s for tf32
+    p_bytes = 0 if frag is torch.float32 else esz * m * s_ld    # p aliases s for tf32
     scratch = qo + 2 * kv + s_bytes
     return scratch + p_bytes + 3 * (4 * m), scratch
 
 
-def _wmma_legal(dtype, head_dim: int, m: int, n: int) -> bool:
-    _, wk, _ = _FRAG[dtype]
+def _wmma_legal(frag, head_dim: int, m: int, n: int) -> bool:
+    _, wk, _ = _FRAG[frag]
     pdim = 16 if head_dim < 16 else head_dim
     if pdim % wk or pdim % 16 or n % wk or m % 16:
         return False
-    total, scratch = _wmma_smem(dtype, head_dim, m, n)
+    total, scratch = _wmma_smem(frag, head_dim, m, n)
     if scratch < 4 * (m // 16) * 512:        # the accumulator probe needs this much
         return False
     # 48 KB is the cap that keeps two blocks resident without opting in to the
@@ -120,9 +148,9 @@ def _wmma_legal(dtype, head_dim: int, m: int, n: int) -> bool:
     return total <= 48 * 1024
 
 
-def _wmma_candidates(dtype, head_dim: int):
+def _wmma_candidates(frag, head_dim: int):
     return tuple((m, n) for m in _WMMA_M for n in _WMMA_N
-                 if _wmma_legal(dtype, head_dim, m, n))
+                 if _wmma_legal(frag, head_dim, m, n))
 
 
 # ---------------------------------------------------------------------------
@@ -146,9 +174,9 @@ class Backend:
         self.mask_split = mask_split
         self.dtypes = dtypes
 
-    def candidates(self, dtype, head_dim):
+    def candidates(self, frag, head_dim):
         if self.name == "wmma":
-            return _wmma_candidates(dtype, head_dim)
+            return _wmma_candidates(frag, head_dim)
         return _TILE_CANDIDATES
 
     def macros(self, dtype, head_dim: int, m: int, n: int, causal: bool) -> dict:
@@ -280,20 +308,24 @@ def score_all(mods: dict, head_dim: int, dtype, cases, impl: int, rounds: int = 
     return best
 
 
-def sweep_backend(be: Backend, dtype, head_dims, causal: bool, rounds: int) -> dict:
+def sweep_backend(be: Backend, dtype, frag, head_dims, causal: bool,
+                  rounds: int) -> dict:
     """Sweep one backend over the requested head_dims; return {head_dim: (ms, m, n)}."""
     # A mask-split backend is scored only on the cases its shape will serve.
     # Scoring a shape on cases it never runs is how one shape ended up serving
     # both mask modes. wmma's shape serves both, so it is scored on both.
     cases = tuple(c for c in ALL_CASES if c[3] == causal) if be.mask_split else ALL_CASES
 
-    label = f"{be.name}  {str(dtype).replace('torch.', '')}  "
+    label = f"{be.name}  {str(dtype).replace('torch.', '')}"
+    if be.name == "wmma" and frag is not dtype:
+        label += f"->{str(frag).replace('torch.', '')} frags"
+    label += "  "
     label += ("causal" if causal else "dense") if be.mask_split else "dense+causal"
     print(f"\n=== {label} ===")
 
     winners = {}
     for hd in head_dims:
-        cands = be.candidates(dtype, hd)
+        cands = be.candidates(frag, hd)
         if not cands:
             print(f"\nhead_dim {hd}: no legal shape")
             continue
@@ -343,6 +375,11 @@ def parse_args(argv):
     p.add_argument("--dtype", default="float32",
                    choices=("float32", "float16", "bfloat16"),
                    help="input dtype; only wmma accepts anything but float32")
+    p.add_argument("--frag", default="auto", choices=("auto", "fp16", "tf32"),
+                   help="wmma only: what fp32 tensors contract in. auto (=fp16) "
+                        "matches the kernel's own default; tf32 is the pre-fp16 "
+                        "behaviour. Sets WMMA_FP16 and, more importantly, picks "
+                        "which shared-memory budget the candidate filter models")
     p.add_argument("--rounds", type=int, default=5,
                    help="interleaved timing rounds per candidate")
     return p.parse_args(argv)
@@ -364,9 +401,22 @@ def main(argv) -> int:
     dtype = getattr(torch, args.dtype)
     names = args.backend or sorted(BACKENDS)
 
+    # Set before the first launch in any built module: wmma_fp16_flag() is a
+    # function-local static seeded from the environment on first call, per
+    # loaded extension. Setting it here covers every candidate build.
+    fp16_frags = args.frag != "tf32"
+    os.environ["WMMA_FP16"] = "1" if fp16_frags else "0"
+    frag = frag_dtype(dtype, fp16_frags)
+
+    note = ""
+    if frag is not dtype:
+        note = (f"  frags={str(frag).replace('torch.', '')} (WMMA_FP16=1; the "
+                f"candidate filter models its 2-byte budget)")
+    elif dtype is torch.float32:
+        note = "  frags=tf32 (WMMA_FP16=0)"
     print(f"{torch.cuda.get_device_name(0)}  "
           f"sm_{''.join(map(str, torch.cuda.get_device_capability()))}  "
-          f"dtype={args.dtype}")
+          f"dtype={args.dtype}{note}")
 
     results = {}
     for name in names:
@@ -385,7 +435,11 @@ def main(argv) -> int:
             have = ", ".join(map(str, be.head_dims))
             print(f"\n=== {name} === skipped: supports head_dim {{{have}}}")
             continue
-        results[name] = sweep_backend(be, dtype, head_dims, args.causal, args.rounds)
+        # The tile backends pick their math mode by impl, not by WMMA_FP16, so
+        # their budget is the tensor dtype's either way.
+        be_frag = frag if be.name == "wmma" else dtype
+        results[name] = sweep_backend(be, dtype, be_frag, head_dims, args.causal,
+                                      args.rounds)
 
     print("\n" + "=" * 60)
     print("Winners. Paste into the macro defaults these override.")

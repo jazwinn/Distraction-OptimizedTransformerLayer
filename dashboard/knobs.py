@@ -157,12 +157,12 @@ ENV_BY_NAME = {knob["name"]: knob for knob in ENV_KNOBS}
 # not fall back -- it raises, by design, so that "--attn-impl scalar" can never
 # quietly time ATen and report it as the scalar kernel.
 HEAD_DIM_COVERAGE = {
-    "scalar": {8, 16, 32, 64, 128},
-    "wmma": {8, 16, 32, 64, 128},
-    "tile": {8, 16, 32, 64},
-    "tile-bf16": {8, 16, 32, 64},
-    "tile-tf32": {8, 16, 32, 64},
-    "tile-fp16": {8, 16, 32, 64},
+    "scalar": {8, 16, 32, 64, 128, 256},
+    "wmma": {8, 16, 32, 64, 128, 256},
+    "tile": {8, 16, 32, 64, 256},
+    "tile-bf16": {8, 16, 32, 64, 256},
+    "tile-tf32": {8, 16, 32, 64, 256},
+    "tile-fp16": {8, 16, 32, 64, 256},
 }
 
 TILE_IMPLS = ("tile", "tile-bf16", "tile-tf32", "tile-fp16")

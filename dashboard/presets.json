@@ -11,7 +11,8 @@
     "12-13 vary seq_len, and 14 is its own thing.",
     "",
     "head_dim = d_model / heads decides which attention kernel can run:",
-    "wmma and scalar cover {8,16,32,64,128}, the tile kernels {8,16,32,64}.",
+    "wmma and scalar cover {8,16,32,64,128,256}, the tile kernels",
+  "{8,16,32,64,256}.",
     "",
     "This file is re-read on every request, so edits appear on the next page",
     "load with no restart. Keys: name, batch_size, seq_len, d_model, heads,",
@@ -104,7 +105,7 @@
       "ffn_dim": 1024,
       "layers": 4,
       "causal": true,
-      "note": "head_dim 256 -- outside every custom kernel (wmma/scalar stop at 128, tile at 64), so attention falls back to SDPA. Forcing any --attn-impl here will be refused."
+      "note": "head_dim 256. Every impl covers it, but none beats SDPA there (wmma is the closest at 0.50x), so auto still falls back to SDPA. Force --attn-impl to compare them."
     },
     {
       "name": "9 - 1 head",
@@ -126,7 +127,7 @@
       "ffn_dim": 128,
       "layers": 4,
       "causal": true,
-      "note": "head_dim 64, the widest the tile kernels reach."
+      "note": "head_dim 64, the widest the tile kernels reach before jumping to 256."
     },
     {
       "name": "11 - 16 heads",

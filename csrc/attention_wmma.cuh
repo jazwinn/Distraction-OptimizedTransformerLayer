@@ -201,6 +201,41 @@ __device__ __forceinline__ float attn_exp(float x) {
 #define WMMA_M_128 32
 #define WMMA_N_128 16
 #endif
+// head_dim 256 is the one shape that does not fit in the free 48 KB at all:
+// Q, O and both K/V tiles are BLOCK_* x 256, so even 16x16 wants 36 KB in fp16
+// and 50 KB in tf32. Once the block is opting into the larger carveout anyway,
+// the question is which shape to spend it on. Swept against SDPA over 10
+// shapes, ratio > 1 meaning the kernel wins:
+//
+//                        16x16     32x16     16x32
+//   causal b8h8s32       0.690     0.796     0.393
+//   causal b8h8s128      0.346     0.536     0.192
+//   causal b8h8s512      0.357     0.607     0.213
+//   causal b1h8s128      0.479     0.716     0.295
+//   causal b2h8s1024     0.390     0.700     0.259
+//   dense  b8h8s32       0.575     0.764     0.377
+//   dense  b8h8s128      0.269     0.434     0.143
+//   dense  b8h8s512      0.309     0.524     0.196
+//   dense  b1h8s128      0.472     0.725     0.225
+//   dense  b2h8s1024     0.305     0.528     0.203
+//
+// 32x16 wins every one of the ten, by 1.15x-1.55x, and it does not buy that
+// with occupancy: at 55 KB an SM holds one block of two warps, exactly the 64
+// threads 16x16 gets from two blocks of one. What it buys is half the blocks,
+// hence half the K/V passes over global memory -- the same reason a taller
+// block wins at every other head_dim.
+//
+// 16x32 loses everywhere, which is the head_dim 128 result again (see the
+// WmmaShape note above): a wider key tile doubles the staging without adding
+// parallelism, and Q is register-resident so there is nothing for it to buy.
+//
+// None of the three beats SDPA. That is what keeps head_dim 256 out of Auto --
+// see wmma_preferred_by_auto in attention_dispatch.cuh -- and this table is
+// about being the best forced `--attn-impl wmma`, not about winning.
+#ifndef WMMA_M_256
+#define WMMA_M_256 32
+#define WMMA_N_256 16
+#endif
 
 // The primary template keeps the 64x32 general case for any head_dim the
 // dispatcher does not switch on; the five it does switch on read the macros.
@@ -213,6 +248,7 @@ template <> struct WmmaShape<16>  { static constexpr int M = WMMA_M_16;  static 
 template <> struct WmmaShape<32>  { static constexpr int M = WMMA_M_32;  static constexpr int N = WMMA_N_32;  };
 template <> struct WmmaShape<64>  { static constexpr int M = WMMA_M_64;  static constexpr int N = WMMA_N_64;  };
 template <> struct WmmaShape<128> { static constexpr int M = WMMA_M_128; static constexpr int N = WMMA_N_128; };
+template <> struct WmmaShape<256> { static constexpr int M = WMMA_M_256; static constexpr int N = WMMA_N_256; };
 
 template <typename scalar_t, int HEAD_DIM>
 struct WmmaCfg {
@@ -272,15 +308,34 @@ struct WmmaCfg {
     // head_dim 16 through 64. scripts/ab_causal_reverse.py has the table.
     static constexpr bool REVERSE_CAUSAL = (HEAD_DIM <= 64);
 
+    // 48 KB is what a block gets without opting in, and two of them then fit on
+    // an SM. Every head_dim up to 128 stays inside it and none of them calls
+    // cudaFuncSetAttribute.
+    //
+    // head_dim 256 cannot, in either compute type: Q, O and both K/V tiles are
+    // all 256 wide, so the swept 32x16 shape is 53.9 KB in fp16 and 67.9 KB in
+    // tf32. Declining would mean `--attn-impl wmma` covered a head_dim with the
+    // fp16 fragments and not with the tf32 ones, and would also cost the 1.15x-
+    // 1.55x the taller block is worth. So that head_dim opts into the larger
+    // carveout instead, and pays for it with the second resident block -- which
+    // it was never going to get: 2 x 55 KB does not fit in an SM's 100 KB, and
+    // the 16x16 shape that does fit twice runs half the warps per block.
+    //
+    // 96 KB is a compile-time ceiling, not a device query, so it is deliberately
+    // under SM 8.x's 99 KB per-block maximum. A device that will not grant it
+    // fails the check at launch with a message naming the number, rather than
+    // failing the launch itself several frames later.
+    static constexpr size_t SMEM_FREE  = 48 * 1024;
+    static constexpr size_t SMEM_LIMIT = (HEAD_DIM >= 256) ? (96 * 1024) : SMEM_FREE;
+    static constexpr bool NEEDS_CARVEOUT = (SMEM > SMEM_FREE);
+
     // GEMM1 contracts over the padded head_dim, GEMM2 over the key tile; both
-    // must be a whole number of fragments. Staying under 48 KB keeps two blocks
-    // resident per SM without having to opt in to the larger dynamic
-    // shared-memory carveout.
+    // must be a whole number of fragments.
     static constexpr bool SUPPORTED =
         FragTraits<scalar_t>::supported &&
         (PDIM % WK == 0) && (PDIM % 16 == 0) &&
         (BLOCK_N % WK == 0) && (BLOCK_M % 16 == 0) &&
-        (SCRATCH_BYTES >= PROBE_BYTES) && (SMEM <= 48 * 1024);
+        (SCRATCH_BYTES >= PROBE_BYTES) && (SMEM <= SMEM_LIMIT);
 };
 
 // Runtime off switch for the causal block-index reversal below, so the two
@@ -999,6 +1054,21 @@ void launch_wmma_kernel_as(const torch::Tensor& q, const torch::Tensor& k,
 
     const bool out_bshd = (out.dim() == 3);
 
+    // Only a config that asked for more than the free 48 KB pays for this, and
+    // it pays once per instantiation rather than per launch. Checked rather
+    // than ignored: without the opt-in the launch fails with
+    // cudaErrorInvalidValue several frames away from the cause.
+    if constexpr (Cfg::NEEDS_CARVEOUT) {
+        static const cudaError_t carveout = cudaFuncSetAttribute(
+            fused_attention_wmma_kernel<scalar_t, compute_t, HEAD_DIM, MODE>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(Cfg::SMEM));
+        TORCH_CHECK(carveout == cudaSuccess,
+                    "fused_attention: head_dim ", HEAD_DIM, " needs ", Cfg::SMEM,
+                    " bytes of dynamic shared memory per block and this device "
+                    "would not grant it (", cudaGetErrorString(carveout), ")");
+    }
+
     // Reversal only pays when there is a queue to reorder. Measured on 13
     // causal shapes (scripts/ab_causal_reverse.py): below one wave every block
     // is already resident, so dispatch order decides nothing and reversing only
@@ -1205,6 +1275,8 @@ bool dispatch_wmma(const torch::Tensor& q, const torch::Tensor& k,
             return maybe_launch_wmma<scalar_t, 64>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
         case 128:
             return maybe_launch_wmma<scalar_t, 128>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
+        case 256:
+            return maybe_launch_wmma<scalar_t, 256>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
         default:
             return false;
     }

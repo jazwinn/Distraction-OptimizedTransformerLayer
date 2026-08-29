@@ -1,5 +1,5 @@
-// Scalar kernel: one thread owns one query row -- or, past head_dim 64, half of
-// one.
+// Scalar kernel: one thread owns one query row -- or, past head_dim 64, a
+// 64-dim slice of one.
 //
 // A thread keeps q and the output accumulator for its row in registers, which
 // is the whole reason the key loop is cheap: no reload per key, and the
@@ -8,23 +8,25 @@
 // 255 -- not a tuning problem, a wall. Which is why this kernel stopped at 64
 // and why REPORT.md's "scalar at head_dim 128" measurements were always ATen.
 //
-// So past 64 the row is split between two threads instead. Each owns 64 dims of
-// q and the matching 64 of acc, computes a partial dot product against the key,
-// and one __shfl_xor_sync between the two lanes makes the score whole.
-// Everything after that -- running max, rescale, accumulate, normalise -- both
-// partners run identically on their own half. One shuffle per key, no other
-// communication, and the same total shared-memory traffic as before: the two
-// threads read disjoint halves of the key row.
+// So past 64 the row is split across HEAD_DIM/64 threads instead -- two at
+// head_dim 128, four at 256. Each owns 64 dims of q and the matching 64 of acc,
+// computes a partial dot product against the key, and a log2(TPR)-step
+// __shfl_xor_sync butterfly over the group makes the score whole in every
+// member at once. Everything after that -- running max, rescale, accumulate,
+// normalise -- every partner runs identically on its own slice. log2(TPR)
+// shuffles per key, no other communication, and the same total shared-memory
+// traffic as before: the threads read disjoint slices of the key row.
 //
-// Two threads per row also doubles the block to 128 threads, which is the
-// second thing head_dim 128 needed. The one-thread-per-row shape ran two warps
-// per SM with nothing queued behind a miss.
+// That also means the per-thread register cost stops growing at head_dim 64:
+// 128 floats of q_reg + acc whether the head is 64, 128 or 256 wide. What grows
+// instead is the block -- 64, 128, 256 threads -- and the key tile has to
+// shrink to pay for it, which is what BLOCK_N below does.
 //
-// The shuffle mask is two lanes wide, and that is safe because partners share a
+// The shuffle mask is TPR lanes wide, and that is safe because a group shares a
 // row index: the i < S guard, the causal break and the mask continue all depend
-// on the row and never on which half, so a pair is always converged. Partners
-// are adjacent lanes by construction (row = tid / TPR), never split across a
-// warp boundary, since TPR divides 32.
+// on the row and never on which slice, so a group is always converged. Group
+// members are adjacent lanes by construction (row = tid / TPR) and never
+// straddle a warp boundary, since TPR is a power of two that divides 32.
 
 #pragma once
 
@@ -51,9 +53,11 @@ struct ScalarCfg {
 
     // Keys per shared tile. Picked so k_s + v_s land at 32 KB for every
     // head_dim from 64 up, comfortably inside the 48 KB that keeps two blocks
-    // resident per SM.
+    // resident per SM. The tile is BLOCK_N * HEAD_DIM elements twice over, so
+    // each doubling of head_dim halves this.
     static constexpr int BLOCK_N =
-        (HEAD_DIM >= 128) ? 32 : ((HEAD_DIM >= 64) ? 64 : 128);
+        (HEAD_DIM >= 256) ? 16
+                          : ((HEAD_DIM >= 128) ? 32 : ((HEAD_DIM >= 64) ? 64 : 128));
     static constexpr size_t SMEM =
         2 * static_cast<size_t>(BLOCK_N) * HEAD_DIM * sizeof(scalar_t);
 
@@ -63,7 +67,8 @@ struct ScalarCfg {
     static constexpr bool SUPPORTED = (SMEM <= SMEM_LIMIT);
 
     static_assert(HEAD_DIM % DIMS == 0, "head_dim must split evenly over a row");
-    static_assert(TPR == 1 || TPR == 2, "the score shuffle assumes a lane pair");
+    static_assert(TPR >= 1 && (TPR & (TPR - 1)) == 0,
+                  "the score butterfly assumes a power-of-two lane group");
     static_assert(NTHREADS % 32 == 0, "block must be whole warps");
     static_assert(32 % TPR == 0, "a row's threads must not straddle two warps");
 };
@@ -100,11 +105,13 @@ __global__ void fused_attention_kernel(const scalar_t* __restrict__ q,
     const int i = m_tile * BLOCK_M + row;
     const bool active = (i < S);
 
-    // The two lanes sharing a row, and nothing else. Safe as a fully-populated
-    // mask because a pair never diverges -- see the note above the kernel. At
+    // The TPR lanes sharing a row, and nothing else. Safe as a fully-populated
+    // mask because a group never diverges -- see the note above the kernel. At
     // TPR == 1 there is no shuffle to mask.
-    const unsigned pair_mask =
-        (TPR == 1) ? 0u : (3u << (threadIdx.x & 31u & ~1u));
+    const unsigned group_mask =
+        (TPR == 1) ? 0u
+                   : (((1u << TPR) - 1u)
+                      << (threadIdx.x & 31u & ~static_cast<unsigned>(TPR - 1)));
 
     const int64_t bh_off =
         static_cast<int64_t>(b) * qs0 + static_cast<int64_t>(h) * qs1;
@@ -177,9 +184,13 @@ __global__ void fused_attention_kernel(const scalar_t* __restrict__ q,
                 for (int d = 0; d < DIMS; ++d) {
                     s += q_reg[d] * static_cast<float>(k_s[j * HEAD_DIM + d0 + d]);
                 }
-                // Half a dot product each; one exchange makes both whole.
+                // A slice of the dot product each; a butterfly over the
+                // group leaves every member holding the whole of it.
                 if constexpr (TPR > 1) {
-                    s += __shfl_xor_sync(pair_mask, s, 1);
+                    #pragma unroll
+                    for (int off = 1; off < TPR; off <<= 1) {
+                        s += __shfl_xor_sync(group_mask, s, off);
+                    }
                 }
                 s *= scale;
 
@@ -278,6 +289,8 @@ bool dispatch_head_dim(const torch::Tensor& q, const torch::Tensor& k,
             return launch_kernel<scalar_t, 64>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
         case 128:
             return launch_kernel<scalar_t, 128>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
+        case 256:
+            return launch_kernel<scalar_t, 256>(q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
         default:
             return false;
     }

@@ -1532,3 +1532,98 @@ sweep and the interpreting; README.md, Setup step 4 walks through reading its
 output. It obeys both rules at the top of this file: candidates are timed
 interleaved in one process, and it carries an eager-vs-eager control row so the
 noise floor is measured rather than assumed.
+
+## head_dim 256: coverage everywhere, a win nowhere
+
+Grading shape 8 (batch 64, seq 128, d_model 1024, 4 heads, causal) is head_dim
+256, and it was the one shape in the set no kernel covered: `--attn-impl wmma`
+refused it, `--attn-impl scalar` refused it, the tile kernels refused it, and
+Auto quietly served it from SDPA. Every impl covers it now. None of them should
+be used for it.
+
+### What each kernel had to change
+
+**scalar.** Nothing structural. Past head_dim 64 a query row is already split
+across threads so that `q_reg + acc` clears the 255-register ceiling; head_dim
+256 just makes that four threads instead of two. The one real change is the
+score exchange: a single `__shfl_xor_sync(mask, s, 1)` only completes a pair, so
+it became a `log2(TPR)`-step butterfly over the group. Per-thread registers are
+therefore identical at head_dim 64, 128 and 256 -- 128 floats -- and what grows
+is the block (64 -> 128 -> 256 threads) and what shrinks is the key tile
+(BLOCK_N 64 -> 32 -> 16, holding `k_s + v_s` at 32 KB).
+
+**wmma.** Q and O are register-resident across the whole head, so head_dim 256
+gives each warp a 16-fragment `q_frag` and a 16-fragment `o_frag`. Nothing about
+that is tunable; what is tunable is the block shape, and at 256 no shape fits in
+the 48 KB a block gets for free -- Q, O and both K/V tiles are all `BLOCK_* x
+256`. So head_dim 256 is the one head_dim that opts into the larger dynamic
+shared-memory carveout, via one `cudaFuncSetAttribute` per instantiation.
+
+**tile.** Only a `BlockCfg<256, ...>` per math mode and a dispatch case. The
+kernel itself is already generic in HEAD_DIM.
+
+### The wmma block shape, swept
+
+Once the carveout is being paid for anyway, the shape is a free choice. Against
+SDPA, causal and dense, ratio > 1 meaning the kernel wins, one build per
+candidate:
+
+|                    | 16x16 | 32x16 | 16x32 |
+|--------------------|-------|-------|-------|
+| causal b8h8s32     | 0.690 | 0.796 | 0.393 |
+| causal b8h8s128    | 0.346 | 0.536 | 0.192 |
+| causal b8h8s512    | 0.357 | 0.607 | 0.213 |
+| causal b1h8s128    | 0.479 | 0.716 | 0.295 |
+| causal b2h8s1024   | 0.390 | 0.700 | 0.259 |
+| dense  b8h8s32     | 0.575 | 0.764 | 0.377 |
+| dense  b8h8s128    | 0.269 | 0.434 | 0.143 |
+| dense  b8h8s512    | 0.309 | 0.524 | 0.196 |
+| dense  b1h8s128    | 0.472 | 0.725 | 0.225 |
+| dense  b2h8s1024   | 0.305 | 0.528 | 0.203 |
+
+32x16 wins all ten by 1.15x-1.55x, and not through occupancy: at 55 KB an SM
+holds one block of two warps, which is exactly the 64 threads 16x16 gets from
+two blocks of one warp. What it buys is half the blocks and therefore half the
+K/V passes over global memory.
+
+16x32 loses everywhere, which is the head_dim 128 result again (see "NEGATIVE:
+the freed shared memory does not want to be spent on a bigger tile"): a wider
+key tile doubles the staging without adding parallelism, and Q is already in
+registers, so there is nothing for it to buy.
+
+### Why Auto still routes head_dim 256 to SDPA
+
+Interleaved against SDPA, causal, with an A/A control row, at the shape that
+actually matters and three neighbours:
+
+| shape                   | sdpa_ms | control | scalar | wmma  | tile  | tile-fp16 |
+|-------------------------|---------|---------|--------|-------|-------|-----------|
+| b64 h4 s128 (shape 8)   |  0.6745 |   0.0%  | 0.262  | 0.503 | 0.067 | 0.096     |
+| b16 h4 s128             |  0.1835 |   1.1%  | 0.250  | 0.498 | 0.071 | 0.101     |
+| b2  h4 s128             |  0.0378 |   2.0%  | 0.140  | 0.706 | 0.099 | 0.126     |
+| b2  h4 s64              |  0.0292 |   1.4%  | 0.242  | 0.884 | 0.203 | 0.241     |
+
+The best of the four is half SDPA's speed at the grading shape, and the closest
+any of them gets anywhere is 0.884x on a shape small enough that SDPA is mostly
+launch overhead. That is not a threshold to find; it is a loss everywhere. So
+`wmma_preferred_by_auto` declines above head_dim 128 outright
+(`kWmmaAutoMaxCandidateHeadDim`), and the two head_dim 128 clauses above it are
+left describing only the case they were measured on.
+
+The reason is structural rather than a tuning miss. This family of kernels keeps
+Q and the output accumulator in registers for the whole key loop, which is what
+makes them fast at head_dim 64. At 256 that same choice forces a 32-row block,
+one block per SM, 64 threads -- a sixteenth of what the SM can hold -- and no
+block shape recovers it while Q stays register-resident. SDPA's flash backend
+tiles the head dimension instead. Beating it at head_dim 256 means a kernel that
+does the same, and that is a different kernel, not a different constant.
+
+So this is coverage: `--attn-impl wmma` (or scalar, or any tile mode) now runs
+at head_dim 256 and reports its own honest time instead of refusing, which is
+what the A/B tooling needs. It is not a speedup, and Auto does not take it.
+
+### One coverage gap left, deliberately
+
+The tile kernels now cover `{8,16,32,64,256}` -- 128 is still missing, as it was
+before. Nothing here needed it and nothing measured it; it is a `BlockCfg<128>`
+away if a shape ever wants it.

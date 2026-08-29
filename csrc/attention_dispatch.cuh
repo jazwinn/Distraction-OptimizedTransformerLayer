@@ -191,11 +191,25 @@ bool launch_tile(const AttnArgs& a, tile_attn::MathMode math) {
 // The dip at S 128 is the reason head_dim 128 is not simply admitted outright.
 // It is also the sequence length of most of the grading set, so getting it
 // wrong would cost exactly where it is measured.
+//
+// head_dim 256 is covered by every impl and claimed by none of them. The two
+// clauses above are both measurements at head_dim 128, and 256 is not a wider
+// version of that case -- it is a different one. The wmma kernel there runs a
+// 16x16 block, one warp, because Q and O are register-resident across the whole
+// head and the fragment geometry admits no smaller shape; the scalar kernel
+// splits each row over four lanes and drops to a 16-key tile. Both are coverage
+// for a forced --attn-impl, not candidates for the default path, so Auto keeps
+// SDPA here until something measures otherwise. Raise
+// kWmmaAutoMaxCandidateHeadDim when it does.
 constexpr int kWmmaAutoMaxHeadDim = 64;
 constexpr int kWmmaAutoMinSeqForSdpa = 128;
 constexpr int kWmmaAutoWideMinSeq = 512;
+constexpr int kWmmaAutoMaxCandidateHeadDim = 128;
 
 bool wmma_preferred_by_auto(const AttnArgs& a) {
+    if (a.head_dim > kWmmaAutoMaxCandidateHeadDim) {
+        return false;
+    }
     if (a.head_dim <= kWmmaAutoMaxHeadDim || a.S < kWmmaAutoMinSeqForSdpa) {
         return true;
     }
@@ -246,7 +260,9 @@ torch::Tensor to_bshd(const torch::Tensor& t) {
 // file takes when it has nothing better runs the *baseline's* algorithm and
 // inherits its memory traffic. SDPA runs a flash-style kernel instead and never
 // builds the score matrix. Interleaved against it at head_dim 256 causal
-// (the only head_dim in the grading set no kernel covers):
+// (measured while that was the only head_dim in the grading set no kernel
+// covered; every impl covers it now, but Auto still routes it here -- see
+// wmma_preferred_by_auto):
 //
 //   B8 H8 S32    3.91x     B8 H8 S128   1.37x     B8 H8 S512   1.30x
 //   B1 H8 S32    6.29x     B1 H8 S128   5.20x     B1 H8 S512   1.08x
@@ -449,11 +465,11 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
                     ", head_dim=", head_dim, " on compute capability ",
                     at::cuda::getCurrentDeviceProperties()->major, ".",
                     at::cuda::getCurrentDeviceProperties()->minor,
-                    ". scalar needs head_dim in {8,16,32,64,128} and enough "
+                    ". scalar needs head_dim in {8,16,32,64,128,256} and enough "
                     "shared memory for its key tiles (float64 runs out past 16); "
-                    "wmma needs SM 8.0+ and head_dim in {8,16,32,64,128}; the "
-                    "tile kernels need float32 and head_dim in {8,16,32,64}. Use "
-                    "impl=0 (auto) to fall back to SDPA for this shape.");
+                    "wmma needs SM 8.0+ and head_dim in {8,16,32,64,128,256}; the "
+                    "tile kernels need float32 and head_dim in {8,16,32,64,256}. "
+                    "Use impl=0 (auto) to fall back to SDPA for this shape.");
 
         // The strided views, not .contiguous() copies -- a measured tie, not an
         // oversight. The fallback is the one consumer here that pays for a row
