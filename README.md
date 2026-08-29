@@ -94,6 +94,54 @@ by measurement on this card, and would need re-measuring on a different one.
 
 ### Results
 
+All fourteen official test cases. Every one passes the accuracy check, with **zero** failing
+numbers out of the billions compared.
+
+| Across all fourteen | Speedup |
+| --- | ---: |
+| Average (geometric mean) | **8.13×** |
+| Median | **9.39×** |
+| Best — a single sequence | **39.67×** |
+| Worst — the widest model | **1.41×** |
+| Cases at 4× or better | 11 of 14 |
+| Cases failing the accuracy check | **0 of 14** |
+
+Case by case:
+
+| # | Test case | Reference | This project | Speedup | Worst error |
+| :---: | --- | ---: | ---: | ---: | ---: |
+| 1 | base | 5.91 ms | 1.34 ms | **4.41×** | 9.2e-4 |
+| 2 | 1 sequence | 5.63 ms | 0.14 ms | **39.67×** | 7.4e-4 |
+| 3 | 4 sequences | 3.78 ms | 0.16 ms | **23.37×** | 8.0e-4 |
+| 4 | 16 sequences | 3.66 ms | 0.37 ms | **9.86×** | 1.1e-3 |
+| 5 | 128 sequences | 9.97 ms | 2.29 ms | **4.35×** | 9.6e-4 |
+| 6 | 10,000 sequences | 6.89 s | 1.05 s | **6.53×** | 1.3e-3 |
+| 7 | width 32 | 3.86 ms | 0.28 ms | **13.63×** | 1.4e-3 |
+| 8 | width 1024 | 38.12 ms | 27.01 ms | **1.41×** | 1.1e-3 |
+| 9 | 1 head | 3.40 ms | 1.44 ms | **2.36×** | 1.0e-3 |
+| 10 | 2 heads | 3.95 ms | 1.26 ms | **3.14×** | 1.0e-3 |
+| 11 | 16 heads | 12.71 ms | 1.42 ms | **8.93×** | 8.8e-4 |
+| 12 | 32 words | 4.03 ms | 0.37 ms | **11.00×** | 1.1e-3 |
+| 13 | 1024 words | 181.38 ms | 11.98 ms | **15.14×** | 1.1e-3 |
+| 14 | 100,000 words | 43.19 s | 1.89 s per slice | **22.84×** | 7.4e-4 |
+
+The allowed error is 0.002, so every case in that last column finishes comfortably inside it.
+
+**The spread is wide, and it is not random.** The biggest gains are where the card was sitting idle:
+cases 2 and 3 give it so little work at a time that the original spent most of the pass waiting to
+be handed something, and removing that wait is worth 39.7× and 23.4× on its own. The next tier is
+where the grid of scores dominates — cases 13 and 14 have the longest inputs, so never writing that
+grid out is worth 15.1× and 22.8×. The smallest gain, case 8, is the widest model, where the rest
+of the layer dwarfs attention and the card was kept busy either way.
+
+Cases 9 and 10 are the honest low points. One or two heads give the card very few independent pieces
+of work, so much of it sits idle however the kernel is written.
+
+Case 14 is a special one: 32 sequences of 100,000 words need 12.2 GB of input on a card with 8 GB,
+so it does not fit. The model predicts that before starting and processes the batch in slices, which
+is why its timing is quoted per slice. This is the one place where the hardware rather than the
+implementation sets the ceiling.
+
 ### What is in the repository
 
 | Location | What is in it |

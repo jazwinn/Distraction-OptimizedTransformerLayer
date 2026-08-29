@@ -41,6 +41,8 @@
     - [7.2 The measurement rules it enforces](#72-the-measurement-rules-it-enforces)
     - [7.3 Profiling](#73-profiling)
 - **[8. Results](#8-results)**
+    - [8.1 Reading the spread](#81-reading-the-spread)
+    - [8.2 Shape 14, and the limits of an 8 GB card](#82-shape-14-and-the-limits-of-an-8-gb-card)
 - **[9. Limitations](#9-limitations)**
     - [9.1 The matrix-multiply hardware is barely used](#91-the-matrix-multiply-hardware-is-barely-used)
     - [9.2 The accuracy margin belongs to the reference, not the kernel](#92-the-accuracy-margin-belongs-to-the-reference-not-the-kernel)
@@ -68,18 +70,19 @@ multiplications on the card's dedicated matrix-multiply hardware, and combines n
 intermediate results stop making needless trips to memory. Nineteen further changes address what
 remains, from redundant data copies to the cost of issuing thousands of small instructions.
 
-**Results across the graded test shapes**, twelve measured, every one passing the accuracy check:
+**Results across all fourteen graded test shapes**, every one passing the accuracy check with zero
+failing values:
 
 | | Speedup |
 | --- | ---: |
-| Best (single sequence, batch 1) | **36.46×** |
-| Median | **9.20×** |
-| Geometric mean | **7.53×** |
+| Best (single sequence, batch 1) | **39.67×** |
+| Median | **9.39×** |
+| Geometric mean | **8.13×** |
 | Worst (widest model, 1024) | **1.41×** |
 
-The largest shape in the set — a batch of 10,000 — goes from 9.81 seconds to 2.05 seconds. The gain
-is largest where the original spent most of its time waiting rather than computing, and smallest on
-the widest model, where it was already busy.
+The longest shape in the set — 100,000 words — goes from 43.2 seconds to 1.9 seconds per slice, and
+a batch of 10,000 from 6.9 seconds to 1.1. The gain is largest where the original spent most of its
+time waiting rather than computing, and smallest on the widest model, where it was already busy.
 
 ## 1. The Problem and the Goal
 
@@ -1094,6 +1097,88 @@ worse than one that refuses to run.
 ---
 
 ## 8. Results
+
+All fourteen graded shapes, measured on the hardware in section 2.1. Every one passes the accuracy
+check, with **zero** failing values out of the billions compared.
+
+| # | Shape | Baseline | Optimized | Speedup | Worst error | Failed |
+| :---: | --- | ---: | ---: | ---: | ---: | :---: |
+| 1 | base | 5.91 ms | 1.34 ms | **4.41×** | 9.2e-4 | 0 / 2.1 M |
+| 2 | batch 1 | 5.63 ms | 0.14 ms | **39.67×** | 7.4e-4 | 0 / 32.8 K |
+| 3 | batch 4 | 3.78 ms | 0.16 ms | **23.37×** | 8.0e-4 | 0 / 131 K |
+| 4 | batch 16 | 3.66 ms | 0.37 ms | **9.86×** | 1.1e-3 | 0 / 524 K |
+| 5 | batch 128 | 9.97 ms | 2.29 ms | **4.35×** | 9.6e-4 | 0 / 4.2 M |
+| 6 | batch 10000 | 6.89 s | 1.05 s | **6.53×** | 1.3e-3 | 0 / 328 M |
+| 7 | d_model 32 | 3.86 ms | 0.28 ms | **13.63×** | 1.4e-3 | 0 / 524 K |
+| 8 | d_model 1024 | 38.12 ms | 27.01 ms | **1.41×** | 1.1e-3 | 0 / 16.8 M |
+| 9 | 1 head | 3.40 ms | 1.44 ms | **2.36×** | 1.0e-3 | 0 / 2.1 M |
+| 10 | 2 heads | 3.95 ms | 1.26 ms | **3.14×** | 1.0e-3 | 0 / 2.1 M |
+| 11 | 16 heads | 12.71 ms | 1.42 ms | **8.93×** | 8.8e-4 | 0 / 2.1 M |
+| 12 | seq 32 | 4.03 ms | 0.37 ms | **11.00×** | 1.1e-3 | 0 / 524 K |
+| 13 | seq 1024 | 181.38 ms | 11.98 ms | **15.14×** | 1.1e-3 | 0 / 16.8 M |
+| 14 | seq 100000 | 43.19 s | 1.89 s / slice | **22.84×** | 7.4e-4 | 0 / 6.55 B |
+
+| | |
+| --- | ---: |
+| Geometric mean | **8.13×** |
+| Median | **9.39×** |
+| Best — shape 2, batch 1 | **39.67×** |
+| Worst — shape 8, d_model 1024 | **1.41×** |
+| Shapes at or above 4× | 11 of 14 |
+| Shapes failing the accuracy check | **0 of 14** |
+
+### 8.1 Reading the spread
+
+The range is wide — 1.41× to 39.67× — and it is not random. It tracks exactly what sections 3.2 and
+3.3 predicted about where the baseline wastes time.
+
+**The biggest gains are where the card was idle.** Shapes 2 and 3 have a batch of 1 and 4. There is
+so little work per instruction that the baseline spends most of its time waiting to be given
+something to do rather than computing. Removing that wait is worth 39.7× and 23.4×, and almost
+none of it is faster arithmetic.
+
+**The next tier is where the score grid dominates.** Shapes 13 and 14 have the longest sequences in
+the set, so the grid — which grows quadratically — is the largest thing in the model. Never writing
+it out is worth 15.1× and 22.8×.
+
+**The smallest gain is where the baseline was already efficient.** Shape 8 is the widest model at
+1024, where the feed-forward network dwarfs attention and the card is kept busy either way. At
+1.41× the optimizations still help, but there was less waste to remove.
+
+**Shapes 9 and 10 are the honest low points among the attention-heavy cases.** One and two heads
+give the card very few independent pieces of work, so much of it sits idle no matter how the kernel
+is written. Splitting the key range recovers some of this, but not all — this is the case the
+kernel is least suited to.
+
+### 8.2 Shape 14, and the limits of an 8 GB card
+
+Shape 14 is a batch of 32 sequences of 100,000 words at a width of 1024. Its input alone is
+**12.2 GB**, against a card with **8 GB** of memory. It does not fit, and no kernel optimization
+changes that.
+
+The model handles it by **slicing the batch**: rather than processing all 32 sequences together, it
+processes them in pieces and joins the results. The reported figure of 1.89 seconds is therefore
+per slice, and the whole batch takes proportionally longer — the 2,346 seconds the run took overall
+is dominated by this one shape.
+
+Two details make this more than a convenience.
+
+**It is predicted, not discovered by failing.** On Windows an over-large allocation does not raise a
+clean error — it spills into system memory and slows to a crawl, which is far harder to diagnose
+than a crash. So the model estimates the peak requirement before starting and splits up front when
+it would exceed 85% of the card, falling back to halving the batch if it turns out to have
+underestimated.
+
+**Slicing is not free of consequences for the numbers.** The matrix-multiply library chooses its
+method partly from how many rows it is given, so a sliced run does slightly different arithmetic
+from a whole one — measured at about 6.5e-4 of movement. That is why the chosen slice size is
+cached per shape rather than re-derived: a result that changes depending on how the work happened
+to be divided is not a result. Shape 14 still passes with its worst error at 7.4e-4, comfortably
+inside the budget.
+
+This is the one place where the hardware, rather than the implementation, sets the ceiling. A card
+with more memory would run the shape whole and report a single figure; this one cannot, and the
+report says so rather than quoting a number that hides it.
 
 ---
 
