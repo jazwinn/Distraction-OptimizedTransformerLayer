@@ -1,4 +1,4 @@
-"""Dispatch into the custom CUDA extension, with an SDPA fallback.
+"""Dispatch into the custom CUDA extension.
 
 Nothing here knows about CUDA graphs or about the model; it is the boundary
 between torch ops and csrc/.
@@ -6,14 +6,13 @@ between torch ops and csrc/.
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
 from . import config
 
-_fallback_warned = False
 
 # Last value pushed into the extension's wmma_set_fp16 knob. The knob is a
 # process-global in the extension rather than a per-call argument, so it is
@@ -31,14 +30,13 @@ def _sync_attention_precision(kernels) -> None:
 
 
 def _custom_kernels():
-    """The extension module, or None when unavailable or switched off.
+    """The extension module, or None when the build is unavailable.
 
-    ATTENTION_BACKEND == "sdpa" means "no custom kernels at all", not just no
-    custom attention -- otherwise --attn-backend sdpa would still be timing
-    hand-written code and the comparison would mean nothing.
+    None is now only ever "the extension would not load" -- the switch that
+    used to turn the custom kernels off wholesale went with the SDPA backend.
+    Attention treats that as fatal (see _attention_dispatch); the elementwise
+    helpers below can still answer in torch, and do.
     """
-    if config.ATTENTION_BACKEND == "sdpa":
-        return None
     import kernel_ext
 
     return kernel_ext.get_kernels()
@@ -97,76 +95,37 @@ def _attention_dispatch(
     attn_mask: Optional[torch.Tensor],
     is_causal: bool,
     scale: float,
-    causal_mask: Optional[Callable[[], torch.Tensor]] = None,
 ) -> torch.Tensor:
-    """Route attention to the custom CUDA kernel or to SDPA.
+    """Route attention to the custom CUDA kernel. There is no other route.
 
-    Always returns [B, S, H*head_dim], the layout out_proj consumes, whichever
-    backend served the call: the custom kernels write it from their epilogue,
-    SDPA cannot, so the transpose/reshape happens here. One contract, so the
-    caller never has to ask which backend it got.
+    Always returns [B, S, H*head_dim], the layout out_proj consumes: the
+    kernels write it from their epilogue, so no transpose or reshape happens
+    here at all.
 
     `attn_mask` and `is_causal` may both be set, which is what lets a padded
     causal call stay a [B, 1, 1, S] key mask plus a flag rather than a folded
     [B, 1, S, S] triangle -- the kernels keep their causal early exit that way,
-    worth 1.18x-1.85x on the op. SDPA cannot take the pair, so `causal_mask`
-    optionally supplies a cached [S, S] triangle to fold with; it is called only
-    on the branch that needs it, and that branch builds its own when there is
-    none.
+    worth 1.18x-1.85x on the op.
+
+    This used to fall back to F.scaled_dot_product_attention when the extension
+    would not load, and `causal_mask` existed to hand that path a cached [S, S]
+    triangle, because SDPA rejects the mask/flag pair the kernels accept. Both
+    are gone: a prebuilt attention is not an acceptable substitute here, so a
+    missing extension is an error rather than a quietly different answer.
     """
-    global _fallback_warned
+    import kernel_ext
 
-    if config.ATTENTION_BACKEND != "sdpa":
-        import kernel_ext
-
-        kernels = kernel_ext.get_kernels()
-        if kernels is not None:
-            _sync_attention_precision(kernels)
-            return kernels.fused_attention_forward(
-                q, k, v, attn_mask, is_causal, scale,
-                config._IMPL_CODE[config.ATTENTION_IMPL],
-                config._OUT_LAYOUT_BSHD
-            )
-        if config.ATTENTION_BACKEND == "custom":
-            raise RuntimeError(
-                'ATTENTION_BACKEND is "custom" but the CUDA extension failed to '
-                "load. Build it with scripts/build_ext.bat. "
-                f"Cause: {kernel_ext.load_error()}"
-            )
-        if not _fallback_warned:
-            _fallback_warned = True
-            print(
-                f"[info] custom CUDA kernel unavailable, using SDPA instead "
-                f"(results are still correct). Reason: {kernel_ext.load_error()}\n"
-                f"[info] to use the kernel:  cmd.exe /c scripts\\devenv.bat "
-                f"python torch_transformer_benchmark.py\n"
-                f'[info] to silence this:    set ATTENTION_BACKEND = "sdpa" '
-                f"in optimized/config.py"
-            )
-
-    if is_causal and attn_mask is not None:
-        # SDPA rejects the combination the kernels accept. Fold, and pay for the
-        # [B, 1, S, S] the custom path no longer builds. `causal_mask` is the
-        # caller's cache for the triangle -- seq_len is fixed for a model
-        # instance's lifetime, so rebuilding it per layer would be waste -- but
-        # it is a cache, not a contract: without one, build the triangle here
-        # rather than refuse. This is the branch that has to stay correct for
-        # any caller, not the one that has to be fast.
-        if causal_mask is not None:
-            allowed = causal_mask()
-        else:
-            seq_len = q.shape[2]
-            allowed = torch.ones(
-                seq_len, seq_len, device=q.device, dtype=torch.bool
-            ).tril()
-        attn_mask = attn_mask & allowed
-        is_causal = False
-
-    context = F.scaled_dot_product_attention(
-        q, k, v, attn_mask=attn_mask, is_causal=is_causal, scale=scale
+    kernels = kernel_ext.get_kernels()
+    if kernels is None:
+        raise RuntimeError(
+            "the CUDA extension failed to load, and there is no fallback: this "
+            "project implements attention itself and will not substitute a "
+            "prebuilt one. Build it with scripts/build_ext.bat. "
+            f"Cause: {kernel_ext.load_error()}"
+        )
+    _sync_attention_precision(kernels)
+    return kernels.fused_attention_forward(
+        q, k, v, attn_mask, is_causal, scale,
+        config._IMPL_CODE[config.ATTENTION_IMPL],
+        config._OUT_LAYOUT_BSHD,
     )
-    # [B, H, S, D] -> [B, S, H*D]. Cannot be a view across the transpose, so
-    # this is the strided repack the custom kernels skip. flatten(2) rather than
-    # reshape(b, s, h*d) keeps the shape arithmetic on the C++ side, which is
-    # not free in a model this close to launch-bound.
-    return context.transpose(1, 2).flatten(2)

@@ -119,8 +119,10 @@ The traced harness runs through `_profile_shim.py`, and it has to. Torch
 resolves the MSVC linker by shelling out to `where cl`; inside a profiled
 process that returns empty output, and torch's guard (`len(cl_paths) >= 1`, true
 even for `[""]`) turns that into `command = "/link.exe"`. The link fails, the
-extension does not load, and `optimized/` falls back to SDPA **without reporting
-an error** -- so the profile measures ATen and looks entirely plausible. The
+extension does not load. That used to fall back to a prebuilt attention
+**without reporting an error**, so the profile measured ATen and looked
+entirely plausible; it now raises instead, which turns this into a loud failure
+rather than a misleading profile. The
 shim answers that one call from `shutil.which` and touches nothing else.
 
 If the summary ever says **no custom kernels ran**, that is what has happened
@@ -275,7 +277,7 @@ shape            head_dim   note
 7, 11                   8
 10, 14                 64
 9                     128   tile kernels cannot take it
-8                     256   outside every custom kernel; falls back to SDPA
+8                     256   wmma only; tile kernels cannot take it
 ```
 
 **Shape 14 runs**, and the list says how. Its full `[32,100000,1024]` input is
@@ -373,10 +375,9 @@ option, and in full underneath the field for whichever mode is selected —
 including `auto`, whose name says nothing about what it does. Selecting
 `--attn-impl auto` displays:
 
-> auto: the fastest path for the shape, which is not the same as the first one
-> that covers it: the tensor-core kernel where it wins, the scalar kernel where
-> that is all there is, and SDPA from head_dim 128 up, where the wmma kernel is
-> correct and slower.
+> auto: the first kernel that covers the shape: the tensor-core kernel wherever
+> it applies, the scalar kernel where that is all there is, and an error where
+> neither does. It used to prefer SDPA from head_dim 128 up, which is gone.
 
 That text is not written here. It is the comment above `ATTENTION_IMPL` in
 `optimized/config.py`, parsed at page load, so there is no second description to

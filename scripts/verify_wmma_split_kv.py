@@ -26,7 +26,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kernel_ext  # noqa: E402
 
 import torch  # noqa: E402
-import torch.nn.functional as F  # noqa: E402
+
+from verify_kernel import reference_attention_f64  # noqa: E402
 
 DEV = torch.device("cuda")
 IMPL_WMMA = 2
@@ -82,15 +83,12 @@ def reference(q, k, v, mask, causal, scale, layout):
     elif causal:
         bool_mask = None
 
-    am = None
-    if bool_mask is not None:
-        am = torch.zeros(bool_mask.shape, dtype=torch.float64, device=DEV)
-        am.masked_fill_(~bool_mask, float("-inf"))
-    out = F.scaled_dot_product_attention(
-        q.double(), k.double(), v.double(), attn_mask=am,
-        is_causal=(causal and mask is None), scale=scale)
-    out = torch.nan_to_num(out, nan=0.0)
-    return out.transpose(1, 2).flatten(2) if layout == 1 else out
+    # reference_attention_f64 takes the bool mask directly -- True means
+    # "may attend" -- so the float -inf mask this used to build for SDPA is
+    # not needed. It also handles the fully-masked row, which is 0/0 in the
+    # softmax and which the kernels emit as 0.
+    return reference_attention_f64(
+        q, k, v, bool_mask, causal and mask is None, scale, layout=layout)
 
 
 def main() -> int:

@@ -7,7 +7,7 @@ fp16 buys is that its tensor cores run 2.0x-2.25x tf32 on this card, that a
 16x16x16 fragment contracts twice the K of tf32's 16x16x8, and that every staged
 tile halves -- which is what decides the block shape at head_dim 128.
 
-Three columns, because the kernel is not always the right answer: SDPA is what
+Two columns, tf32 against fp16. There used to be a third holding SDPA -- what
 `auto` falls back to, and at head_dim 128 the tf32 kernel loses to it. Whether
 fp16 changes that verdict is the question `kWmmaAutoMaxHeadDim` depends on.
 
@@ -31,6 +31,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kernel_ext  # noqa: E402
 
 import torch  # noqa: E402
+
+from verify_kernel import reference_attention_f64  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
 import torch_transformer_benchmark as bench  # noqa: E402
@@ -109,8 +111,8 @@ def main() -> int:
     props = torch.cuda.get_device_properties(DEV)
     print(f"{props.name}: {props.multi_processor_count} SMs, causal, "
           f"fp32 tensors throughout, graph-timed\n")
-    print(f"  {'shape':<20} {'sdpa':>9} {'tf32':>9} {'fp16':>9} {'16v32':>7} "
-          f"{'vs sdpa':>8} {'ctrl':>6} {'e32':>9} {'e16':>9}")
+    print(f"  {'shape':<20} {'tf32':>9} {'fp16':>9} {'16v32':>7} "
+          f"{'ctrl':>6} {'e32':>9} {'e16':>9}")
 
     # Throwaway: the first measurement in a fresh process reads several percent
     # slow, and once turned a 1.10x into a reported 1.32x.
@@ -118,7 +120,7 @@ def main() -> int:
     graph_timed(lambda: K.fused_attention_forward(
         warm, warm, warm, None, True, 0.125, IMPL_WMMA, BSHD), 10, 2, 5)
 
-    gains, sdpa_gains, worst_ctrl = [], [], 0.0
+    gains, worst_ctrl = [], 0.0
     for label, B, H, S, D in CASES:
         g = torch.Generator(device="cuda").manual_seed(1234)
         q = torch.randn(B, H, S, D, device=DEV, generator=g)
@@ -126,24 +128,18 @@ def main() -> int:
         v = torch.randn(B, H, S, D, device=DEV, generator=g)
         scale = D ** -0.5
 
-        ref = F.scaled_dot_product_attention(
-            q.double(), k.double(), v.double(), is_causal=True, scale=scale)
-        ref = ref.transpose(1, 2).flatten(2)
+        ref = reference_attention_f64(q, k, v, None, True, scale, layout=1)
 
         def wmma():
             return K.fused_attention_forward(q, k, v, None, True, scale,
                                              IMPL_WMMA, BSHD)
-
-        def sdpa():
-            return F.scaled_dot_product_attention(
-                q, k, v, is_causal=True, scale=scale).transpose(1, 2).flatten(2)
 
         errs = {}
         for name, on in (("tf32", False), ("fp16", True)):
             K.wmma_set_fp16(on)
             errs[name] = (wmma().double() - ref).abs().max().item()
 
-        best = {"tf32": math.inf, "fp16": math.inf, "sdpa": math.inf}
+        best = {"tf32": math.inf, "fp16": math.inf}
         ctrl = math.inf
         for _ in range(args.rounds):
             # tf32 at both ends of the round; the two are identical code, so
@@ -154,20 +150,16 @@ def main() -> int:
             f = graph_timed(wmma, args.iters)
             K.wmma_set_fp16(False)
             c = graph_timed(wmma, args.iters)
-            sd = graph_timed(sdpa, args.iters)
             best["tf32"] = min(best["tf32"], a, c)
             best["fp16"] = min(best["fp16"], f)
-            best["sdpa"] = min(best["sdpa"], sd)
             ctrl = min(ctrl, abs(a / c - 1.0))
         K.wmma_set_fp16(True)
         worst_ctrl = max(worst_ctrl, ctrl)
 
         r = best["tf32"] / best["fp16"]
-        vs_sdpa = best["sdpa"] / best["fp16"]
         gains.append(r)
-        sdpa_gains.append(vs_sdpa)
-        print(f"  {label:<20} {best['sdpa']:9.1f} {best['tf32']:9.1f} "
-              f"{best['fp16']:9.1f} {r:6.3f}x {vs_sdpa:7.3f}x {ctrl*100:5.1f}% "
+        print(f"  {label:<20} {best['tf32']:9.1f} "
+              f"{best['fp16']:9.1f} {r:6.3f}x {ctrl*100:5.1f}% "
               f"{errs['tf32']:9.2e} {errs['fp16']:9.2e}")
 
     def gm(v):
@@ -175,8 +167,6 @@ def main() -> int:
 
     print(f"\n  geometric mean over {len(gains)} shapes:")
     print(f"    fp16 vs tf32 : {gm(gains):.3f}x")
-    print(f"    fp16 vs SDPA : {gm(sdpa_gains):.3f}x  "
-          f"(>1 means the kernel is worth dispatching)")
     print(f"  worst control this run: +/-{worst_ctrl*100:.1f}% -- "
           f"nothing below this is a result")
 

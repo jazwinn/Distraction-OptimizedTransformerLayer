@@ -295,11 +295,6 @@ def env_value(name: str, value: Any) -> Optional[str]:
     return None if number == knob["default"] else str(number)
 
 
-def knob_differs(name: str, value: Any) -> bool:
-    """Whether a submitted knob value actually moves it off its default."""
-    return env_value(name, value) is not None
-
-
 def human_bytes(count: float) -> str:
     for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
         if abs(count) < 1024 or unit == "PiB":
@@ -341,7 +336,6 @@ def preflight(form: Dict[str, Any], tile_available: Optional[bool],
     heads = integer("heads", 8)
     causal = bool(form.get("causal"))
     dtype = form.get("dtype") or "float32"
-    backend = form.get("attn_backend")
     impl = form.get("attn_impl")
     linear_gelu = form.get("linear_gelu")
 
@@ -380,21 +374,10 @@ def preflight(form: Dict[str, Any], tile_available: Optional[bool],
                  f"F.gelu, so this run does not measure the fusion")
 
     # --- backend gates ---------------------------------------------------
-    if backend == "sdpa":
-        chosen = [name for name, value in (("--attn-impl", impl),
-                                           ("--attn-fp16", form.get("attn_fp16")),
-                                           ("--linear-gelu", linear_gelu))
-                  if value not in (None, "", "auto")]
-        if chosen:
-            warn("--attn-backend sdpa switches off every custom kernel, not "
-                 "just attention -- LayerNorm and Linear+GELU included. "
-                 + ", ".join(chosen) + " will have no effect.")
-        env = form.get("env") or {}
-        active = [name for name in env
-                  if name in ENV_BY_NAME and knob_differs(name, env[name])]
-        if active:
-            warn("--attn-backend sdpa means the extension is never loaded, so "
-                 + ", ".join(sorted(active)) + " will have no effect")
+    # There used to be one here for --attn-backend sdpa, which switched off
+    # every custom kernel and so made every knob below it inert. That backend
+    # is gone: this project may not use a prebuilt attention, so "custom" is
+    # the only value and there is nothing left to warn about.
 
     # --- flag conflicts --------------------------------------------------
     if form.get("compile_user") and form.get("cuda_graph") not in (None, "", "off"):

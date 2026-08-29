@@ -106,10 +106,11 @@ def main():
                          "of spilling into system RAM, which hangs Windows")
     ap.add_argument("--self-check", action="store_true",
                     help="prove microbatching is exact, then exit")
-    ap.add_argument("--attn-backend", choices=("auto", "sdpa", "custom"), default=None,
-                    help="override ATTENTION_BACKEND for this run, so the custom "
-                         "kernel and F.scaled_dot_product_attention can be compared "
-                         "at a sequence length nothing else reaches")
+    ap.add_argument("--attn-backend", choices=("custom",), default=None,
+                    help="override ATTENTION_BACKEND for this run. Only "
+                         "'custom' is accepted now that the prebuilt-attention "
+                         "backends are gone; kept so existing command lines "
+                         "still parse")
     args = ap.parse_args()
 
     if args.attn_backend is not None:

@@ -95,18 +95,18 @@ class _GraphRunner:
 def _graph_key(x: torch.Tensor, use_mask: bool) -> Tuple:
     """What makes two calls interchangeable to one captured graph.
 
-    ATTENTION_BACKEND/ATTENTION_IMPL/LINEAR_GELU are in the key because a
-    capture freezes whichever kernel they selected; without them, an in-process
-    A/B script flipping the global would silently do nothing on a captured
-    model.
+    ATTENTION_IMPL/LINEAR_GELU/ATTENTION_FP16 are in the key because a capture
+    freezes whichever kernel they selected; without them, an in-process A/B
+    script flipping the global would silently do nothing on a captured model.
+    ATTENTION_BACKEND is not: it has one legal value now, so it can never make
+    two calls differ.
 
     Strides are deliberately absent: inputs are copied into a freshly allocated
     contiguous buffer and copy_ handles any source layout, so one graph is valid
     for every layout of x.
     """
     return (x.shape, x.dtype, x.device.index, use_mask,
-            config.ATTENTION_BACKEND, config.ATTENTION_IMPL, config.LINEAR_GELU,
-            config.ATTENTION_FP16)
+            config.ATTENTION_IMPL, config.LINEAR_GELU, config.ATTENTION_FP16)
 
 
 def _graph_pool_cap_bytes(device: torch.device) -> int:
@@ -248,12 +248,12 @@ def _capture_graph(
                 # -- Step 3: warmup, on the stream we are about to capture on.
                 #
                 # This is what keeps lazily-built persistent state out of the
-                # graph's private pool: _get_qkv_weight's torch.cat and
-                # _get_causal_mask's ones().tril() get built here, by the
-                # general allocator. Built inside the capture they would live in
-                # the pool, and the *eager* fallback path would then be reading
-                # graph-pool memory -- the most dangerous failure this feature
-                # can have.
+                # graph's private pool: _get_qkv_weight's torch.cat gets built
+                # here, by the general allocator. Built inside the capture it
+                # would live in the pool, and the *eager* path would then be
+                # reading graph-pool memory -- the most dangerous failure this
+                # feature can have. (The causal triangle used to be the other
+                # such cache; it went with the SDPA fallback that needed it.)
                 #
                 # Same stream as the capture because cuBLAS caches a workspace
                 # per (handle, stream): warming this stream first puts that
@@ -365,7 +365,7 @@ def _capture_graph(
             pool_mib = (torch.cuda.memory_reserved(dev) - reserved_before) / (1 << 20)
             print(f"[info] CUDA graph captured: shape={tuple(x.shape)} "
                   f"{str(x.dtype).replace('torch.', '')} mask="
-                  f"{'on' if use_mask else 'off'} backend={config.ATTENTION_BACKEND} "
+                  f"{'on' if use_mask else 'off'} "
                   f"impl={config.ATTENTION_IMPL}, pool +{pool_mib:.1f} MiB, "
                   f"replay matches eager exactly")
         return runner
@@ -410,7 +410,7 @@ def _graph_cache_ptrs(model: "OptimizedTransformer") -> Tuple:
     out = []
     for layer in model.layers:
         attn = layer.attention
-        for t in (attn._qkv_weight, attn._qkv_bias, attn._causal_mask):
+        for t in (attn._qkv_weight, attn._qkv_bias):
             out.append(None if t is None else t.data_ptr())
     return tuple(out)
 
@@ -420,7 +420,7 @@ def _graph_pinned_refs(model: "OptimizedTransformer") -> Tuple:
     out = []
     for layer in model.layers:
         attn = layer.attention
-        out.extend((attn._qkv_weight, attn._qkv_bias, attn._causal_mask))
+        out.extend((attn._qkv_weight, attn._qkv_bias))
     return tuple(out)
 
 

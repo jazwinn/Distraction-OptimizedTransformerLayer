@@ -125,15 +125,26 @@ it clears the accuracy gate everywhere that kernel does. The lesson is not about
 plausible explanation, written down once, had been treated as established fact for as long
 as nobody asked where it came from.
 
-### One diagnosis that was wrong
+### Two diagnoses that were wrong
 
-A configuration with 12 layers fails the accuracy check. The explanation given at the time —
-that attention's precision was to blame — was **wrong**, and measuring properly disproved it.
-All four implementations land within 9% of each other there, including the two that never
-lose precision at all. The drift comes from the other two-thirds of the model. The failure is
-also one bad value in 2.6 million, close enough to the line that which implementation
-"passes" changes with the random seed. **No amount of work on the attention kernel will fix
-it.** It was the wrong target.
+**The 12-layer configuration was blamed on attention.** It used to fail the accuracy check,
+and the explanation given at the time was that attention's precision was at fault. Measuring
+disproved it: all four implementations land within 9% of each other there, *including the two
+that never lose precision at all*. The drift comes from the other two-thirds of the model, so
+no amount of work on the attention kernel would have fixed it. It was the wrong target.
+
+**And then the failure itself turned out not to be real.** The check was being run against a
+tolerance of 1 in 1,000 — but the graders' actual tolerance is 1 in 500, twice as loose. The
+tighter number was written in this project's own documentation and in a comment at the top of
+the grading script, both left over from before the problem statement was updated, while the
+code underneath had always used the looser one. Re-run against the tolerance that actually
+applies, the 12-layer configuration passes on every implementation, with **no failing values
+at all** rather than one in a few million — as do the two other configurations that had been
+recorded as borderline.
+
+The lesson repeats one the CUDA sections below make three more times: a number that everything
+downstream cites is worth checking against the thing it describes. The measurements here were
+never wrong. They were being compared against the wrong line.
 
 ### Where it ended up
 
@@ -178,7 +189,8 @@ for (int j = 0; j < n_keys; ++j) {
 
 At `head_dim=64` that is ~128 floats of live state per thread, in blocks of only 64 threads
 (2 warps). It left the MMA units — the single biggest source of arithmetic throughput on
-the card — completely idle, and it measured slower than PyTorch's SDPA on most shapes.
+the card — completely idle, and on most shapes it was slower than a stock fused
+attention.
 
 ## The change
 
@@ -291,22 +303,21 @@ the kernel was not P-load bound by that point.
 fp32, all nine shapes, candidates timed **interleaved** and minimum-of-N so they see the
 same clock state:
 
-| Shape | vs. scalar kernel | vs. PyTorch SDPA |
-| --- | --- | --- |
-| default (B8 H8 S128 D64) | 2.50x | 1.63x |
-| default causal | 2.60x | 1.54x |
-| default padded | 1.70x | 1.44x |
-| seq 512 | 1.99x | 1.72x |
-| seq 2048 | 1.85x | 1.79x |
-| seq 2048 causal | 2.19x | 1.78x |
-| head_dim 32 | 2.43x | 2.30x |
-| head_dim 16 | 1.74x | 3.64x |
-| wide (d_model 1024, 16 heads) | 2.40x | 1.57x |
-| **total** | **2.00x** | **1.81x** |
+| Shape | vs. scalar kernel |
+| --- | --- |
+| default (B8 H8 S128 D64) | 2.50x |
+| default causal | 2.60x |
+| default padded | 1.70x |
+| seq 512 | 1.99x |
+| seq 2048 | 1.85x |
+| seq 2048 causal | 2.19x |
+| head_dim 32 | 2.43x |
+| head_dim 16 | 1.74x |
+| wide (d_model 1024, 16 heads) | 2.40x |
+| **total** | **2.00x** |
 
-Every shape improves, and the tensor-core kernel is faster than SDPA on all of them. An
-earlier independent run of the same table gave 2.07x / 1.87x, which is the size of the
-run-to-run error bar.
+Every shape improves. An earlier independent run of the same table gave 2.07x, which is the
+size of the run-to-run error bar.
 
 ### Why the tile kernel loses to wmma, and where it doesn't
 
@@ -394,33 +405,31 @@ as the fast option.
 
 Harness speedup against `BaselineTransformer`:
 
-| Configuration | SDPA | custom scalar | custom wmma |
-| --- | --- | --- | --- |
-| default (B8 S128 D512 H8 L6) | 0.999x | 0.900x | **1.007x** |
-| padded (30%) | 0.992x | 0.846x | **1.001x** |
-| seq_len 512 | 1.365x | 1.268x | **1.398x** |
-| seq_len 2048 | 1.816x | 1.678x | **2.270x** |
-| seq_len 2048, causal | 3.124x | 2.915x | **3.785x** |
-| small (B1 S32) | **1.529x** | 1.268x | 1.497x |
-| wide (d_model 1024) | **1.033x** | 0.961x | 0.988x |
+| Configuration | custom scalar | custom wmma |
+| --- | --- | --- |
+| default (B8 S128 D512 H8 L6) | 0.900x | **1.007x** |
+| padded (30%) | 0.846x | **1.001x** |
+| seq_len 512 | 1.268x | **1.398x** |
+| seq_len 2048 | 1.678x | **2.270x** |
+| seq_len 2048, causal | 2.915x | **3.785x** |
+| small (B1 S32) | 1.268x | **1.497x** |
+| wide (d_model 1024) | 0.961x | **0.988x** |
 
 Differences under ~10% here are not evidence of anything — a single harness run gives one
 median with no interleaving, and `deep 12L` was measured at both 1.401x and 0.958x on two
 runs. `seq_len 2048` and `seq_len 2048 causal` are well outside that band and agree with the
 attention-op table.
 
-**Where the tensor cores show up.** At `seq_len=2048` the custom backend goes from 1.678x
-with the scalar kernel to 2.270x with the tensor-core one, overtaking SDPA's 1.816x; with
-causal masking, 2.915x to 3.785x against SDPA's 3.124x. Those are the configurations where
-attention is most of the runtime, and they are the ones the kernel was written for.
+**Where the tensor cores show up.** At `seq_len=2048` the model goes from 1.678x with the
+scalar kernel to 2.270x with the tensor-core one; with causal masking, 2.915x to 3.785x.
+Those are the configurations where attention is most of the runtime, and they are the ones
+the kernel was written for.
 
-**The PASS/FAIL verdicts are not a precision ranking.** Three configurations sit on the
-accuracy gate — `causal`, `causal + padded` and `deep 12L` — and which backend passes is
-close to a coin flip. On `deep 12L` over 8 trials, SDPA failed on 1 element of 4.19M, wmma on
-2, and the scalar kernel passed *with the largest `max_abs` of the three* (1.187e-3, against
-wmma's 1.140e-3). The gate is `abs <= atol OR rel <= rtol`, so which elements fail depends on
-where the reference happens to be near zero, not on which kernel rounds more. See
-[Accuracy](#accuracy) and [Notes and known limits](#notes-and-known-limits).
+**The three borderline configurations now pass outright.** `causal`, `causal + padded` and
+`deep 12L` used to fail intermittently, by one or two elements out of millions, against an
+`atol` of 1e-3. The harness's actual tolerance is **2e-3 / 2%**, and re-measured against it
+all three pass on every backend with **zero** failing elements. See
+[Accuracy](#accuracy) for the table and for what the old readings did and did not mean.
 
 ## Why the harness number looks small
 
@@ -467,38 +476,69 @@ brings the kernel *closer* to the reference, not further:
 *(max abs error against a TF32 reference — the arithmetic the baseline actually runs.)*
 
 End to end this does **not** translate into headroom. Over 12 accuracy trials the scalar
-kernel peaked at `max_abs` 7.7e-4 and the tensor-core kernel at 8.7e-4. Both pass
-`atol=1e-3`; neither margin is comfortable. The harness metric is set by a handful of
-cancellation outliers — trials routinely report `max_rel` in the hundreds, meaning the worst
-element is one whose reference value is near zero — rather than by systematic rounding,
-which is why halving the systematic error barely moves it.
+kernel peaked at `max_abs` 7.7e-4 and the tensor-core kernel at 8.7e-4. The harness metric is
+set by a handful of cancellation outliers — trials routinely report `max_rel` in the hundreds,
+meaning the worst element is one whose reference value is near zero — rather than by
+systematic rounding, which is why halving the systematic error barely moves it.
 
-Three configurations sit on the gate on this hardware (`causal`, `causal + padded`,
-`deep 12L`) and fail intermittently by one or two elements out of millions — **for every
-backend, including stock PyTorch SDPA**. `deep 12L`, 8 trials each:
+### The three borderline configurations, re-measured
 
-| | verdict | `max_abs` | failed elements |
-| --- | --- | --- | --- |
-| SDPA | FAIL | 1.101e-3 | 1 / 4,194,304 |
-| custom scalar | PASS | 1.187e-3 | 0 |
-| custom wmma | FAIL | 1.140e-3 | 2 / 4,194,304 |
+`causal`, `causal + padded` and `deep 12L` were previously documented here as sitting *on* the
+accuracy gate, failing intermittently by one or two elements out of millions on every
+kernel. **That was measured against `atol=1e-3`, which is not the harness's
+tolerance.** The argparse defaults in `torch_transformer_benchmark.py` are `atol=0.002`,
+`rtol=0.02`; the 1e-3 figure came from the module docstring and from `README.md`, both of which
+were stale after the problem statement's tolerance update, and both are now corrected.
 
-The backend that passed has the **largest** error of the three. This is not a precision
-ranking — the criterion is `abs <= atol OR abs <= rtol * abs(ref)`, so the verdict turns on
-whether a few near-zero-reference elements happen to land inside `atol`.
+Re-run against the real gate — default shape otherwise (B8 S128 D512 H8), 8 trials each,
+524,288 elements per trial:
+
+| config | backend | verdict | worst `max_abs` | failed elements |
+| --- | --- | --- | --- | --- |
+| causal | custom scalar | **PASS** | 1.228e-3 | 0 / 4,194,304 |
+| causal | custom wmma | **PASS** | 1.339e-3 | 0 / 4,194,304 |
+| causal + padded | custom scalar | **PASS** | 1.228e-3 | 0 / 4,194,304 |
+| causal + padded | custom wmma | **PASS** | 1.294e-3 | 0 / 4,194,304 |
+| deep 12L | custom scalar | **PASS** | 1.094e-3 | 0 / 4,194,304 |
+| deep 12L | custom wmma | **PASS** | 1.104e-3 | 0 / 4,194,304 |
+
+Six for six, no failing elements anywhere. The worst reading in the set is the wmma kernel's
+1.339e-3 on `causal`, which is a **33% margin** against the 2e-3 budget.
+
+Two things from the old write-up survive the correction, and one does not.
+
+**Survives:** the *magnitudes*. Every kernel really does land at `max_abs` ~1.0-1.3e-3 on
+these shapes — on `deep 12L` they sit within 3% of each other. The spread across kernels is
+smaller than the spread across seeds.
+
+**Survives:** the reasoning about *why* the verdict was unstable when it was unstable. The
+criterion is `abs <= atol OR abs <= rtol * abs(ref)`, so a failing element is one whose
+reference value happens to be near zero — `max_rel` in the hundreds on passing runs is the
+signature. That is why the backend with the largest `max_abs` could pass while a more accurate
+one failed. It was never a precision ranking.
+
+**Does not survive:** the conclusion. "Three configurations sit on the gate and fail
+intermittently" was an artefact of grading against a tolerance twice as tight as the one the
+harness actually applies. There is no borderline config on this hardware at the real gate.
 
 ## Coverage and limits
 
-| dtype | head_dim 8 | 16 | 32 | 64 | 128 |
-| --- | --- | --- | --- | --- | --- |
-| float32 | wmma | wmma | wmma | wmma | wmma |
-| float16 | wmma | wmma | wmma | wmma | wmma |
-| bfloat16 | wmma | wmma | wmma | wmma | wmma |
+| dtype | head_dim 8 | 16 | 32 | 64 | 128 | 256 |
+| --- | --- | --- | --- | --- | --- | --- |
+| float32 | wmma | wmma | wmma | wmma | wmma | wmma |
+| float16 | wmma | wmma | wmma | wmma | wmma | wmma |
+| bfloat16 | wmma | wmma | wmma | wmma | wmma | wmma |
+
+Every column is a kernel in this repository. `auto` used to apply a *preference* on top of
+coverage — it asked which path was fastest, and handed head_dim 256 to
+`F.scaled_dot_product_attention` — and that is gone: this project implements attention, so
+`auto` now picks the first kernel that covers the shape and raises when none does. See
+[head_dim 256](#head_dim-256-covered-by-everything-fastest-at-nothing).
 
 Tensor cores need compute capability **8.0+**; below that the scalar kernel runs. Selection
 is automatic — `--attn-impl` only exists to force a path for measurement.
 
-The scalar kernel now covers the same five head_dims, so that fallback is real at every
+The scalar kernel now covers the same five head_dims, so that second path is real at every
 column rather than four of five. It used to stop at 64, because a thread holds q and the
 output accumulator for its row in registers and `q_reg[128] + acc[128]` is 256 registers
 against a hardware ceiling of 255 — a wall, not a tuning problem. Past 64 the row is split
@@ -510,9 +550,9 @@ two threads read disjoint halves of the key row. Measured `REG:168, LOCAL:0` at 
 float32: no spill. It also doubles the block to 128 threads, which lifts occupancy from two
 warps per SM to twelve.
 
-At `wide head_dim` (B2·H4·S64·D128) it runs 0.059 ms against SDPA's 0.054 and wmma's 0.037,
-and lands 8.9e-7 from an fp32 reference where wmma lands 6.2e-4 — which is the point of
-having it. It is a correctness reference and a pre-Ampere fallback, not a competitor.
+At `wide head_dim` (B2·H4·S64·D128) it runs 0.059 ms against wmma's 0.037, and lands 8.9e-7
+from an fp32 reference where wmma lands 6.2e-4 — which is the point of having it. It is a
+correctness reference and pre-Ampere coverage, not a competitor.
 
 A side effect of routing every head_dim through one `ScalarCfg`: the launcher now declines
 when a (dtype, head_dim) pair wants more shared memory than a block gets, instead of
@@ -532,11 +572,72 @@ brings the same head_dim down to 35.9 KB. `WmmaShape` now picks the block per he
 `WARPS` follows from `BLOCK_M` so the warp/lane mapping stays consistent.
 
 Both were worth real speed, not just coverage — at `head_dim=128` the tensor-core kernel
-runs 0.041 ms against the 0.142 ms that shape used to cost, turning a 0.40x loss to SDPA into
-a 1.40x win. (That 0.142 ms was ATen, not the scalar kernel, which has no head_dim 128
-specialisation. It reads as "the scalar fallback" in older revisions of this file for the
-reason worked through in [The one
+runs 0.041 ms against the 0.142 ms that shape used to cost, a 3.4x improvement that turned a
+loss into a win. (That 0.142 ms was ATen, not the scalar kernel, which had no head_dim 128
+specialisation at the time. Older revisions of this file attribute it to the scalar kernel
+for the reason worked through in [The one
 regression](#the-one-regression-and-why-it-was-not-the-kernel-it-was-blamed-on).)
+
+### head_dim 256: covered by everything, fastest at nothing
+
+Grading shape 8 (batch 64, seq 128, `d_model` 1024, 4 heads, causal) is head_dim 256, and it
+was the one shape in the set no kernel covered: every forced `--attn-impl` refused it and
+`auto` served it externally. All three families cover it now — scalar and wmma at
+`{8,16,32,64,128,256}`, and the tile kernels at the same set.
+
+Each needed something different:
+
+* **scalar.** Past head_dim 64 a query row is already split across threads so `q_reg + acc`
+  clears the 255-register ceiling; 256 makes that four threads instead of two. The real
+  change is the score exchange — one `__shfl_xor_sync` only completes a *pair*, so it became
+  a `log2(TPR)`-step butterfly over the group. Registers per thread are now identical at 64,
+  128 and 256; what grows is the block (64 → 128 → 256 threads) and what shrinks is the key
+  tile (`BLOCK_N` 64 → 32 → 16, holding the staged tiles at 32 KB).
+* **wmma.** Q and O are register-resident across the whole head, so at 256 *no* block shape
+  fits the 48 KB a block gets for free — Q, O and both K/V tiles are all `BLOCK_* × 256`.
+  head_dim 256 is the one head_dim that opts into the larger shared-memory carveout, via one
+  `cudaFuncSetAttribute` per instantiation. The shape was swept: `32x16` beats `16x16` at all
+  ten shapes tried by 1.15x–1.55x, and `16x32` loses everywhere — the head_dim 128 result
+  again, that a wider key tile buys nothing while Q is in registers.
+* **tile.** A `BlockCfg<256>` per math mode and a dispatch case; the kernel was already
+  generic in `HEAD_DIM`.
+
+**And `auto` now takes head_dim 256.** It used to decline it, on the grounds that the
+kernel was about half the speed of the alternative — which was a fair reading of the
+measurement and is no longer a choice this project makes, because the alternative was a
+prebuilt attention.
+
+Two things changed after that decision. The first is the rule: there is no external
+attention to defer to any more. The second is the kernel, and it moved a long way. The
+occupancy diagnosis below was right — a 32-row block, **one** block per SM, about 4% of what
+an SM can hold — and the direct-to-global epilogue is what fixed it. Storing O from the
+accumulator fragments instead of staging the whole block tile through shared memory frees
+16 KB at this head_dim, which is exactly the block that was missing: head_dim 256 went from
+**1 resident block per SM to 2**, and the op itself gained **1.91x**.
+
+What that leaves, measured on the two appendix shapes that used to be routed away, causal,
+at their real dimensions:
+
+| | op, was | op, now | end to end, 4 layers |
+| --- | --- | --- | --- |
+| shape 8 (head_dim 256, S 128) | ~0.50 | **0.82** | **0.992x** |
+| shape 9 (head_dim 128, S 128) | 0.938 | **1.009** | **1.055x** |
+
+(the op columns are against what the external baseline used to cost, kept because they are
+the same measurement the old decision was made on.)
+
+So routing both to the kernel costs 0.8% on shape 8 and *gains* 5.5% on shape 9 — the
+head_dim 128 shape was being sent away for a loss that had stopped existing once fp32
+tensors started contracting in fp16 fragments.
+
+The structural point still stands and is worth keeping: this family of kernels holds Q and
+the output accumulator in registers for the whole key loop, which is what makes it fast at
+head_dim 64 and what costs it occupancy at 256. Freeing the O tile bought back one of the
+blocks that costs; tiling the head dimension the way a production kernel does would be a
+different kernel, not a different constant.
+
+One gap is left deliberately: the tile kernels still do not cover head_dim **128**, as they
+never did. Nothing measured wanted it; it is a `BlockCfg<128>` away.
 
 ## Notes and known limits
 
@@ -599,13 +700,16 @@ at all. Every entry point that can reach a tile kernel therefore imports `kernel
 `torch`, `torch_transformer_benchmark.py` included, since `--attn-impl tile` is reachable
 from it. `kernel_ext.tile_compiler_status()` reports whether the preload landed in time.
 
-**The accuracy budget is tighter than it looks.** The baseline's *own* TF32 rounding sits
-9.8e-4 (non-causal) to 1.2e-3 (causal) away from an exact fp32 result — at or above
-`atol=0.001`. Since the harness compares against the baseline's rounded output rather than
-ground truth, being *more* mathematically correct does not help. Only closeness to the
-baseline's specific rounding does. This is why restructuring GEMM order (for example fusing
-Q/K/V into one matmul) can fail the gate while being no less correct: it was measured to
-push `max_abs` from 9.9e-4 to 1.12e-3.
+**The accuracy budget is dominated by the baseline's own rounding, not by the kernel.** The
+baseline's *own* TF32 rounding sits 9.8e-4 (non-causal) to 1.2e-3 (causal) away from an exact
+fp32 result — over half the `atol=0.002` budget before the optimized path has done anything at
+all. Since the harness compares against the baseline's rounded output rather than ground truth,
+being *more* mathematically correct does not help. Only closeness to the baseline's specific
+rounding does. This is why restructuring GEMM order (for example fusing Q/K/V into one matmul)
+moves the metric while being no less correct: it was measured to push `max_abs` from 9.9e-4 to
+1.12e-3. At the real 2e-3 gate that particular change no longer costs a verdict, but the
+principle stands — the headroom is what is left after the reference's own noise, and that noise
+is the larger term.
 
 **fp16 / bf16 are not winnable.** The bf16 baseline sits 6.1e-2 from exact fp32, with
 153,627 of 524,288 elements failing the tolerance test *for a mathematically perfect
@@ -652,17 +756,23 @@ lands about 2x *closer* to it than the scalar kernel does (6.4e-5 vs 2.1e-4 at `
 accuracy trials the scalar kernel peaked at `max_abs` 7.7e-4 and the tensor-core kernel at
 8.7e-4 — but it does not reverse either.
 
-**Three configurations sit on the accuracy gate, and which backend passes is close to
-chance.** `causal`, `causal + padded` and `deep 12L` all fail intermittently, by one or two
-elements out of hundreds of thousands to millions, at `max_abs` ~1.0-1.2e-3 against
-`atol=1e-3`. This is not specific to the custom kernels: plain `--attn-backend sdpa` fails
-`causal` and `deep 12L` too. Measured directly on `causal + padded` over 8 seeds, the custom
-kernel failed 2 and stock SDPA failed 2 — while the **baseline compared against itself with
-TF32 disabled** failed all 8, by up to 1.566e-3. The reference the harness grades against is
-further from exact arithmetic than the tolerance allows, which is the whole of the effect.
+**The "three configurations on the accuracy gate" finding was an artefact of a stale
+tolerance, and is withdrawn.** `causal`, `causal + padded` and `deep 12L` were recorded here
+as failing intermittently at `max_abs` ~1.0-1.2e-3 against `atol=1e-3`. The harness's real
+tolerance is `atol=2e-3, rtol=2%`; re-measured against it, all three pass on every backend
+with zero failing elements, worst case 1.339e-3 — a 33% margin. The table is in
+[Accuracy](#accuracy).
 
-`--no-allow-tf32 --matmul-precision highest` removes the TF32 rounding from both sides and
-the margin returns.
+What remains true is the *mechanism* that made those verdicts unstable while they were
+unstable, because it still sets the metric: the baseline's own TF32 rounding sits 9.8e-4 to
+1.2e-3 from exact fp32, the harness grades against that rounded reference rather than ground
+truth, and the criterion's `OR` means the elements at risk are the ones whose reference value
+is near zero. `max_rel` in the hundreds on a comfortably passing run is that signature. So the
+error floor described throughout this section is real and unchanged — it simply sits inside a
+budget twice as large as this document previously assumed.
+
+`--no-allow-tf32 --matmul-precision highest` removes the TF32 rounding from both sides, which
+is still the way to see the floor itself rather than the budget.
 
 ## CUDA graphs
 
@@ -797,15 +907,22 @@ table out of that script should be discarded unless its control column is read a
 disagree about the *verdict*, so 6 configs x 8 seeds were graded against the baseline twice on
 the same inputs, once with capture off and once on:
 
-| | pairs | failed the gate | identical to eager, bit for bit |
+| | pairs | failed the gate *(at the old 1e-3 tolerance)* | identical to eager, bit for bit |
 | --- | --- | --- | --- |
 | eager | 48 | 2 | — |
 | graphed | 48 | 2 | **48/48** |
 
 Same two rows fail on both sides, with `max_abs` agreeing to the last digit and a gap of exactly
-`0.0e+00` on every pair. Both failures are `causal+padded` (seeds 2 and 4), one element of
-2,621,440 each — which is the pre-existing margin described under [Accuracy](#accuracy), not
-anything graphs introduced. `causal+padded` fails on roughly a quarter of seeds either way.
+`0.0e+00` on every pair. Both failures were `causal+padded` (seeds 2 and 4), one element of
+2,621,440 each.
+
+Those two failures no longer occur: this run was graded against `atol=1e-3`, and at the
+harness's real 2e-3 gate `causal+padded` passes on every backend with no failing elements (see
+[Accuracy](#accuracy)). **That does not weaken the result here, it strengthens it** — the
+column that matters is the right-hand one, and the point being tested was never whether a
+config passes but whether capture changes the answer. The two sides agreed bit for bit on all
+48 pairs *including* on the two rows that were then failing, which is the harder case to
+agree on.
 
 The useful conclusion is the negative one: **a graph cannot rescue an accuracy failure and
 cannot cause one.** It is a latency switch, and the accuracy discussion elsewhere in this
@@ -929,10 +1046,9 @@ the scalar kernel's name. The code comment beside the exemption had already name
 failure — "it can time ATen and label it 'scalar'" — and then deferred it as "a behaviour
 change, not a cleanup".
 
-The fix is to stop exempting it: forcing any impl now means that kernel or an error, and
-`auto` is the only mode that reaches the fallback. (That fallback is SDPA now rather than
-the explicit matmul this paragraph calls ATen -- see csrc/TUNING.md, "The uncovered-shape
-fallback is SDPA".) The scalar kernel has since grown a real head_dim
+The fix is to stop exempting it: forcing any impl now means that kernel or an error. `auto`
+raises too — there is no longer any fallback for it to reach, external or otherwise. The
+scalar kernel has since grown a real head_dim
 128 — see [Coverage and limits](#coverage-and-limits) for the lane-pair split that fits it
 under the register ceiling — so that row carries a genuine measurement again, and it reads
 **1.000 against a 1.000 control**. The regression that was attributed to memory-level
@@ -945,8 +1061,8 @@ there — falling to 1.01x by seq 2048, where the matmuls are large enough to sw
 
 Handing ATen `.contiguous()` copies instead does *not* collect that back: the clone measures
 1.32–1.54x on the same three shapes, within noise of just passing the strided views and worse
-at head_dim 96. The copy costs what the strided reads cost. The fallback keeps the views, and
-that is now a measured tie rather than an oversight.
+at head_dim 96. The copy costs what the strided reads cost, so the views are passed through
+as they are — a measured tie rather than an oversight.
 
 Restructuring the staging loop row-outer, so the 64-bit row offset is computed once per row
 instead of once per element, is kept: it is an absolute win at the head_dims the scalar kernel
@@ -1027,19 +1143,19 @@ its own independent measurement -- `--seq-len 2048 --batch-size 1 --causal` went
 
 ### head_dim 128 changes verdict
 
-The tf32 kernel *lost* to SDPA at head_dim 128, which is why `auto` capped the
+The tf32 kernel *lost* to a stock fused attention at head_dim 128, which is why `auto` capped the
 kernel at head_dim 64 and it never ran there. In fp16 it wins — except at
 exactly S 128, which reproduced across runs:
 
 | S | 64 | 128 | 256 | 384 | 512 | 1024 |
 |:--|--:|--:|--:|--:|--:|--:|
-| SDPA / wmma | 1.552x | **0.938x** | 1.028x | 1.027x | 1.047x | 1.081x |
+| external / wmma | 1.552x | **0.938x** | 1.028x | 1.027x | 1.047x | 1.081x |
 
 So the dispatch rule admits head_dim 128 from S 512 up, where the margin is
 4.7%-8.1% against a ±0.4% control. S 256 and 384 win too, by 2.8%, and are
 deliberately not claimed — that is close enough to the noise floor that
 widening the rule for it would be claiming more than was measured. Leaving S 128
-to SDPA is the important part: it is the sequence length of eleven of the
+there is the important part: it is the sequence length of eleven of the
 fourteen grading shapes.
 
 ### What did not work
@@ -1200,7 +1316,8 @@ the tensor-core rate.
 ## What's left
 
 Everything above is attention. This section is the other direction: given a kernel that is
-already faster than SDPA on every shape, what is still worth doing to the model around it?
+already ahead of a stock fused attention on every shape, what is still worth doing to the
+model around it?
 
 The measurements here come from a profiler run over the optimized path at four shapes with
 the harness's own settings (`allow_tf32=True`, `matmul_precision="high"`), reading leaf CUDA
@@ -1256,7 +1373,7 @@ treats very differently:
 
 * **Implementation changes** — CUDA graphs, fused epilogues, lower-precision GEMMs — compute
   the same function by a different route. They are graded on speed and on staying inside
-  `atol=1e-3`.
+  `atol=2e-3 / rtol=2%`.
 * **Architecture changes** — SwiGLU gating, RMSNorm — compute a *different function*.
 
 `copy_model_weights` loads the baseline's `state_dict` with `strict=True`, and
@@ -1289,8 +1406,10 @@ F.linear alone                  138.9 us    <- so GELU itself is only ~50 us
 ```
 
 It is also the **tanh** approximation, not erf: 3.87e-4 against an erf reference. Against an
-end-to-end `max_abs` that already peaks at 8.7e-4, that is most of the remaining margin for
-2%. So the cheap route was rejected, and the expensive one — a TF32 tensor-core GEMM with a
+end-to-end `max_abs` that already peaks at 8.7e-4, that is roughly a third of the remaining
+margin to the 2e-3 gate — not disqualifying on its own, as an earlier version of this note
+claimed under the mistaken 1e-3 budget, but a real cost for a change worth 2%. So the cheap
+route was rejected on the speed, and the expensive one — a TF32 tensor-core GEMM with a
 GELU epilogue that beats cuBLAS — was taken instead, and then moved from tf32 to fp16
 fragments for a further 2x on the tensor cores at identical accuracy. Together they are
 worth **1.066x end to end** (geometric mean, up to 1.115x) on the grading appendix's
@@ -1381,8 +1500,8 @@ To use the CUDA kernel, run through `devenv.bat` so the build can find `cl.exe`:
 cmd.exe /c scripts\devenv.bat python torch_transformer_benchmark.py
 ```
 
-Use `--attn-backend custom` rather than the default `auto` when timing the kernel: it raises
-if the extension fails to load, instead of silently falling back to SDPA and looking slow.
+`--attn-backend custom` is the only backend, and it raises if the extension fails to load
+rather than quietly measuring something that is not this project.
 
 To see the kernel rather than the FFN, benchmark where attention dominates:
 
@@ -1397,9 +1516,25 @@ Edit `ATTENTION_BACKEND` in [`optimized/config.py`](optimized/config.py), or pas
 
 | Value | Behavior |
 | --- | --- |
-| `auto` | Use the CUDA kernel if it loads, otherwise fall back to SDPA with a one-time notice. |
-| `sdpa` | Always use `F.scaled_dot_product_attention`. No build required. |
-| `custom` | Require the CUDA kernel; raise if it is unavailable, so a broken build fails loudly instead of quietly benchmarking the fallback and looking slow. |
+| `custom` | Require the CUDA kernel; raise if it is unavailable, so a broken build fails loudly instead of quietly benchmarking something else and looking slow. |
+
+**That is the only value.** There used to be two more — `auto`, which fell back to
+`F.scaled_dot_product_attention` when the extension would not load, and `sdpa`, which always
+used it — and both were routes to a prebuilt attention living inside the submission. A
+switch that quietly stops implementing the thing the project exists to implement is worse
+than no switch, so neither survives.
+
+To A/B attention alone, vary `--attn-impl`. Same shape, same everything else:
+
+| shape 8 | speedup | attention math |
+| --- | --- | --- |
+| `--attn-impl auto` | 1.308x | picks wmma, the first kernel that covers head_dim 256 |
+| `--attn-impl wmma` | 1.308x | tensor-core kernel |
+| `--attn-impl scalar` | 1.049x | scalar kernel |
+| `--attn-impl tile-fp16` | 0.714x | cuTile kernel |
+
+`auto` and `wmma` now agree at this shape, which they did not before: `auto` used to read
+1.420x here by declining every kernel and serving the case externally.
 
 ### Choosing the kernel inside the custom backend
 
@@ -1409,15 +1544,19 @@ attention:
 | Value | Behavior |
 | --- | --- |
 | `auto` | Tensor-core kernel where it applies, scalar kernel otherwise. |
-| `scalar` | Force the scalar kernel. No tensor cores, no TF32 rounding. `head_dim` in {8,16,32,64,128}; raises on anything else, so ATen cannot be timed under its name. |
-| `wmma` | Force the tensor-core kernel; raises on shapes it does not cover, so a silent fallback cannot be mistaken for a slow kernel. |
-| `tile` | Force the cuTile kernel — the same math written against the CUDA tile programming model instead of per-thread. float32, `head_dim` in {8,16,32,64}. Raises rather than falling back. |
+| `scalar` | Force the scalar kernel. No tensor cores, no TF32 rounding. `head_dim` in {8,16,32,64,128,256}; raises on anything else, so ATen cannot be timed under its name. |
+| `wmma` | Force the tensor-core kernel; raises on shapes it does not cover, so a silent substitution cannot be mistaken for a slow kernel. |
+| `tile` | Force the cuTile kernel — the same math written against the CUDA tile programming model instead of per-thread. float32, `head_dim` in {8,16,32,64,128,256}. Raises rather than falling back. |
 | `tile-tf32` | The same cuTile kernel with its two GEMMs narrowed to TF32, which is what puts them on the tensor cores. Same arithmetic `wmma` uses for fp32 inputs and the same ~1e-3 accuracy, so it clears the harness gate wherever `wmma` does. The tensor-core tile mode to reach for first. |
 | `tile-bf16` | As above but narrowed to bfloat16 — 8 mantissa bits. Marginally faster than `tile-tf32` on some shapes and far less accurate; fails the harness gate on most configs. |
+| `tile-fp16` | The same cuTile kernel narrowed to float16 — tf32's 10 mantissa bits at twice the tensor-core rate, accumulated in fp32. The fastest tile mode, and it clears the harness gate wherever `tile-tf32` does. |
 
-The tensor-core kernel covers `head_dim` 8, 16, 32, 64 and 128 in float32, float16 and
+The tensor-core kernel covers `head_dim` 8, 16, 32, 64, 128 and 256 in float32, float16 and
 bfloat16, on compute capability 8.0 and up — every head_dim the harness can produce, since
-`d_model` is divisible by `num_heads`. Nothing falls through to ATen any more.
+`d_model` is divisible by `num_heads`. Nothing falls through to ATen any more. Covering a
+head_dim and being the right thing to run for it are different questions; see
+[head_dim 256](#head_dim-256-covered-by-everything-fastest-at-nothing) for the one place they
+come apart.
 
 Neither tile mode is ever chosen by `auto`: they are a separate programming model whose
 performance you should opt into deliberately. They need a build that found CUDA 13.3+;
@@ -1429,10 +1568,10 @@ and the slowest kernel here.
 
 | Script | Purpose |
 | --- | --- |
-| `scripts/verify_kernel.py` | Every kernel vs. reference vs. SDPA across 12 shapes. Fails fast and names the shape that broke. The `packed` column reruns each case through the non-contiguous views the model actually produces and demands a *bit-identical* result, not one within tolerance. |
+| `scripts/verify_kernel.py` | Every kernel against a float64 reference across 14 shapes. Fails fast and names the shape that broke. The `packed` column reruns each case through the non-contiguous views the model actually produces and demands a *bit-identical* result, not one within tolerance. It also exports `reference_attention_f64`, which the A/B scripts use as their yardstick — one expression evaluated the same way every time, rather than a library call that picks a backend per shape. |
 | `scripts/verify_split_kv.py` | Checks the tile kernel's split-KV path against its own single-pass path, and asserts the split actually fired. |
 | `scripts/verify_graph.py` | Checks that graph replay is *bit-identical* to eager — tolerance exactly zero — and that the graph actually fired rather than silently declining. `--test-failure` also exercises the capture-failure path; `--include-tile` adds the cuTile impls. |
-| `scripts/bench_attention.py` | Times the attention op alone — scalar vs. tensor-core vs. SDPA — with accuracy alongside, so a speed win bought with precision is visible. |
+| `scripts/bench_attention.py` | Times the attention op alone — scalar vs. tensor-core vs. the tile kernels — with accuracy alongside, so a speed win bought with precision is visible. |
 | `scripts/compare_backends.py` | Runs the full harness once per backend and prints the comparison table above. Set `COMPARE_FULL=1` for the harness's own accuracy-trial count instead of the trimmed one. |
 | `scripts/ab_split_kv.py` | A/Bs the split-KV path against single-pass, interleaved in one process with a control group. |
 | `scripts/ab_layout.py` | A/Bs contiguous q/k/v against the packed views the model produces, alternating call by call, with a contiguous-vs-contiguous control row. Measures what reading strides costs, not what skipping the clones saves. |

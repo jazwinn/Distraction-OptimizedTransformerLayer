@@ -22,10 +22,13 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     """Add the optimization flags to the harness's own parser."""
     parser.add_argument(
         "--attn-backend",
-        choices=("auto", "sdpa", "custom"),
+        choices=("custom",),
         default=None,
-        help="override ATTENTION_BACKEND for this run only (default: use the "
-             "value set in optimized/config.py)",
+        help="override ATTENTION_BACKEND for this run only. Only one value is "
+             "accepted now: the 'auto' and 'sdpa' choices were routes to a "
+             "prebuilt attention and have been removed. Kept as a flag so "
+             "existing command lines that pass --attn-backend custom still "
+             "work (default: use the value set in optimized/config.py)",
     )
     parser.add_argument(
         "--attn-impl",

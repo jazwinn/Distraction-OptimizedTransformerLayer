@@ -14,20 +14,25 @@ run; see optimized/cli.py.
 
 # Attention backend. --attn-backend overrides this for a single run.
 #
-#   "auto"     custom CUDA kernel when it builds and loads, else SDPA
-#   "sdpa"     always F.scaled_dot_product_attention. No build required.
-#   "custom"   require the custom kernel, so a broken build fails loudly
-#              instead of quietly benchmarking the fallback and looking slow
-ATTENTION_BACKEND = "auto"
+#   "custom"   the custom CUDA kernel, and nothing else. A broken build fails
+#              loudly rather than quietly substituting something.
+#
+# There is no second choice. This used to offer "auto" (kernel if it loads,
+# else SDPA) and "sdpa" (always F.scaled_dot_product_attention), and both were
+# routes to a prebuilt attention living inside the submission. The whole point
+# of the project is that this file implements attention; a switch that quietly
+# stops doing so is worse than no switch. To compare against torch's own
+# attention, use the benchmark scripts, which are not the model.
+ATTENTION_BACKEND = "custom"
 
 # Which kernel inside the extension handles attention; only meaningful when the
 # custom backend is in play. --attn-impl overrides this for a single run.
 #
-#   "auto"       the fastest path for the shape, which is not the same as the
-#                first one that covers it: the tensor-core kernel where it
-#                wins, the scalar kernel where that is all there is, and SDPA
-#                from head_dim 128 up, where the wmma kernel is correct and
-#                slower. See run_kernel() in csrc/attention_dispatch.cuh.
+#   "auto"       the first kernel that covers the shape: the tensor-core
+#                kernel wherever it applies, the scalar kernel where that is
+#                all there is, and an error where neither does. It used to
+#                prefer SDPA from head_dim 128 up, which is gone -- see
+#                run_kernel() in csrc/attention_dispatch.cuh.
 #   "scalar"     force the scalar kernel (no tensor cores, no TF32 rounding);
 #                head_dim in {8,16,32,64,128,256}, and raises on anything
 #                else. It

@@ -213,7 +213,7 @@ FALLBACK: List[Dict[str, Any]] = [
      "choices": ["float32", "float16", "bfloat16"], "default": "float32",
      "help": "", "group": "data"},
     {"flag": "--attn-backend", "dest": "attn_backend", "kind": "choice",
-     "choices": ["auto", "sdpa", "custom"], "default": None, "help": "",
+     "choices": ["custom"], "default": None, "help": "",
      "group": "optimization"},
     {"flag": "--attn-impl", "dest": "attn_impl", "kind": "choice",
      "choices": ["auto", "scalar", "wmma", "tile", "tile-bf16", "tile-tf32",
@@ -272,8 +272,8 @@ def load(repo: str = REPO) -> Dict[str, Any]:
 
 # A legend entry in config.py: three spaces, a quoted value, then prose.
 #
-#     #   "auto"     custom CUDA kernel when it builds and loads, else SDPA
-#     #   "sdpa"     always F.scaled_dot_product_attention. No build required.
+#     #   "wmma"     force the tensor-core kernel; raises on shapes it misses
+#     #   "scalar"   force the scalar kernel (no tensor cores, no TF32)
 #
 # Continuation lines are indented past where the prose started, which is what
 # separates them from the next entry.

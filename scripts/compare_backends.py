@@ -30,11 +30,13 @@ CASES = [
     ("deep 12L",           ["--layers", "12"]),
 ]
 
-# (column label, extra flags). The custom backend has two kernels behind it, so
-# the scalar one is timed separately -- otherwise "custom" would just mean
-# "whatever auto picked" and the tensor-core win would be invisible.
+# (column label, extra flags). Every column is a kernel this project wrote:
+# --attn-backend has one legal value now, so the columns vary --attn-impl and
+# the scalar kernel is timed separately from the tensor-core one, which is the
+# comparison that matters. There used to be an "sdpa" column here; it went with
+# the backend flag that selected it, since a prebuilt attention is no longer
+# reachable from the model.
 BACKENDS = (
-    ("sdpa",          ["--attn-backend", "sdpa"]),
     ("custom scalar", ["--attn-backend", "custom", "--attn-impl", "scalar"]),
     ("custom wmma",   ["--attn-backend", "custom", "--attn-impl", "wmma"]),
     ("custom tile",   ["--attn-backend", "custom", "--attn-impl", "tile"]),
@@ -44,7 +46,7 @@ BACKENDS = (
 
 # A full sweep is len(CASES) * len(BACKENDS) harness invocations, so restrict the
 # columns when only some are interesting:
-#   COMPARE_BACKENDS="sdpa,custom wmma,custom tile-tf32"
+#   COMPARE_BACKENDS="custom wmma,custom tile-tf32"
 # Names must match the column labels above; an unknown one is an error rather
 # than a silently empty table.
 _want = os.environ.get("COMPARE_BACKENDS", "").strip()

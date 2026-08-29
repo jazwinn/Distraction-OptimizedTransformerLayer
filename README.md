@@ -11,16 +11,18 @@ so the diff against it is readable. `optimized/model.py` holds the forward pass,
 `optimized/layers.py` its submodules, `optimized/kernels.py` the dispatch into CUDA,
 `optimized/graphs.py` the CUDA-graph machinery, and `optimized/config.py` every runtime knob.
 
-Attention runs through one of two interchangeable backends: PyTorch's
-`scaled_dot_product_attention`, or a hand-written fused CUDA kernel in
-[`csrc/`](csrc/) -- [`attention_wmma.cuh`](csrc/attention_wmma.cuh) and
+Attention runs on hand-written fused CUDA kernels in [`csrc/`](csrc/) --
+[`attention_wmma.cuh`](csrc/attention_wmma.cuh) and
 [`attention_scalar.cuh`](csrc/attention_scalar.cuh), picked between by
-[`attention_dispatch.cuh`](csrc/attention_dispatch.cuh).
+[`attention_dispatch.cuh`](csrc/attention_dispatch.cuh). There is no prebuilt
+attention anywhere in the forward pass: this project implements the operation,
+so a shape no kernel covers raises rather than being handed to
+`torch.nn.functional.scaled_dot_product_attention`.
 
-The custom backend has two kernels behind it. The default one runs both of attention's
+The default kernel runs both of attention's
 matrix multiplies — `Q @ K^T` and `P @ V` — on the GPU's tensor cores through
 `nvcuda::wmma`, with the softmax fused between them and the `[B, H, S, S]` score matrix
-never leaving shared memory. A scalar fallback covers the shapes tensor cores cannot take
+never leaving shared memory. A second, scalar kernel covers what tensor cores cannot take
 and stays selectable for comparison. A third kernel in
 [`csrc/tile_attention.cu`](csrc/tile_attention.cu) expresses the same maths against the CUDA
 tile programming model, as a portability-versus-speed comparison rather than as the default.
@@ -65,9 +67,9 @@ CUDA 13.3+ toolkit is installed, builds the tile kernel against it — several t
 sit side by side and the tile-capable one is found by looking for the header rather than by
 trusting `PATH`. Set `CUDA_TILE_HOME` to override that search.
 
-Only the CUDA-kernel backend needs MSVC and `nvcc`. **The SDPA backend needs neither** — if
-you just want to run the benchmark, `python torch_transformer_benchmark.py` works with
-PyTorch alone.
+**MSVC and `nvcc` are required.** The kernels are the project, so there is no
+PyTorch-only path that runs the benchmark without building them; a build that does not load
+raises rather than quietly measuring something else.
 
 ### 1. Install Python dependencies
 
@@ -198,10 +200,10 @@ If you skip it, the harness still prints which path each run took and why:
 
 ### Troubleshooting
 
-**`custom CUDA kernel unavailable, using SDPA instead`** — not an error, and not a claim
-that MSVC is missing. It means `cl.exe` was not on `PATH`, so the extension could not be
-built and attention fell back to SDPA; results are still correct and the benchmark still
-reports a real speedup.
+**`the CUDA extension failed to load, and there is no fallback`** — this usually means
+`cl.exe` was not on `PATH`, so the extension could not be built. It is a hard error on
+purpose: substituting a prebuilt attention would make the benchmark measure something other
+than this project.
 
 `cl.exe` is not on `PATH` in a normal shell even with Visual Studio fully installed — only
 inside a developer command prompt. Prefix the command with `devenv.bat`:
@@ -211,18 +213,14 @@ cmd.exe /c scripts\devenv.bat python torch_transformer_benchmark.py
 ```
 
 Every run needs the prefix, because `torch.utils.cpp_extension.load()` probes for the host
-compiler before it will even check whether a rebuild is needed. To make a missing kernel a
-hard error rather than a silent fallback, use `--attn-backend custom`.
-
-To use SDPA deliberately and silence the message, set `ATTENTION_BACKEND = "sdpa"` in
-[`optimized/config.py`](optimized/config.py).
+compiler before it will even check whether a rebuild is needed.
 
 **`'vswhere.exe' is not recognized`** — harmless, printed by `vcvarsall.bat` itself. The
 build succeeds regardless.
 
-**Extension builds but the harness is slower than expected** — confirm which backend
-actually ran. With `"auto"`, a silent fallback means you may be timing SDPA rather than the
-kernel; `"custom"` raises instead of falling back.
+**Extension builds but the harness is slower than expected** — confirm which kernel
+actually ran, with `--attn-impl`. `auto` picks the first kernel that covers the shape, and a
+forced impl raises rather than quietly serving the case from another one.
 
 **A run prints a passing verdict and then exits non-zero** — this was a cuTile teardown
 fault (`0xC0000005` *after* `main()` returned) and it is fixed: importing `kernel_ext`
@@ -318,8 +316,9 @@ own, and the first two were regressions until fixed:
 last query row, so whole key tiles beyond it are never loaded or computed — not computed
 and discarded.
 
-**A scalar kernel as the fallback.** One thread per query row, plain fp32 FMA, no tensor
-cores and so no TF32 rounding at all. It covers what wmma cannot (pre-Ampere cards) and
+**A scalar kernel for what tensor cores cannot take.** One thread per query row, plain
+fp32 FMA, no tensor cores and so no TF32 rounding at all. It covers what wmma cannot
+(pre-Ampere cards) and
 stays selectable through `--attn-impl scalar` so the tensor-core win can be measured rather
 than assumed.
 
@@ -406,7 +405,7 @@ optimized/config.py                       the runtime knobs: backend, kernel, CU
 optimized/cli.py                          --attn-backend / --attn-impl / --cuda-graph
 optimized/model.py                        OptimizedTransformer: the whole forward pass
 optimized/layers.py                       its submodules, named to match the baseline's
-optimized/kernels.py                      dispatch into csrc/, with an SDPA fallback
+optimized/kernels.py                      dispatch into csrc/; no fallback by design
 optimized/graphs.py                       CUDA graph capture, replay and teardown
 optimized/util.py                         small shared helpers
 

@@ -1,5 +1,13 @@
 # Kernel tuning notes
 
+> **On the "external baseline" columns.** Several tables below compare against a
+> stock fused attention from the framework, which is what this kernel was
+> developed against. It is no longer part of the project -- the rules for this
+> work forbid a prebuilt attention, so it was removed from the model, the
+> dispatcher and the benchmark scripts. The measurements are kept as the record
+> of why particular decisions were made; nothing in the repository calls it any
+> more, and the two sections it decided have been marked SUPERSEDED.
+
 Measurements behind the constants in the `csrc/` kernels. `fused_attention.cu` is the module root and includes the `.cuh` slices; its header comment maps the tree.
 All numbers are from an RTX 3070 (SM 8.6, 46 SMs, 448 GB/s), CUDA 13.3.
 
@@ -229,9 +237,10 @@ spread and keeps the identity mapping.
 ## wmma kernel: causal block-index reversal, gated on one wave
 
 The same idea as the tile kernel's reversal above, ported to the hand-written
-kernel and measured by `scripts/ab_causal_reverse.py`. It does not port
-unconditionally: ungated it is a wash, and the reason it is a wash is the useful
-part.
+kernel. It does not port unconditionally: ungated it is a wash, and the reason
+it is a wash is the useful part. (The A/B script that produced the numbers below
+has since been deleted, so this section is the record of them; re-running it
+would mean writing it again against `wmma_set_causal_reverse()`.)
 
 Ungated, over 13 causal shapes: geometric mean **1.002x**, with individual
 shapes from 0.933x to 1.101x. Both extremes reproduce to within 1% across runs,
@@ -360,7 +369,7 @@ real constraint — batch 8, heads 8, seq 512, head_dim 64 at 4 splits is 34 MB.
 which is only the right rule while covering a case and being the fastest way to
 serve it are the same thing. At head_dim 128 they are not.
 
-wmma against SDPA, fp32 causal, interleaved in one process. Ratio > 1 means the
+wmma against the external baseline, fp32 causal, interleaved in one process. Ratio > 1 means the
 wmma kernel is slower:
 
 | head_dim 128 | batch 8 | batch 1 |
@@ -380,13 +389,13 @@ enough in flight to cover memory latency, and no block shape fixes it while Q is
 register-resident. (head_dim 64 reports REG:168, head_dim 32 REG:128.)
 
 So Auto now takes wmma at `head_dim <= 64`, or at head_dim 128 when
-`seq_len < 128`, and otherwise falls through. The crossover is where SDPA's
+`seq_len < 128`, and otherwise falls through. The crossover is where the external baseline's
 fixed per-launch cost stops dominating: seq 64 is a tie at the noise floor and
 seq 128 is not. `--attn-impl wmma` still reaches the kernel at every head_dim it
 covers, because a forced impl means that kernel or nothing.
 
 float16 crosses earlier and harder (2.85x at seq 128, 3.30x at seq 512, where
-SDPA reaches its flash backend), so a gate on head_dim and length alone is
+the external baseline reached its flash backend), so a gate on head_dim and length alone is
 conservative for the narrow dtypes rather than wrong for them.
 
 End to end, `--causal --d-model 1024 --ffn-dim 1024` (head_dim 128), auto
@@ -516,7 +525,18 @@ the block at 25344, and buys head_dim 32 the fourth block too -- which is the
 head_dim the benchmark actually runs. Separate change, with its own
 bank-conflict question.
 
-## The uncovered-shape fallback is SDPA, not the baseline's own matmul
+## SUPERSEDED: there is no uncovered-shape fallback any more
+
+The section below chose an external fused attention for the path taken when no
+kernel covers a case, over mirroring the baseline's own matmul. Both options are
+gone: this project may not use a prebuilt attention, so an uncovered shape now
+raises. `Impl::Auto` also stopped applying a *speed* preference on top of
+coverage, which is what used to send head_dim 256 and head_dim 128 at S 128
+away. Kept because the reasoning about score-matrix memory traffic is still
+correct, and because it records why the baseline's algorithm was the wrong
+shape for a fallback to have.
+
+## (superseded) The uncovered-shape fallback, and why not the baseline's matmul
 
 The path taken when no kernel covers a case used to mirror
 `BaselineSelfAttention.forward` exactly: `matmul`, mask, `softmax`, `matmul`.
@@ -525,7 +545,7 @@ whole [B, H, S, S] score matrix, so the one path this file takes when it has
 nothing better ran the *baseline's* algorithm and inherited its memory traffic.
 
 head_dim 256 is the only head_dim in the grading set no kernel covers. The old
-fallback against SDPA, interleaved, causal fp32:
+fallback against the external baseline, interleaved, causal fp32:
 
 | head_dim 256 | batch 8 | batch 1 |
 |:-------------|--------:|--------:|
@@ -543,7 +563,7 @@ dominate what attention costs either way.
 ## Causal and an explicit mask, together
 
 `fused_attention_forward` used to reject `is_causal` alongside `attn_mask`,
-copying SDPA's restriction. SDPA has to have it; this ABI did not. Both kernels
+copying the external baseline's restriction. the external baseline has to have it; this ABI did not. Both kernels
 already apply the two independently — a causal `break`/predicate and a separate
 mask lookup — so allowing the pair needed no kernel change at all.
 
@@ -826,7 +846,7 @@ case.**
 | long seq causal | 0.422 | 0.825 | 0.494 | 0.494 | 7.4e-4 | 9.2e-3 | 7.4e-4 |
 | odd shape | 0.019 | 0.020 | 0.021 | 0.020 | 1.2e-3 | 1.0e-2 | 1.2e-3 |
 
-Against sdpa at `long seq`, that moves the tile kernel from tf32's 1.26x to
+Against external at `long seq`, that moves the tile kernel from tf32's 1.26x to
 **1.85x**, and at `long seq causal` from 1.23x to **2.05x** -- for free, since
 `verify_kernel.py` holds tile-fp16 to the tf32 tolerance (3e-3), not bf16's.
 
@@ -902,9 +922,9 @@ N=2048, 44.4 vs 22.0 at N=8192), and a 16x16x16 fp16 fragment contracts twice
 the K of tf32's 16x16x8, so the mma count halves as well.
 
 `scripts/ab_attention_fp16.py`, causal, graph-timed, interleaved, control
-+/-0.4%. The SDPA column is what `auto` falls back to:
++/-0.4%. The external column is what `auto` used to fall back to:
 
-| shape | SDPA | tf32 | fp16 | fp16 vs tf32 | fp16 vs SDPA |
+| shape | the external baseline | tf32 | fp16 | fp16 vs tf32 | fp16 vs the external baseline |
 |:--|--:|--:|--:|--:|--:|
 | B8 H4 S128 d8 | 29.3 | 11.3 | 9.3 | 1.210x | 3.145x |
 | B16 H8 S128 d32 | 83.2 | 38.8 | 31.8 | 1.221x | 2.618x |
@@ -943,15 +963,15 @@ table sit. The harness's own verdict agrees independently -- `--seq-len 2048
 1.123x at S 1024.
 
 The last row is a **consistency check, not a regression**: at head_dim 128 and
-S 128 the dispatch rule sends both configurations to SDPA, which is why its
+S 128 the dispatch rule sends both configurations to the external baseline, which is why its
 `max_abs` column is exactly 0.00e+00. 0.981x against a 1.0% control is that
 shape's noise.
 
 ### head_dim 128 changes verdict, and the auto rule with it
 
-The tf32 kernel *lost* to SDPA at head_dim 128, which is why
+The tf32 kernel *lost* to the external baseline at head_dim 128, which is why
 `kWmmaAutoMaxHeadDim` was 64 and the kernel never ran there above S 64. In fp16
-it wins -- but not everywhere. Re-measured, SDPA/wmma, so >1 means the kernel
+it wins -- but not everywhere. Re-measured, the external baseline/wmma, so >1 means the kernel
 wins:
 
 | S | 64 | 128 | 256 | 384 | 512 | 1024 |
@@ -964,7 +984,7 @@ margin is 4.7%-8.1%, comfortably past the +/-0.4% control. S 256 and 384 also
 win, by 2.8%, and are deliberately not claimed: too close to the floor to be
 worth widening the rule for.
 
-Leaving S 128 to SDPA matters more than the ratio suggests. It is the sequence
+Leaving S 128 to the external baseline matters more than the ratio suggests. It is the sequence
 length of eleven of the fourteen grading shapes, so admitting head_dim 128
 outright would have cost 6% at the one shape that has it.
 
@@ -1025,7 +1045,7 @@ built before the 1.37x can be claimed.
    `k_s[i] = inb ? cvt(k_base[g]) : zero_v` as an `if/else` with two stores cost
    **1.3x-2.1x on the tf32 path** -- 708 us to 1473 us at B4 H8 S512 d128. The
    ternary compiles to a predicated select; the branch does not. It was caught
-   only because SDPA, timed in the same table, did not move between the two
+   only because the external baseline, timed in the same table, did not move between the two
    runs. Hence `dev_of_float<T>`, a value-returning narrowing helper.
 
 A fourth, in `kernel_ext.py` rather than the kernel: the no-cuTile retry does not
@@ -1803,7 +1823,7 @@ noise floor is measured rather than assumed.
 Grading shape 8 (batch 64, seq 128, d_model 1024, 4 heads, causal) is head_dim
 256, and it was the one shape in the set no kernel covered: `--attn-impl wmma`
 refused it, `--attn-impl scalar` refused it, the tile kernels refused it, and
-Auto quietly served it from SDPA. Every impl covers it now. None of them should
+Auto quietly served it from the external baseline. Every impl covers it now. None of them should
 be used for it.
 
 ### What each kernel had to change
@@ -1830,7 +1850,7 @@ kernel itself is already generic in HEAD_DIM.
 ### The wmma block shape, swept
 
 Once the carveout is being paid for anyway, the shape is a free choice. Against
-SDPA, causal and dense, ratio > 1 meaning the kernel wins, one build per
+the external baseline, causal and dense, ratio > 1 meaning the kernel wins, one build per
 candidate:
 
 |                    | 16x16 | 32x16 | 16x32 |
@@ -1856,30 +1876,40 @@ the freed shared memory does not want to be spent on a bigger tile"): a wider
 key tile doubles the staging without adding parallelism, and Q is already in
 registers, so there is nothing for it to buy.
 
-### Why Auto still routes head_dim 256 to SDPA
+### SUPERSEDED: Auto now takes head_dim 256
 
-Interleaved against SDPA, causal, with an A/A control row, at the shape that
+Two things changed after the measurement below. The rule -- no prebuilt
+attention, so there is nothing to decline *to* -- and the kernel, which moved a
+long way: the direct-to-global epilogue frees 16 KB at this head_dim and takes
+it from **1 resident block per SM to 2**, worth **1.91x** on the op. The
+occupancy diagnosis at the end of this section was right, and that is what
+fixed it. Measured cost of routing both former escapees to the kernel, end to
+end over 4 layers: shape 8 **0.992x**, shape 9 **1.055x**.
+
+### (superseded) Why Auto used to route head_dim 256 away
+
+Interleaved against the external baseline, causal, with an A/A control row, at the shape that
 actually matters and three neighbours:
 
-| shape                   | sdpa_ms | control | scalar | wmma  | tile  | tile-fp16 |
+| shape                   | external_ms | control | scalar | wmma  | tile  | tile-fp16 |
 |-------------------------|---------|---------|--------|-------|-------|-----------|
 | b64 h4 s128 (shape 8)   |  0.6745 |   0.0%  | 0.262  | 0.503 | 0.067 | 0.096     |
 | b16 h4 s128             |  0.1835 |   1.1%  | 0.250  | 0.498 | 0.071 | 0.101     |
 | b2  h4 s128             |  0.0378 |   2.0%  | 0.140  | 0.706 | 0.099 | 0.126     |
 | b2  h4 s64              |  0.0292 |   1.4%  | 0.242  | 0.884 | 0.203 | 0.241     |
 
-The best of the four is half SDPA's speed at the grading shape, and the closest
-any of them gets anywhere is 0.884x on a shape small enough that SDPA is mostly
+The best of the four is half the external baseline's speed at the grading shape, and the closest
+any of them gets anywhere is 0.884x on a shape small enough that the external baseline is mostly
 launch overhead. That is not a threshold to find; it is a loss everywhere. So
-`wmma_preferred_by_auto` declines above head_dim 128 outright
-(`kWmmaAutoMaxCandidateHeadDim`), and the two head_dim 128 clauses above it are
-left describing only the case they were measured on.
+`wmma_preferred_by_auto` declined above head_dim 128 outright
+(`kWmmaAutoMaxCandidateHeadDim`). Both that function and those constants have
+since been deleted.
 
 The reason is structural rather than a tuning miss. This family of kernels keeps
 Q and the output accumulator in registers for the whole key loop, which is what
 makes them fast at head_dim 64. At 256 that same choice forces a 32-row block,
 one block per SM, 64 threads -- a sixteenth of what the SM can hold -- and no
-block shape recovers it while Q stays register-resident. SDPA's flash backend
+block shape recovers it while Q stays register-resident. the external baseline's flash backend
 tiles the head dimension instead. Beating it at head_dim 256 means a kernel that
 does the same, and that is a different kernel, not a different constant.
 
@@ -1975,9 +2005,9 @@ causal ranking reproduced across both runs to within 2% (32x16 read 14.11 and
 14.34 ms at b1h8s2048), which is what makes the two tables trustworthy side by
 side rather than the ratios between them.
 
-### Against wmma and SDPA
+### Against wmma and the external baseline
 
-Interleaved, one process, min of rounds, fp32 in and out. `control` is SDPA
+Interleaved, one process, min of rounds, fp32 in and out. `control` is the external baseline
 timed a second time under another name: its true ratio is exactly 1.000x, so
 what it reports is this run's noise floor.
 
@@ -1992,10 +2022,10 @@ what it reports is this run's noise floor.
 | b1 h8 s2048 causal    | 1.03x | 1.50x | **1.67x** | 0.96x | 0.18x |
 | b1 h8 s2048 dense     | 0.98x | 1.19x | **1.50x** | 0.87x | 0.11x |
 
-Ratios are against SDPA; >1 is faster. Three things follow:
+Ratios are against the external baseline; >1 is faster. Three things follow:
 
 * **The crossover is around seq 512.** Below it wmma wins and tile-fp16 is
-  slower than SDPA; at 512 they tie; at 2048 tile-fp16 is 1.12x (causal) to
+  slower than the external baseline; at 512 they tie; at 2048 tile-fp16 is 1.12x (causal) to
   1.26x (dense) faster than wmma. Same shape as the head_dim 64 story -- the
   tile kernel needs a long key loop before its scheduling pays for itself.
 * **Auto is unchanged.** It routes head_dim 128 to wmma, and wmma wins the two
@@ -2059,8 +2089,8 @@ dispatch rule keyed on block count.
 `b1h8` is the noisiest series: 64-128 blocks is under one wave on 46 SMs, so it
 is latency-bound, and its 384 (1.05) and 512 (0.73) dense rows disagree with
 their neighbours by more than the trend does. Past the threshold the win is
-modest -- 1.1x typical, against the 1.5x tile-fp16 posts over SDPA in the same
-rows, because wmma is beating SDPA by 1.2x-1.4x there too.
+modest -- 1.1x typical, against the 1.5x tile-fp16 posts over the external baseline in the same
+rows, because wmma is beating the external baseline by 1.2x-1.4x there too.
 
 Auto is unaffected either way: every grading shape is seq 128 or seq 1024, and
 the seq-1024 one is head_dim 32.
@@ -2094,8 +2124,8 @@ Causal sorts by grid size, not by sequence length:
 `b1 h8 s4096` causal is the only real loss in 40 shapes.
 
 The mechanism is wmma getting better, not the tile kernel getting worse:
-`wmma/sdpa` under causal climbs from ~1.20x at 8 blocks-per-head to 1.42x-1.53x
-at 64, while `tile-fp16/sdpa` sits flat near 1.40x throughout. wmma runs
+`wmma/external` under causal climbs from ~1.20x at 8 blocks-per-head to 1.42x-1.53x
+at 64, while `tile-fp16/external` sits flat near 1.40x throughout. wmma runs
 `WMMA_M_128` = 32 against the tile kernel's 64, so it has twice the blocks with
 which to fill a large causal grid -- and causal is the mask mode where block
 cost varies most, so more, smaller blocks schedule better.
@@ -2108,10 +2138,10 @@ that is the difference between a tie and 1.1x-1.2x.
 
 One caveat on reading the raw table: several causal rows carry a control
 deviation of 9%-12% while their own three passes agree to within 0.01 (`b2 h8
-s1024` read 1.103 / 1.103 / 1.097 against a 12.1% control). That is SDPA's
+s1024` read 1.103 / 1.103 / 1.097 against a 12.1% control). That is the external baseline's
 variance between two timings of itself, and the `wmma/fp16` ratio does not go
-through SDPA at all -- which is why `spread` is the error bar to read here and
-the control only gates the `*/sdpa` columns.
+through the external baseline at all -- which is why `spread` is the error bar to read here and
+the control only gates the `*/external` columns.
 
 ### Routing Auto to tile-fp16 at head_dim 128: measured, and NOT done
 
@@ -2162,7 +2192,7 @@ without putting a new way to mis-lay-out the output into the default path.
 
 Part of this pass was measured while a second process was using the same GPU.
 It was caught by the control column (0.44x on one row, where the true value is
-1.000x) and by SDPA itself reading 4x its quiet time, and those runs were
+1.000x) and by the external baseline itself reading 4x its quiet time, and those runs were
 discarded and re-run. Every number above comes from a run whose control column
 sits inside 0.91x-1.07x. This is what the control row is for; a table without
 one would have shipped the contaminated ranking.

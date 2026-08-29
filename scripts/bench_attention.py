@@ -1,7 +1,12 @@
 """
-Benchmark the attention op alone: both custom kernels against SDPA, with
+Benchmark the attention op alone: the custom kernels against each other, with
 accuracy alongside, so a speed win that came from losing precision is visible
 rather than hidden.
+
+The SDPA column that used to anchor this table is gone. This project may not
+use a prebuilt attention, so there is no longer a version of the op to compare
+against that is not one of these kernels -- the wmma column is the anchor now,
+being the one Auto dispatches to.
 
 The reference here runs with TF32 enabled, because that is the arithmetic the
 benchmark harness baseline actually uses. Measuring against an exact-fp32
@@ -84,10 +89,9 @@ def main() -> int:
     # this table under the scalar kernel's name.
     TILE_COLS = (("tile-tf32", 5), ("tile-bf16", 4), ("tile-fp16", 6))
 
-    head = (f"{'case':<18}{'sdpa':>10}{'scalar':>10}{'wmma':>10}"
+    head = (f"{'case':<18}{'scalar':>10}{'wmma':>10}"
             + "".join(f"{name:>10}" for name, _ in TILE_COLS)
-            + f"{'wmma/sdpa':>11}"
-            + "".join(f"{name + '/sdpa':>16}" for name, _ in TILE_COLS)
+            + "".join(f"{name + '/wmma':>16}" for name, _ in TILE_COLS)
             + f"{'wmma err':>10}"
             + "".join(f"{name + ' err':>14}" for name, _ in TILE_COLS))
     print(head)
@@ -105,11 +109,7 @@ def main() -> int:
             ref = reference_attention(q, k, v, am, ic, scale).float()
             err_wmma = (run(0).float() - ref).abs().max().item()
 
-            timed = {
-                "sdpa": lambda: F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=am, is_causal=ic, scale=scale),
-                "wmma": lambda: run(0),
-            }
+            timed = {"wmma": lambda: run(0)}
             errs = {}
             try:
                 errs["scalar"] = (run(1).float() - ref).abs().max().item()
@@ -131,19 +131,18 @@ def main() -> int:
             return (f"{fmt(name):>{width}}" if errs[name] is not None
                     else f"{'n/a':>{width}}")
 
-        print(f"{label:<18}{t['sdpa']:>10.3f}"
+        print(f"{label:<18}"
               + cell("scalar", 10, lambda n: f"{t[n]:.3f}")
               + f"{t['wmma']:>10.3f}"
               + "".join(cell(n, 10, lambda n=n: f"{t[n]:.3f}") for n, _ in TILE_COLS)
-              + f"{t['sdpa'] / t['wmma']:>10.2f}x"
-              + "".join(cell(n, 16, lambda n=n: f"{t['sdpa'] / t[n]:.2f}x")
+              + "".join(cell(n, 16, lambda n=n: f"{t['wmma'] / t[n]:.2f}x")
                         for n, _ in TILE_COLS)
               + f"{err_wmma:>10.1e}"
               + "".join(cell(n, 14, lambda n=n: f"{errs[n]:.1e}")
                         for n, _ in TILE_COLS))
 
     print("-" * len(head))
-    print("ratios >1 mean the custom kernel is faster than sdpa. Every impl "
+    print("ratios >1 mean that tile mode is faster than wmma. Every impl "
           "covers every")
     print("head_dim in the table, so an n/a is a build without tile support "
           "rather than a")

@@ -68,6 +68,24 @@ def reference_attention(q, k, v, attn_mask, is_causal, scale):
     return torch.matmul(probs, v)
 
 
+def reference_attention_f64(q, k, v, attn_mask, is_causal, scale, layout=0):
+    """The same arithmetic in float64, for scripts that want a yardstick.
+
+    This replaces what used to be an F.scaled_dot_product_attention call in
+    float64. It is a better reference than that was, not merely a permitted
+    one: SDPA picks a backend by shape and dtype, so the "exact" baseline could
+    silently change algorithm between cases, whereas this is one expression
+    evaluated the same way every time.
+
+    layout 1 returns [B, S, H*head_dim], the packed view the kernels write.
+    """
+    out = reference_attention(q.double(), k.double(), v.double(),
+                              attn_mask, is_causal, scale)
+    # A fully-masked row is 0/0 in the softmax. The kernels emit 0 there; match.
+    out = torch.nan_to_num(out, nan=0.0)
+    return out.transpose(1, 2).flatten(2) if layout == 1 else out
+
+
 def build_case(b, h, s, d, causal, padded, device, dtype, seed=0):
     g = torch.Generator(device=device).manual_seed(seed)
     q = torch.randn(b, h, s, d, generator=g, device=device, dtype=dtype)
@@ -173,10 +191,9 @@ def main() -> int:
 
     device = torch.device("cuda")
     dtype = torch.float32
-    row = "{:<18} {:>8} {:>11} {:>11} {:>9} {:>9} {:>8} {:>8}"
-    print(row.format("case", "impl", "vs_ref", "vs_sdpa",
-                     "custom_ms", "sdpa_ms", "speedup", "packed"))
-    print("-" * 89)
+    row = "{:<18} {:>8} {:>11} {:>9} {:>8}"
+    print(row.format("case", "impl", "vs_ref", "custom_ms", "packed"))
+    print("-" * 60)
 
     failures = []
     for label, b, h, s, d, causal, padded in CASES:
@@ -188,11 +205,6 @@ def main() -> int:
 
         with torch.inference_mode():
             ref = reference_attention(q, k, v, attn_mask, is_causal, scale)
-            sdpa = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, is_causal=is_causal, scale=scale
-            )
-            t_sdpa = timed(lambda: F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, is_causal=is_causal, scale=scale))
 
             for impl, name, tol in IMPLS:
                 try:
@@ -204,16 +216,16 @@ def main() -> int:
                         # No tensor-core / tile specialization for this
                         # head_dim (or no tile support in this build). The
                         # scalar row above already covered the case.
-                        print(row.format(label, name, "n/a", "-", "-", "-", "-", "-"))
+                        print(row.format(label, name, "n/a", "-", "-"))
                         continue
-                    print(row.format(label, name, "RAISED", str(exc)[:11],
-                                     "-", "-", "-", "-"))
+                    print(row.format(label, name, "RAISED",
+                                     str(exc)[:9], "-"))
                     failures.append(f"{label}/{name}")
                     continue
 
                 if custom.shape != ref.shape:
                     print(row.format(label, name, f"SHAPE{tuple(custom.shape)}",
-                                     "-", "-", "-", "-", "-"))
+                                     "-", "-"))
                     failures.append(f"{label}/{name}")
                     continue
 
@@ -229,7 +241,6 @@ def main() -> int:
                     failures.append(f"{label}/{name} packed")
 
                 d_ref = (custom.float() - ref.float()).abs().max().item()
-                d_sdpa = (custom.float() - sdpa.float()).abs().max().item()
                 t_custom = timed(lambda: kernels.fused_attention_forward(
                     q, k, v, attn_mask, is_causal, scale, impl))
 
@@ -240,14 +251,11 @@ def main() -> int:
                     label,
                     name,
                     f"{d_ref:.2e}" + ("!" if bad else ""),
-                    f"{d_sdpa:.2e}",
                     f"{t_custom:.3f}",
-                    f"{t_sdpa:.3f}",
-                    f"{t_sdpa / t_custom:.2f}x",
                     packed_cell,
                 ))
 
-    print("-" * 89)
+    print("-" * 60)
     if failures:
         print(f"FAILED: {', '.join(failures)}")
         return 1

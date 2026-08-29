@@ -32,7 +32,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kernel_ext  # noqa: E402
 
 import torch  # noqa: E402
-import torch.nn.functional as F  # noqa: E402
+
+from verify_kernel import reference_attention_f64  # noqa: E402
 
 DEV = torch.device("cuda")
 IMPL_WMMA = 2
@@ -139,9 +140,7 @@ def main() -> int:
         v = torch.randn(B, H, S, D, device=DEV, generator=gen)
         scale = D ** -0.5
 
-        ref = F.scaled_dot_product_attention(
-            q.double(), k.double(), v.double(), is_causal=True, scale=scale)
-        ref = ref.transpose(1, 2).flatten(2)
+        ref = reference_attention_f64(q, k, v, None, True, scale, layout=1)
 
         def run():
             return K.fused_attention_forward(q, k, v, None, True, scale,

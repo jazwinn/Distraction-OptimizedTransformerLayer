@@ -63,8 +63,6 @@ class MySelfAttention(nn.Module):
         # so has to fold them. The custom kernels never touch it. Plain
         # attributes, not buffers, so they stay out of state_dict() and strict
         # weight copying keeps working.
-        self._causal_mask_key: Optional[Tuple] = None
-        self._causal_mask: Optional[torch.Tensor] = None
 
         # Fused QKV projection cache. See _get_qkv_weight.
         self._qkv_key: Optional[Tuple] = None
@@ -95,14 +93,6 @@ class MySelfAttention(nn.Module):
             self._qkv_key = key
         return self._qkv_weight, self._qkv_bias
 
-    def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        key = (seq_len, device)
-        if self._causal_mask_key != key:
-            self._causal_mask = torch.ones(
-                seq_len, seq_len, device=device, dtype=torch.bool
-            ).tril()
-            self._causal_mask_key = key
-        return self._causal_mask
 
     def forward(
         self,
@@ -153,15 +143,11 @@ class MySelfAttention(nn.Module):
 
         # Already [B, S, d_model] -- see _attention_dispatch. No transpose or
         # reshape here any more; the kernel epilogue wrote this layout directly.
-        # The triangle is only ever wanted on the SDPA fallback, and only when
-        # both halves are live -- so the closure is built on the one path that
-        # can need it rather than allocated once per layer per forward pass on
-        # every path that cannot.
-        fold = ((lambda: self._get_causal_mask(seq_len, x.device))
-                if (use_mask and causal) else None)
+        # The cached [S, S] triangle that used to be threaded through here went
+        # with the SDPA fallback: only that path could not take the mask and the
+        # causal flag together, and it no longer exists.
         context = _attention_dispatch(
             q, k, v, attn_mask=attn_mask, is_causal=is_causal, scale=self.scale,
-            causal_mask=fold,
         )
         output = self.out_proj(context)
 

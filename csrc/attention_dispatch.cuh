@@ -142,82 +142,37 @@ bool launch_tile(const AttnArgs& a, tile_attn::MathMode math) {
         static_cast<float>(a.scale), math, at::cuda::getCurrentCUDAStream());
 }
 
-// Auto's kernel preferences, where "covers this case" and "is the fastest thing
-// available for it" come apart.
+// No prebuilt attention. Auto picks among the kernels in this file and nothing
+// else, and raises when none of them covers a case.
 //
-// The wmma kernel *covers* head_dim 128 -- it is correct there and it is what
-// --attn-impl wmma still gets -- but past a short sequence it loses to SDPA,
-// and it loses by more the longer the sequence gets. head_dim 128 gives each
-// warp a 16-fragment q_frag array, 128 registers of query before a single
-// accumulator is allocated, which is what forces the block down to 32x16: two
-// warps and about 36 KB, so an SM holds two blocks and 128 threads. There is
-// not enough in flight to cover the memory latency, and no block shape fixes it
-// while Q is register-resident.
+// This used to be a preference gate: "covers this case" and "is the fastest
+// thing available for it" came apart, and where they did, Auto handed the case
+// to at::scaled_dot_product_attention. Two of the fourteen grading shapes went
+// that way -- head_dim 256, and head_dim 128 at exactly S 128, where the gate
+// tested `S < 128` and S *is* 128, so it fell through to a clause needing
+// S >= 512 and declined. Neither was a coverage gap: wmma and scalar both
+// handle head_dim {8,16,32,64,128,256}. Only the speed preference sent them
+// away, and silently -- nothing in the output said which shapes had run on a
+// kernel this project did not write.
 //
-// Interleaved against SDPA, causal fp32, ratio > 1 meaning wmma is slower:
+// What removing it costs, measured 2026-08-29 on the two shapes affected,
+// causal, at their appendix dimensions:
 //
-//   S   32   0.42x    S  128   1.47x    S  512   1.52x
-//   S   64   0.98x    S  256   1.46x
+//   op level                 sdpa      wmma    scalar   wmma/sdpa
+//   B16 H4 S128 d256      184.9us   225.6us   734.2us      0.820x
+//   B16 H1 S128 d128       31.8us    31.6us   106.0us      1.009x
 //
-// The crossover is the sequence length at which SDPA's fixed per-launch cost
-// stops dominating, and it sits between 64 and 128 -- S 64 is a tie at the 4.3%
-// noise floor (0.98x at batch 8, 0.86x at batch 1), so the threshold is set at
-// the first length where the loss is unambiguous. float16 crosses earlier
-// (2.85x at S 128, where SDPA reaches its flash backend), so gating on
-// head_dim and length alone is conservative for the narrow dtypes rather than
-// wrong for them.
+//   whole model, 4 layers    auto      wmma       ratio
+//   d_model 1024 h4 S128   9.612ms   9.693ms    0.992x
+//   d_model 128  h1 S128   1.899ms   1.799ms    1.055x
 //
-// Below the threshold Auto keeps the wmma kernel, which is worth keeping: at
-// S 32 it is more than twice as fast as SDPA.
-// UPDATED once fp32 tensors started contracting in fp16 fragments. That is
-// worth 1.43x-1.54x at head_dim 128, which changes the verdict above rather
-// than merely improving it. Re-measured against SDPA, causal, sdpa/wmma so
-// ratio > 1 means the kernel wins:
+// So 0.8% on one shape and a 5.5% GAIN on the other -- the head_dim 128 shape
+// was being sent to SDPA for a loss that had stopped existing. wmma is the
+// first choice over scalar because scalar is 0.25x-0.30x of SDPA on both.
 //
-//   S   64   1.552x      S  256   1.028x      S  512   1.047x
-//   S  128   0.938x      S  384   1.027x      S 1024   1.081x
-//
-// So the kernel now wins at head_dim 128 everywhere EXCEPT a dip at exactly
-// S 128, which reproduced across runs (0.938x, 0.943x). Two consequences:
-//
-//   * The S < 128 clause stays. It was 2x at head_dim 128 before and is 1.55x
-//     now, for the same reason: SDPA's fixed launch cost.
-//   * A second clause admits head_dim 128 from S 512 up, where the margin is
-//     4.7%-8.1% -- comfortably past the +/-0.4% this comparison measured as its
-//     control. S 256 and 384 also win, by 2.8%, and are deliberately NOT
-//     claimed: that is close enough to the floor that it is not worth widening
-//     the rule for, and the band is left to SDPA.
-//
-// The dip at S 128 is the reason head_dim 128 is not simply admitted outright.
-// It is also the sequence length of most of the grading set, so getting it
-// wrong would cost exactly where it is measured.
-//
-// head_dim 256 is covered by every impl and claimed by none of them. The two
-// clauses above are both measurements at head_dim 128, and 256 is not a wider
-// version of that case -- it is a different one. The wmma kernel there runs a
-// 16x16 block, one warp, because Q and O are register-resident across the whole
-// head and the fragment geometry admits no smaller shape; the scalar kernel
-// splits each row over four lanes and drops to a 16-key tile. Both are coverage
-// for a forced --attn-impl, not candidates for the default path, so Auto keeps
-// SDPA here until something measures otherwise. Raise
-// kWmmaAutoMaxCandidateHeadDim when it does.
-constexpr int kWmmaAutoMaxHeadDim = 64;
-constexpr int kWmmaAutoMinSeqForSdpa = 128;
-constexpr int kWmmaAutoWideMinSeq = 512;
-constexpr int kWmmaAutoMaxCandidateHeadDim = 128;
-
-bool wmma_preferred_by_auto(const AttnArgs& a) {
-    if (a.head_dim > kWmmaAutoMaxCandidateHeadDim) {
-        return false;
-    }
-    if (a.head_dim <= kWmmaAutoMaxHeadDim || a.S < kWmmaAutoMinSeqForSdpa) {
-        return true;
-    }
-    // Only the fp16 fragments made the wide-head_dim case competitive; with
-    // tf32 it loses by 1.5x-2.1x at these lengths, so the clause is gated on
-    // the precision that earned it.
-    return wmma_fp16_flag() && a.S >= kWmmaAutoWideMinSeq;
-}
+// The measurements that used to justify the gate are kept in csrc/TUNING.md,
+// because they remain true statements about the kernel; they simply no longer
+// decide anything here.
 
 // Runs a kernel for this case, honouring what the caller asked for: for a
 // forced impl, that kernel or nothing; for Auto, the fastest kernel that both
@@ -236,12 +191,19 @@ bool run_kernel(Impl impl, const AttnArgs& a) {
         // separate programming model whose performance the caller should opt
         // into deliberately rather than inherit.
         case Impl::Auto:
-            // Declining here is not "no kernel covers this" -- it is a
-            // preference, and the caller's fallback is what it resolves to. The
-            // scalar kernel is not offered as the second choice at head_dim 128
-            // either: it is slower than wmma everywhere the two overlap.
-            return wmma_preferred_by_auto(a) &&
-                   (launch_wmma(a) || launch_scalar(a));
+            // No preference test any more. It used to ask whether wmma was the
+            // FASTEST way to serve the case and hand the rest to SDPA, which
+            // meant two of the fourteen grading shapes ran on a prebuilt
+            // attention -- head_dim 256, and head_dim 128 at exactly S 128,
+            // where the old gate's `S < 128` test missed by one. Both are
+            // covered by the kernels; only the speed preference sent them away.
+            //
+            // So Auto now asks only "does anything cover this", wmma first
+            // because it is faster than scalar everywhere the two overlap
+            // (0.25x-0.30x at the two shapes in question). Declining here now
+            // genuinely means no kernel covers the case, and the caller raises
+            // rather than substituting.
+            return launch_wmma(a) || launch_scalar(a);
     }
     return false;
 }
@@ -250,46 +212,6 @@ bool run_kernel(Impl impl, const AttnArgs& a) {
 // is a real repack -- which is exactly the cost the layout-1 kernels avoid.
 torch::Tensor to_bshd(const torch::Tensor& t) {
     return t.transpose(1, 2).reshape({t.size(0), t.size(2), t.size(1) * t.size(3)});
-}
-
-// The fallback for shapes and dtypes no kernel here specializes.
-//
-// SDPA, not the baseline's own matmul + softmax + matmul. That version mirrored
-// BaselineSelfAttention exactly, which read as the safe choice and was not:
-// it materializes the whole [B, H, S, S] score matrix, so the one path this
-// file takes when it has nothing better runs the *baseline's* algorithm and
-// inherits its memory traffic. SDPA runs a flash-style kernel instead and never
-// builds the score matrix. Interleaved against it at head_dim 256 causal
-// (measured while that was the only head_dim in the grading set no kernel
-// covered; every impl covers it now, but Auto still routes it here -- see
-// wmma_preferred_by_auto):
-//
-//   B8 H8 S32    3.91x     B8 H8 S128   1.37x     B8 H8 S512   1.30x
-//   B1 H8 S32    6.29x     B1 H8 S128   5.20x     B1 H8 S512   1.08x
-//
-// -- with the largest wins exactly where the score matrix is largest relative
-// to the work. Nothing measured was slower. The arithmetic differs from the
-// baseline's in the last bits (the same tf32 GEMMs, summed in a different
-// order), which is what every kernel in this file already does.
-torch::Tensor attention_sdpa(const torch::Tensor& q, const torch::Tensor& k,
-                             const torch::Tensor& v,
-                             const c10::optional<torch::Tensor>& attn_mask,
-                             bool is_causal, double scale) {
-    // SDPA rejects is_causal together with a mask, which this ABI deliberately
-    // allows -- so the fold the kernels no longer need happens here, for the
-    // shapes no kernel covers. It is the expensive form (an [S, S] triangle
-    // broadcast against the mask) and that is the trade: this path is already
-    // the one nothing specialises.
-    if (is_causal && attn_mask.has_value()) {
-        const int64_t S = q.size(2);
-        auto allowed = torch::ones({S, S}, attn_mask.value().options()).tril();
-        return at::scaled_dot_product_attention(
-            q, k, v, c10::optional<torch::Tensor>(attn_mask.value() & allowed),
-            /*dropout_p=*/0.0, /*is_causal=*/false, c10::optional<double>(scale));
-    }
-    return at::scaled_dot_product_attention(
-        q, k, v, attn_mask, /*dropout_p=*/0.0, is_causal,
-        c10::optional<double>(scale));
 }
 
 }  // namespace
@@ -448,18 +370,17 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
                         B, H, S, head_dim, causal, scale};
 
     if (!run_kernel(mode, args)) {
-        // Auto reaches here two ways -- nothing covers the case, or nothing
-        // covering it is the fastest way to serve it -- and SDPA finishes the
-        // job either way. Every *forced* impl declines loudly instead: asking
-        // for one specifically and quietly getting something else lets a
-        // benchmark time one kernel and report it as another.
+        // Auto now reaches here exactly one way: nothing covers the case. It
+        // used to reach it a second way -- something covered the case but SDPA
+        // was faster -- and quietly served that from at::scaled_dot_product_
+        // attention. Forced impls always declined loudly; Auto now does too.
         //
         // scalar used to be exempt, and the exemption did exactly the damage
         // it was warned about: it had no head_dim 128, so `--attn-impl scalar`
         // there was the fallback wearing the scalar kernel's name, in the
         // benchmark scripts and then in REPORT.md. Left behind this check now:
         // float64 past head_dim 16, and any head_dim nobody specialises.
-        TORCH_CHECK(mode == Impl::Auto,
+        TORCH_CHECK(false,
                     "fused_attention_forward: impl=", impl, " (", impl_name(mode),
                     ") does not cover dtype=", qc.scalar_type(),
                     ", head_dim=", head_dim, " on compute capability ",
@@ -469,19 +390,10 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
                     "shared memory for its key tiles (float64 runs out past 16); "
                     "wmma needs SM 8.0+ and head_dim in {8,16,32,64,128,256}; "
                     "the tile kernels need float32 and the same head_dim set. "
-                    "Use impl=0 (auto) to fall back to SDPA for this shape.");
+                    "There is deliberately no fallback: this build implements "
+                    "attention itself and will not silently hand a shape to a "
+                    "prebuilt one.");
 
-        // The strided views, not .contiguous() copies -- a measured tie, not an
-        // oversight. The fallback is the one consumer here that pays for a row
-        // pitch it did not ask for (1.41x-1.50x on short sequences, 1.01x by
-        // seq 2048), but cloning first costs the same 1.32x-1.54x on the same
-        // shapes. The copy is worth exactly what the strided reads are, so
-        // there is nothing to collect and an allocation to lose. Numbers in
-        // REPORT.md, measured when this path was the explicit matmul; SDPA
-        // makes its own copy when it wants one, so it is if anything less
-        // sensitive.
-        auto fallback_out = attention_sdpa(qc, kc, vc, mask, causal, scale);
-        return want_bshd ? to_bshd(fallback_out) : fallback_out;
     }
 
     cudaError_t err = cudaGetLastError();
