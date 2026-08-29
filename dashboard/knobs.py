@@ -15,6 +15,7 @@ Each entry records where the variable is read, so the claim is checkable:
     WMMA_FP16               csrc/attention_wmma.cuh      wmma_fp16_flag()
     WMMA_SOFTMAX_MODE       csrc/attention_wmma.cuh      softmax_mode_flag()
     WMMA_SPLIT_KV           csrc/attention_wmma.cuh      split_kv_flag()
+    WMMA_MASK_CLASSIFY      csrc/attention_wmma.cuh      mask_classify_flag()
     WMMA_SPLIT_COUNT        csrc/attention_wmma.cuh      split_count_override()
     WMMA_CAUSAL_REVERSE     csrc/attention_wmma.cuh      causal_reverse_flag()
     TILE_SPLIT_KV           csrc/tile_attention.cu       split_flag()
@@ -88,6 +89,19 @@ ENV_KNOBS: List[Dict[str, Any]] = [
                 "accuracy -- the default, worth 1.04x on the op. 2 also folds "
                 "scale*log2(e) into Q, which is a wash on speed and breaks the "
                 "2e-3 atol at head_dim 64; kept only so that can be re-checked.",
+    },
+    {
+        "name": "WMMA_MASK_CLASSIFY",
+        "label": "wmma per-tile mask classification",
+        "kind": "bool",
+        "default": True,
+        "source": "csrc/attention_wmma.cuh",
+        "help": "Classify each key tile once -- rows inside S, columns inside "
+                "S, wholly below the causal diagonal -- and skip the "
+                "per-element bounds, causal and mask tests on the interior "
+                "ones. Bit-identical either way, since it only skips tests "
+                "that would have passed. Worth 1.33x on the op and 1.05x end "
+                "to end.",
     },
     {
         "name": "WMMA_SPLIT_KV",

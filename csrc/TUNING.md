@@ -1241,6 +1241,149 @@ ceiling-vs-floor result warns against. One data point, deliberately not fitted.
 `B1 H8 S512 d32 c` is a smaller version of the same miss: 1.276x forced at n=2,
 declined at 0.46 waves.
 
+## Per-tile mask classification: 1.33x on the op, 1.05x end to end, bit-identical
+
+Every score element used to evaluate four predicates -- `i < S`, `gj < S`, the
+causal `gj > i`, and an explicit-mask lookup -- plus the address arithmetic
+under them. FlashAttention-2 does not do that. `mask.h` templates on
+`Is_even_MN` / `Is_causal` / `Col_idx_only` so interior tiles compile with no
+row-index computation at all, and only the diagonal block pays; the paper puts
+it as "for each row we only need apply the causal mask to 1 block".
+
+This is the same split, decided per (warp, key tile) at run time rather than at
+compile time, because BLOCK_N and the mask pointer are not compile-time
+constants here.
+
+`scripts/ab_mask_classify.py`, `scripts/verify_mask_classify.py`. Knob:
+`WMMA_MASK_CLASSIFY` / `wmma_set_mask_classify()`.
+
+### Why this was the target
+
+SASS on the key-tile loop body said so, before any of it was written: at
+head_dim 32 the body is **1089 instructions per thread, 16 of them HMMA**, and
+roughly 530 of the rest are integer address and predicate math. The two GEMMs
+are 1.5% of the instruction stream. See "The attention softmax in the base-2
+domain" above for the throughput arithmetic behind that.
+
+### What is classified
+
+Three clauses, all **warp-uniform** -- `q_base`, `kt` and `S` do not vary
+across a warp -- so the branch cannot diverge within one:
+
+- `rows_in`  every query row of the warp stripe is inside `S`
+- `cols_in`  every key column of the tile is inside `S`
+- `tri_free` the whole tile is below the causal diagonal, i.e. the largest
+  column it holds is still at most the smallest row the warp owns:
+  `kt + BLOCK_N - 1 <= q_base`
+
+An explicit mask disables the softmax fast path outright -- an arbitrary mask
+cannot be classified away.
+
+Both paths have to exist regardless; that IS the optimization. So the runtime
+flag that forces the slow one costs nothing the shipped kernel does not already
+carry, and no template parameter or extra instantiation was needed.
+
+The K/V staging gets its own, weaker classification: it only asks whether the
+tile is inside `S`, so it applies **even when there is an explicit mask**.
+
+### Results, op level, graph-timed, interleaved, symmetric sampling
+
+| shape | off us | on us | ratio |
+|:--|--:|--:|--:|
+| dense B8 H8 S512 d32 | 230.0 | 157.8 | 1.457x |
+| dense B8 H8 S1024 d32 | 863.0 | 585.3 | 1.474x |
+| dense B4 H8 S2048 d32 | 1682.7 | 1135.4 | **1.482x** |
+| dense B8 H16 S512 d16 | 282.4 | 196.4 | 1.438x |
+| dense B8 H8 S512 d64 | 377.0 | 297.9 | 1.266x |
+| causal B8 H8 S128 d32 | 14.0 | 11.3 | 1.234x |
+| causal B8 H8 S512 d32 | 158.0 | 112.4 | 1.406x |
+| causal B8 H8 S1024 d32 | 501.4 | 353.8 | 1.417x |
+| causal B4 H8 S2048 d32 | 921.4 | 636.7 | 1.447x |
+| causal B8 H16 S512 d16 | 174.8 | 128.4 | 1.362x |
+| causal B8 H8 S512 d64 | 248.0 | 206.6 | 1.200x |
+| causal B4 H8 S1024 d64 | 439.4 | 350.8 | 1.253x |
+| causal B8 H8 S500 d32 | 153.2 | 111.8 | 1.371x |
+| mask B8 H8 S512 d32 | 352.4 | 308.8 | 1.141x |
+| mask B8 H8 S512 d32 c | 215.8 | 193.2 | 1.117x |
+
+Geometric mean **1.332x**: dense **1.421x**, causal **1.333x**, masked
+**1.129x**. Self-control (`--self-control`, classification-off timed against
+itself, so every true ratio is 1.000x) reads **0.999x, 0.992x - 1.013x**. The
+smallest win here is nine times the noise floor.
+
+The ordering is the mechanism: dense shapes, where every interior tile
+qualifies, gain most; causal shapes, which have exactly one diagonal tile per
+block, gain slightly less; head_dim 64 gains least because BLOCK_N is 16 there,
+so the same predicate work is spread over half as many score elements per tile.
+
+**The masked group is not a control**, which is what a first pass assumed. An
+explicit mask kills only the softmax fast path; the K/V staging classification
+asks a different question and still applies. So those two rows isolate the
+staging half of the change at **~1.13x**, and the softmax half is the rest.
+
+### End to end, 6 layers, causal, ffn_dim == d_model
+
+| shape | off ms | on ms | ratio | max_abs |
+|:--|--:|--:|--:|--:|
+| B8 S1024 d256 h8 | 8.617 | 7.749 | **1.112x** | 0.0 |
+| B8 S512 d256 h8 | 3.931 | 3.685 | 1.067x | 0.0 |
+| B8 S128 d256 h8 | 1.029 | 0.988 | 1.041x | 0.0 |
+| B8 S512 d512 h8 | 10.324 | 9.927 | 1.040x | 0.0 |
+| B8 S128 d32 h4 | 0.214 | 0.206 | 1.037x | 0.0 |
+| B16 S128 d256 h8 | 1.945 | 1.935 | 1.005x | 0.0 |
+
+Geometric mean **1.050x**. Through the harness itself the speedup column moves
+**6.478x -> 7.348x**, **9.880x -> 11.485x** and **29.363x -> 31.308x**.
+
+### Bit-identical, and that is the right bar
+
+This removes tests whose outcome was already "pass". An interior tile is by
+definition one where every predicate would have been true, so the arithmetic is
+not merely equivalent -- it is the same arithmetic in the same order.
+
+`verify_mask_classify.py` checks **exact equality**, not a tolerance, over 85
+cases built to fail each clause in turn: `S` not a multiple of BLOCK_M (ragged
+query block), `S` not a multiple of BLOCK_N (ragged key tile), causal, dense,
+key-padding and full-row masks, both output layouts, and head_dim 8 where the
+operands pad 8 -> 16 so `DIM != PDIM`. All 85 bit-identical.
+
+Through the harness, `max_abs` **and** `max_rel` are identical to every digit
+with the flag on and off -- `max_rel` especially, since it is dominated by
+near-zero denominators and would move under any reordering at all.
+
+### Registers went down, not up
+
+The obvious worry is that carrying two paths costs registers and therefore
+occupancy. Measured with `cuobjdump -res-usage`, it does the opposite:
+
+| head_dim | before | after |
+|--:|--:|--:|
+| 16 | 105 | 96 |
+| 32 | 102 | 76 |
+| 64 | 128 | 128 |
+
+`LOCAL:0` throughout. The fast path has no predicates to keep alive across the
+unrolled score loop, so the register pressure that dominated the old body is
+simply gone on the tiles that take it.
+
+### The measurement trap: a cross-process ablation reported the impossible
+
+The prize was supposed to be bounded first by an ablation -- strip the
+predicates entirely, keep the work identical, time it. Built and timed in a
+separate process from the real kernel, it produced rows like:
+
+| shape | ablated | real |
+|:--|--:|--:|
+| B8 H8 S1024 d32 dense | 1116.2 us | 828.6 us |
+| B8 H16 S512 d16 causal | 289.2 us | 159.1 us |
+
+The ablated build **cannot** be slower than the real one; it does strictly less
+work for the same answer shape. Both rows are contamination, and the whole
+table was discarded. A compile-time ablation cannot be timed against its
+baseline in one process, which is exactly why every other measurement here is a
+runtime flag. **Build the A/B as a runtime switch from the start; a
+compile-time ablation is not worth the process it has to run in.**
+
 ## fused_add_layernorm: two block reductions instead of three
 
 The block-per-row kernel reduced `sum(c)` and `sum(c*c)` separately, though both

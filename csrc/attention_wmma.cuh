@@ -377,6 +377,31 @@ int& softmax_mode_flag() {
     return mode;
 }
 
+// Per-tile mask classification. Every score element used to evaluate its own
+// bounds, causal and mask tests -- four predicates and the address arithmetic
+// under them, on every element of every key tile. FlashAttention-2 does not:
+// `mask.h` templates on Is_even_MN / Is_causal / Col_idx_only so that interior
+// tiles compile with no row-index computation at all, and only the diagonal
+// block pays.
+//
+// The same split is available here at run time rather than compile time,
+// because BLOCK_N and the mask pointer are not compile-time constants. A key
+// tile needs no test at all when its rows are all inside S, its columns are
+// all inside S, the whole tile is below the causal diagonal, and there is no
+// explicit mask. All of those are warp-uniform -- q_base, kt and S are -- so
+// the branch never diverges within a warp.
+//
+// Both paths have to exist regardless: that is what the optimization IS. The
+// flag only forces the slow one, so an A/B costs nothing that the shipped
+// kernel does not already carry. Same knob contract as causal_reverse_flag().
+bool& mask_classify_flag() {
+    static bool on = [] {
+        const char* e = std::getenv("WMMA_MASK_CLASSIFY");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    return on;
+}
+
 // Split-KV (Flash-Decoding). The attention grid is (ceil(S/BLOCK_M), H, B) --
 // query side only -- so nothing in it scales with the KEY length. A shape with
 // few queries and many keys launches a small grid whose blocks each do a lot of
@@ -501,7 +526,8 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
                                  float* __restrict__ part_l,
                                  int B, int H, int S,
                                  bool is_causal, float scale,
-                                 bool out_bshd, bool reverse_m, int splits) {
+                                 bool out_bshd, bool reverse_m, int splits,
+                                 bool classify) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using Cfg = WmmaCfg<compute_t, HEAD_DIM>;
     using frag_elem = typename FragTraits<compute_t>::elem;
@@ -705,6 +731,11 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
     // state -- o_frag is zero-filled, m is -inf, l is 0 -- which the combine
     // pass weights to exactly zero. Cheaper than a launch-time special case,
     // and impossible to get wrong.
+    // Loop-invariant half of the tile classification below: whether every
+    // query row this warp owns is inside S. It depends on q_base and S only,
+    // so it is decided once rather than per key tile.
+    const bool rows_in = (q_base + RPW) <= S;
+
     int kt_begin = 0;
     int kt_end   = key_limit;
     if (splits > 1) {
@@ -723,15 +754,34 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
         // the scores anyway, but a NaN in v_s would survive `0 * v` in GEMM2.
         const scalar_t* k_base = k + bh_off + static_cast<int64_t>(kt) * qs2;
         const scalar_t* v_base = v + bh_off + static_cast<int64_t>(kt) * qs2;
-        for (int idx = tid; idx < BLOCK_N * PDIM; idx += Cfg::NTHREADS) {
-            const int r = idx / PDIM;
-            const int c = idx - r * PDIM;
-            const bool inb = ((kt + r) < S) && (c < DIM);
-            const int64_t g = static_cast<int64_t>(r) * qs2 + c;
-            k_s[r * KV_LD + c] =
-                inb ? dev_of_float<compute_t>(dev_to_float(k_base[g])) : zero_v;
-            v_s[r * KV_LD + c] =
-                inb ? dev_of_float<compute_t>(dev_to_float(v_base[g])) : zero_v;
+        // Is every key column of this tile inside S? Both the staging below and
+        // the softmax further down want the answer, so it is computed once.
+        const bool cols_in = (kt + BLOCK_N) <= S;
+
+        // A whole key tile inside S needs no per-element bounds test, and at
+        // every head_dim but 8 the column test is compile-time true anyway.
+        const bool kv_plain = classify && cols_in && (DIM == PDIM);
+        if (kv_plain) {
+            for (int idx = tid; idx < BLOCK_N * PDIM; idx += Cfg::NTHREADS) {
+                const int r = idx / PDIM;
+                const int c = idx - r * PDIM;
+                const int64_t g = static_cast<int64_t>(r) * qs2 + c;
+                k_s[r * KV_LD + c] =
+                    dev_of_float<compute_t>(dev_to_float(k_base[g]));
+                v_s[r * KV_LD + c] =
+                    dev_of_float<compute_t>(dev_to_float(v_base[g]));
+            }
+        } else {
+            for (int idx = tid; idx < BLOCK_N * PDIM; idx += Cfg::NTHREADS) {
+                const int r = idx / PDIM;
+                const int c = idx - r * PDIM;
+                const bool inb = ((kt + r) < S) && (c < DIM);
+                const int64_t g = static_cast<int64_t>(r) * qs2 + c;
+                k_s[r * KV_LD + c] =
+                    inb ? dev_of_float<compute_t>(dev_to_float(k_base[g])) : zero_v;
+                v_s[r * KV_LD + c] =
+                    inb ? dev_of_float<compute_t>(dev_to_float(v_base[g])) : zero_v;
+            }
         }
         __syncthreads();
 
@@ -777,24 +827,51 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
             const int c0 = sh * COLS_PER_LANE;
             const float* s_row = s_s + r * S_LD;
 
+            // Does this key tile need any test at all? Every clause is
+            // warp-uniform: q_base, kt and S do not vary across the warp, so
+            // this branch cannot diverge.
+            //
+            //   rows_in  every query row of the warp stripe is inside S
+            //            (hoisted above the key loop -- it does not vary)
+            //   cols_in  every key column of the tile is inside S
+            //            (computed once per tile, shared with the staging)
+            //   tri_free the whole tile sits below the causal diagonal --
+            //            the largest column it holds is still <= the smallest
+            //            row the warp owns
+            //
+            // Under causal only the diagonal tile of each block fails
+            // tri_free, which is the "for each row we only need apply the
+            // causal mask to 1 block" observation from FlashAttention-2.
+            const bool tri_free = !is_causal || ((kt + BLOCK_N - 1) <= q_base);
+            const bool plain    = classify && rows_in && cols_in && tri_free &&
+                                  (mask == nullptr);
+
             float sv[COLS_PER_LANE];
             float local_max = -INFINITY;
-            #pragma unroll
-            for (int t = 0; t < COLS_PER_LANE; ++t) {
-                const int col = c0 + t;
-                const int gj = kt + col;
-                bool ok = (i < S) && (gj < S);
-                if (ok && is_causal && gj > i) ok = false;
-                if (ok && mask != nullptr &&
-                    !mask[mask_bh + static_cast<int64_t>(i) * ms2 +
-                          static_cast<int64_t>(gj) * ms3]) {
-                    ok = false;
+            if (plain) {
+                #pragma unroll
+                for (int t = 0; t < COLS_PER_LANE; ++t) {
+                    // EXP2 folded `scale * log2e` into Q, so the score already
+                    // carries both and arrives in the base-2 domain.
+                    sv[t] = FOLD_Q ? s_row[c0 + t] : (s_row[c0 + t] * s_mul);
+                    local_max = fmaxf(local_max, sv[t]);
                 }
-                // EXP2 folded `scale * log2e` into Q, so the score already
-                // carries both and arrives in the base-2 domain.
-                sv[t] = ok ? (FOLD_Q ? s_row[col] : (s_row[col] * s_mul))
-                           : -INFINITY;
-                local_max = fmaxf(local_max, sv[t]);
+            } else {
+                #pragma unroll
+                for (int t = 0; t < COLS_PER_LANE; ++t) {
+                    const int col = c0 + t;
+                    const int gj = kt + col;
+                    bool ok = (i < S) && (gj < S);
+                    if (ok && is_causal && gj > i) ok = false;
+                    if (ok && mask != nullptr &&
+                        !mask[mask_bh + static_cast<int64_t>(i) * ms2 +
+                              static_cast<int64_t>(gj) * ms3]) {
+                        ok = false;
+                    }
+                    sv[t] = ok ? (FOLD_Q ? s_row[col] : (s_row[col] * s_mul))
+                               : -INFINITY;
+                    local_max = fmaxf(local_max, sv[t]);
+                }
             }
 
             float mx = local_max;
@@ -1120,7 +1197,7 @@ void launch_wmma_kernel_as(const torch::Tensor& q, const torch::Tensor& k,
             reinterpret_cast<scalar_t*>(out.data_ptr()),
             part_o, part_m, part_l,
             B, H, S, is_causal, static_cast<float>(scale), out_bshd,
-            reverse_m, splits);
+            reverse_m, splits, mask_classify_flag());
 
     if (splits > 1) {
         // The combine has to exponentiate in the domain the kernel stored its

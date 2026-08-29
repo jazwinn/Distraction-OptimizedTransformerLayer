@@ -218,6 +218,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("wmma_softmax_mode",
           []() { return softmax_mode_flag(); },
           "Which softmax mode the wmma attention kernel is currently using");
+    m.def("wmma_set_mask_classify",
+          [](bool on) { mask_classify_flag() = on; },
+          "Classify each key tile once and skip the per-element bounds, "
+          "causal and mask tests on the interior ones (true, the default), or "
+          "test every score element the old way (false). Identical results "
+          "either way; runtime-settable so both can be timed in one process.",
+          pybind11::arg("on"));
+    m.def("wmma_mask_classify_enabled",
+          []() { return mask_classify_flag(); },
+          "Whether per-tile mask classification is currently on");
     m.def("wmma_set_split_kv",
           [](bool on) { split_kv_flag() = on; },
           "Enable/disable the wmma kernel split-KV (Flash-Decoding) path. "
