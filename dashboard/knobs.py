@@ -14,6 +14,8 @@ Each entry records where the variable is read, so the claim is checkable:
 
     WMMA_FP16               csrc/attention_wmma.cuh      wmma_fp16_flag()
     WMMA_SOFTMAX_MODE       csrc/attention_wmma.cuh      softmax_mode_flag()
+    WMMA_SPLIT_KV           csrc/attention_wmma.cuh      split_kv_flag()
+    WMMA_SPLIT_COUNT        csrc/attention_wmma.cuh      split_count_override()
     WMMA_CAUSAL_REVERSE     csrc/attention_wmma.cuh      causal_reverse_flag()
     TILE_SPLIT_KV           csrc/tile_attention.cu       split_flag()
     LAYERNORM_FUSED_REDUCE  csrc/add_layernorm.cuh
@@ -86,6 +88,29 @@ ENV_KNOBS: List[Dict[str, Any]] = [
                 "accuracy -- the default, worth 1.04x on the op. 2 also folds "
                 "scale*log2(e) into Q, which is a wash on speed and breaks the "
                 "2e-3 atol at head_dim 64; kept only so that can be re-checked.",
+    },
+    {
+        "name": "WMMA_SPLIT_KV",
+        "label": "wmma split-KV (Flash-Decoding)",
+        "kind": "bool",
+        "default": True,
+        "source": "csrc/attention_wmma.cuh",
+        "help": "Split the key range across extra blocks when the attention "
+                "grid is too small to fill the card. Gated hard: head_dim > 8, "
+                "at most an eighth of the card in use, and at least 4 key "
+                "tiles to divide. Worth 1.7x-2.7x on the op and 1.18x-1.39x "
+                "end to end at batch 1 with head_dim 64; every other shape is "
+                "declined and runs the single-pass kernel unchanged.",
+    },
+    {
+        "name": "WMMA_SPLIT_COUNT",
+        "label": "wmma split count override",
+        "kind": "int",
+        "default": 0,
+        "source": "csrc/attention_wmma.cuh",
+        "help": "Force a split count instead of the measured rule; 0 restores "
+                "the rule. Counts the rule declines are usually slower -- this "
+                "is here to re-measure that, not to tune with.",
     },
     {
         "name": "LAYERNORM_FUSED_REDUCE",

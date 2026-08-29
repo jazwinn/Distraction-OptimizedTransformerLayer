@@ -18,6 +18,12 @@
 // in the inner loop is the K/V tile, the score tile, and the fragment reads
 // that feed the MMA units.
 //
+// When the grid is too small to fill the card -- the grid is query-side only,
+// so a small batch with a long key range leaves most SMs idle -- the launcher
+// splits the key range across extra blocks and a second pass folds the partial
+// softmaxes together. That path is decided before the launch, not fallen back
+// to: see wmma_split_count() and wmma_split_combine_kernel() below.
+//
 // Every 2-D tile in shared memory is stored with a padded leading dimension.
 // A fragment load walks a column of the tile, so an unpadded row stride of 16,
 // 32 or 64 floats puts every row of the fragment in the same shared-memory
@@ -36,6 +42,7 @@
 
 #include <cstdlib>
 #include <type_traits>
+#include <vector>
 
 namespace {
 
@@ -315,6 +322,105 @@ int& softmax_mode_flag() {
     return mode;
 }
 
+// Split-KV (Flash-Decoding). The attention grid is (ceil(S/BLOCK_M), H, B) --
+// query side only -- so nothing in it scales with the KEY length. A shape with
+// few queries and many keys launches a small grid whose blocks each do a lot of
+// serial work, and the card sits idle. Splitting the key range across extra
+// blocks trades a second pass for parallelism that was not otherwise reachable.
+//
+// Measured on this card (scripts/bench_wmma_occupancy.py): b1 h8 s128 d32 runs
+// 16 blocks against 138 resident, 12% of the card, at 5.7x the per-block cost
+// of the same kernel at a batch that fills it.
+//
+// Same knob contract as causal_reverse_flag().
+bool& split_kv_flag() {
+    static bool on = [] {
+        const char* e = std::getenv("WMMA_SPLIT_KV");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    return on;
+}
+
+// Forces a split count for sweeps; 0 restores the rule below. This is how the
+// rule's constants were chosen, so it stays reachable.
+int& split_count_override() {
+    static int n = [] {
+        const char* e = std::getenv("WMMA_SPLIT_COUNT");
+        return (e != nullptr) ? std::atoi(e) : 0;
+    }();
+    return n;
+}
+
+// Key tiles the AVERAGE block walks. Under causal a block's key range ends at
+// its own last row, so across m-tiles it averages half the dense count -- and
+// it is the average, not the maximum, that decides whether a split has
+// anything to divide.
+int split_key_tiles(int S, int block_n, bool is_causal) {
+    const int dense = (S + block_n - 1) / block_n;
+    return is_causal ? ((dense + 1) / 2) : dense;
+}
+
+// A split group shares an m-tile, so it also shares that m-tile's Q and its
+// slice of K/V in L2. More than this and the partial workspace and the combine
+// pass start costing more than the parallelism is worth.
+constexpr int kMaxSplits = 8;
+
+// How many ways to cut the key range, or 1 for "do not".
+int wmma_split_count(int blocks, int resident, int n_kt, int head_dim) {
+    const int forced = split_count_override();
+    if (forced > 0) return forced;
+    if (!split_kv_flag()) return 1;
+    // head_dim 8 pads its operands to 16, so the fragments are half zeros and
+    // there is no dense key loop to redistribute in the first place.
+    if (head_dim <= 8) return 1;
+    if (blocks <= 0 || resident <= 0) return 1;
+
+    // An eighth of the card or less. This is the clause the sweep bought, and
+    // it is deliberately stricter than "there is spare capacity": splitting
+    // adds a whole second kernel launch, and unless the grid is very small
+    // that launch costs more than the shortened key loop saves. Measured with
+    // the count the rule itself picks (scripts/ab_wmma_split_kv.py):
+    //
+    //   shape                blocks  waves  ratio
+    //   B1 H4 S128  d32 c         8  0.06   1.122x
+    //   B1 H8 S128  d32 c        16  0.12   1.079x
+    //   B1 H8 S128  d64 c        16  0.12   1.582x
+    //   B1 H4 S256  d64 c        16  0.12   2.526x
+    //   B2 H8 S128  d32 c        32  0.23   0.898x   <- declined by this clause
+    //   B4 H8 S128  d32 c        64  0.46   0.779x   <- declined
+    //   B1 H8 S512  d64 c        64  0.46   0.955x   <- declined
+    //
+    // A looser `blocks * 4 <= resident` admits the 0.898x row, and admitting
+    // long key loops with an `n_kt >= 16` clause admits the 0.955x one. Both
+    // were tried and both lose.
+    if (blocks * 8 > resident) return 1;
+
+    // And there has to be a key loop worth dividing. Splitting adds a whole
+    // combine launch per call -- six per forward in a six-layer model -- and
+    // halving a two-tile loop does not repay it. This clause is the one the
+    // END-TO-END measurement bought, and it overrides what the op alone says:
+    //
+    //   shape                 head_dim n_kt  op      end to end
+    //   B1 S128 d512 h8             64    4  1.807x  1.061x
+    //   B1 S128 d256 h8             32    2  1.084x  0.963x   <- declined here
+    //
+    // The op-level win at n_kt 2 is real and still does not survive the extra
+    // launch once it is paid once per layer instead of amortised over a graph
+    // full of back-to-back attention calls.
+    if (n_kt < 4) return 1;
+
+    // FLOOR, never ceiling: a count that overfills the card serialises the
+    // extra blocks into a second wave AND pays the combine pass for it.
+    int n = resident / blocks;
+    if (n < 2) return 1;
+
+    // Cannot usefully cut a key range into more pieces than it has tiles; the
+    // surplus splits come up empty and only add blocks and combine terms.
+    if (n > n_kt) n = n_kt;
+    if (n > kMaxSplits) n = kMaxSplits;
+    return (n < 2) ? 1 : n;
+}
+
 // `scalar_t` is what q/k/v/out are in GLOBAL memory; `compute_t` is what the
 // shared tiles hold and the fragments contract in. They were one type until
 // fp16 was measured against tf32: both carry a 10-bit mantissa, so an fp32
@@ -335,9 +441,12 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
                                  int64_t ms0, int64_t ms1,
                                  int64_t ms2, int64_t ms3,
                                  scalar_t* __restrict__ out,
+                                 float* __restrict__ part_o,
+                                 float* __restrict__ part_m,
+                                 float* __restrict__ part_l,
                                  int B, int H, int S,
                                  bool is_causal, float scale,
-                                 bool out_bshd, bool reverse_m) {
+                                 bool out_bshd, bool reverse_m, int splits) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using Cfg = WmmaCfg<compute_t, HEAD_DIM>;
     using frag_elem = typename FragTraits<compute_t>::elem;
@@ -400,9 +509,22 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
     // the long ones first. grid.x *is* n_m here (unlike the tile kernel, whose
     // grid.x is n_m * splits), so gridDim.x needs no rederivation. Dense has no
     // such spread and keeps the identity mapping -- see csrc/TUNING.md.
-    const int m_tile = reverse_m ? (static_cast<int>(gridDim.x) - 1 -
-                                    static_cast<int>(blockIdx.x))
-                                 : static_cast<int>(blockIdx.x);
+    //
+    // Under split-KV grid.x carries both axes: a grid has only three and y/z
+    // are spoken for by heads and batch. `splits` consecutive blocks share an
+    // m-tile, which keeps the K/V that a split group reads adjacent in L2.
+    //
+    // reverse_m and splits are mutually exclusive by construction -- the
+    // reversal only fires above one wave and the split only below one -- but
+    // n_m is derived rather than assumed, so the two compose if that changes.
+    const int n_m = static_cast<int>(gridDim.x) / splits;
+    int m_lane = static_cast<int>(blockIdx.x);
+    int split  = 0;
+    if (splits > 1) {
+        split  = m_lane % splits;
+        m_lane = m_lane / splits;
+    }
+    const int m_tile = reverse_m ? (n_m - 1 - m_lane) : m_lane;
     const int h      = blockIdx.y;
     const int b      = blockIdx.z;
 
@@ -517,7 +639,27 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
     // and thrown away.
     const int key_limit = is_causal ? min(S, m_tile * BLOCK_M + BLOCK_M) : S;
 
-    for (int kt = 0; kt < key_limit; kt += BLOCK_N) {
+    // Each split takes a contiguous run of whole key tiles out of *this
+    // block's* range, not out of [0, S). That is what makes split-KV work
+    // under causal masking: slicing the dense range instead would leave the
+    // later splits of an early m-tile with nothing to do while a late m-tile
+    // still carried its whole range.
+    //
+    // A split can still come up empty, when a block has fewer key tiles than
+    // there are splits. It falls through the loop and stores its initial
+    // state -- o_frag is zero-filled, m is -inf, l is 0 -- which the combine
+    // pass weights to exactly zero. Cheaper than a launch-time special case,
+    // and impossible to get wrong.
+    int kt_begin = 0;
+    int kt_end   = key_limit;
+    if (splits > 1) {
+        const int n_kt = (key_limit + BLOCK_N - 1) / BLOCK_N;
+        const int per  = (n_kt + splits - 1) / splits;
+        kt_begin = min(split * per * BLOCK_N, key_limit);
+        kt_end   = min(kt_begin + per * BLOCK_N, key_limit);
+    }
+
+    for (int kt = kt_begin; kt < kt_end; kt += BLOCK_N) {
         __syncthreads();  // everyone is done reading the previous k_s/v_s
 
         // head_dim is stride-1 whatever the caller's layout, so a key row is
@@ -700,32 +842,150 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
         }
     }
 
-    // --- normalize and write out --------------------------------------------
-    // l == 0 means every key was masked. The reference produces NaN there;
-    // emit 0 instead, since such rows are zero-filled downstream anyway.
-    #pragma unroll
-    for (int n = 0; n < N_TILES; ++n) {
+    // --- write out ----------------------------------------------------------
+    if (splits > 1) {
+        // Unnormalised on purpose: 1/l is only knowable once every split's l
+        // has been rebased onto the max over all splits, which is the combine
+        // pass's job. Storing a normalised partial here would be wrong, not
+        // merely wasteful.
         #pragma unroll
-        for (int t = 0; t < ACC_ELEMS; ++t) {
-            const float lr = l_s[row_base + acc_row[t]];
-            o_frag[n].x[t] *= (lr > 0.0f) ? (1.0f / lr) : 0.0f;
+        for (int n = 0; n < N_TILES; ++n) {
+            wm::store_matrix_sync(o_s + static_cast<size_t>(row_base) * O_LD + n * 16,
+                                  o_frag[n], O_LD, wm::mem_row_major);
         }
-        wm::store_matrix_sync(o_s + static_cast<size_t>(row_base) * O_LD + n * 16,
-                              o_frag[n], O_LD, wm::mem_row_major);
-    }
-    __syncwarp();
+        __syncwarp();
 
-    for (int rr = 0; rr < RPW; ++rr) {
-        const int i = q_base + rr;
-        if (i >= S) break;
-        const int r = row_base + rr;
-        // Columns past DIM exist only to fill the fragment; they are dropped.
-        scalar_t* out_row = out + out_base(out_bshd, b, h, i, H, S, DIM);
-        for (int c = lane; c < DIM; c += 32) {
-            dev_from_float(out_row[c], o_s[r * O_LD + c]);
+        // [B, H, splits, S, DIM] for O and [B, H, splits, S] for the two row
+        // statistics: the split axis sits between (b, h) and s, so one split's
+        // writes stay contiguous.
+        const int64_t part_bh =
+            (static_cast<int64_t>(b) * H + h) * splits + split;
+        const int64_t row0 = part_bh * S;
+        for (int rr = 0; rr < RPW; ++rr) {
+            const int i = q_base + rr;
+            if (i >= S) break;
+            const int r = row_base + rr;
+            float* po = part_o + (row0 + i) * DIM;
+            for (int c = lane; c < DIM; c += 32) {
+                po[c] = o_s[r * O_LD + c];
+            }
+            if (lane == 0) {
+                part_m[row0 + i] = m_s[r];
+                part_l[row0 + i] = l_s[r];
+            }
+        }
+    } else {
+        // l == 0 means every key was masked. The reference produces NaN there;
+        // emit 0 instead, since such rows are zero-filled downstream anyway.
+        #pragma unroll
+        for (int n = 0; n < N_TILES; ++n) {
+            #pragma unroll
+            for (int t = 0; t < ACC_ELEMS; ++t) {
+                const float lr = l_s[row_base + acc_row[t]];
+                o_frag[n].x[t] *= (lr > 0.0f) ? (1.0f / lr) : 0.0f;
+            }
+            wm::store_matrix_sync(o_s + static_cast<size_t>(row_base) * O_LD + n * 16,
+                                  o_frag[n], O_LD, wm::mem_row_major);
+        }
+        __syncwarp();
+
+        for (int rr = 0; rr < RPW; ++rr) {
+            const int i = q_base + rr;
+            if (i >= S) break;
+            const int r = row_base + rr;
+            // Columns past DIM exist only to fill the fragment; dropped here.
+            scalar_t* out_row = out + out_base(out_bshd, b, h, i, H, S, DIM);
+            for (int c = lane; c < DIM; c += 32) {
+                dev_from_float(out_row[c], o_s[r * O_LD + c]);
+            }
         }
     }
 #endif
+}
+
+// Second pass of split-KV: fold the per-split partials into the finished row.
+//
+// The key-loop rescale, one level up. Each split reports the max over its own
+// slice, so every partial is re-based onto the max over all slices before its
+// numerator and denominator are added. USE_EXP2 has to match the kernel's
+// softmax mode, because that is the domain the stored maxima are in.
+//
+// Plain CUDA rather than anything clever: one reduction of `splits` terms per
+// output element, with no matmul in it. One thread per (row, head_dim element)
+// and blockDim.y rows per block, so a warp stays contiguous in head_dim and
+// the writes coalesce exactly as the single-pass kernel's do.
+template <typename scalar_t, int HEAD_DIM, bool USE_EXP2>
+__global__ void wmma_split_combine_kernel(const float* __restrict__ part_o,
+                                          const float* __restrict__ part_m,
+                                          const float* __restrict__ part_l,
+                                          scalar_t* __restrict__ out,
+                                          int H, int S, int splits,
+                                          bool out_bshd, int64_t n_rows) {
+    const int d = static_cast<int>(threadIdx.x);
+    const int64_t row =
+        static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+    if (row >= n_rows) return;
+
+    const int64_t bh = row / S;
+    const int64_t sq = row - bh * S;
+    const int b = static_cast<int>(bh / H);
+    const int h = static_cast<int>(bh - static_cast<int64_t>(b) * H);
+    const int64_t base = bh * splits * S + sq;
+
+    float m_g = -INFINITY;
+    for (int j = 0; j < splits; ++j) {
+        m_g = fmaxf(m_g, part_m[base + static_cast<int64_t>(j) * S]);
+    }
+
+    scalar_t* out_row =
+        out + out_base(out_bshd, b, h, static_cast<int>(sq), H, S, HEAD_DIM);
+
+    // Every split of this row was empty or entirely masked.
+    if (m_g == -INFINITY) {
+        dev_from_float(out_row[d], 0.0f);
+        return;
+    }
+
+    float l_g = 0.0f;
+    float o_g = 0.0f;
+    for (int j = 0; j < splits; ++j) {
+        const int64_t off = base + static_cast<int64_t>(j) * S;
+        // <= 1 by construction, and exactly 0 for an empty split, whose stored
+        // max is -inf and whose stored O is the zero the fragment started at.
+        const float w = attn_exp<USE_EXP2>(part_m[off] - m_g);
+        l_g += w * part_l[off];
+        o_g += w * part_o[off * HEAD_DIM + d];
+    }
+    dev_from_float(out_row[d], (l_g > 0.0f) ? (o_g / l_g) : 0.0f);
+}
+
+// Blocks of this kernel instantiation the whole card can hold at once.
+//
+// From the occupancy API rather than from dividing the SM's shared memory by
+// Cfg::SMEM, because registers can bind before shared memory does and only the
+// driver knows which. It is a property of (kernel, threads, smem) -- all three
+// compile-time constants here -- so it is queried once per instantiation
+// rather than per launch.
+//
+// Two callers want it: the causal block reversal, which only pays when there
+// is a queue to reorder, and the split-KV gate, which only pays when there is
+// idle capacity to fill. They are opposite questions about the same number, so
+// it lives in one place.
+template <typename scalar_t, typename compute_t, int HEAD_DIM, int MODE>
+int wmma_resident_blocks() {
+    using Cfg = WmmaCfg<compute_t, HEAD_DIM>;
+    static const int resident = [] {
+        int per_sm = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &per_sm,
+                fused_attention_wmma_kernel<scalar_t, compute_t, HEAD_DIM, MODE>,
+                Cfg::NTHREADS, Cfg::SMEM) != cudaSuccess) {
+            return 0;   // unknown -> every gate below reads "do not"
+        }
+        return per_sm * at::cuda::getCurrentDeviceProperties()
+                            ->multiProcessorCount;
+    }();
+    return resident;
 }
 
 template <typename scalar_t, typename compute_t, int HEAD_DIM, int MODE>
@@ -746,36 +1006,69 @@ void launch_wmma_kernel_as(const torch::Tensor& q, const torch::Tensor& k,
     // measured 0.933x. Above one wave the late blocks are the expensive ones
     // and LPT bites: b1 h8 s2048 d64 at 256 blocks measured 1.101x.
     //
-    // The capacity comes from the occupancy API rather than from dividing
-    // 100 KB by Cfg::SMEM, because registers can bind before shared memory does
-    // and only the driver knows which. It is a property of (kernel, threads,
-    // smem) -- all three compile-time constants here -- so it is queried once
-    // per instantiation, not per launch.
-    static const int resident = [] {
-        int per_sm = 0;
-        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &per_sm,
-                fused_attention_wmma_kernel<scalar_t, compute_t, HEAD_DIM, MODE>,
-                Cfg::NTHREADS, Cfg::SMEM) != cudaSuccess) {
-            return 0;   // unknown -> never reverse, i.e. keep today's mapping
-        }
-        return per_sm * at::cuda::getCurrentDeviceProperties()
-                            ->multiProcessorCount;
-    }();
-    const int blocks = static_cast<int>(grid.x) * H * B;
+    // The capacity comes from wmma_resident_blocks(); see the note there.
+    const int resident =
+        wmma_resident_blocks<scalar_t, compute_t, HEAD_DIM, MODE>();
+    const int n_m = static_cast<int>(grid.x);
+    const int blocks = n_m * H * B;
     const bool reverse_m = Cfg::REVERSE_CAUSAL && is_causal &&
                            causal_reverse_flag() && blocks > resident;
 
+    // Split-KV asks the opposite question the reversal does -- is there idle
+    // capacity, rather than is there a queue -- off the same `resident`.
+    const int splits = wmma_split_count(
+        blocks, resident, split_key_tiles(S, Cfg::BLOCK_N, is_causal), HEAD_DIM);
+
+    float* part_o = nullptr;
+    float* part_m = nullptr;
+    float* part_l = nullptr;
+    at::Tensor ws;
+    if (splits > 1) {
+        // ONE allocation, three views into it. Three separate at::empty calls
+        // cost enough host time at these sizes to swamp the device win: the op
+        // read 0.882x eager with three and 0.932x with one, for byte-identical
+        // device work. From torch's caching allocator rather than cudaMalloc so
+        // it is stream-ordered and draws on the pool already being accounted.
+        const int64_t rows =
+            static_cast<int64_t>(B) * H * splits * S;
+        ws = at::empty({rows * (HEAD_DIM + 2)}, q.options().dtype(at::kFloat));
+        part_o = ws.data_ptr<float>();
+        part_m = part_o + rows * HEAD_DIM;
+        part_l = part_m + rows;
+    }
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const dim3 launch_grid(static_cast<unsigned>(n_m * splits), H, B);
+
     fused_attention_wmma_kernel<scalar_t, compute_t, HEAD_DIM, MODE>
-        <<<grid, block, Cfg::SMEM, at::cuda::getCurrentCUDAStream()>>>(
+        <<<launch_grid, block, Cfg::SMEM, stream>>>(
             reinterpret_cast<const scalar_t*>(q.const_data_ptr()),
             reinterpret_cast<const scalar_t*>(k.const_data_ptr()),
             reinterpret_cast<const scalar_t*>(v.const_data_ptr()),
             qs[0], qs[1], qs[2],
             mask_ptr, ms[0], ms[1], ms[2], ms[3],
             reinterpret_cast<scalar_t*>(out.data_ptr()),
+            part_o, part_m, part_l,
             B, H, S, is_causal, static_cast<float>(scale), out_bshd,
-            reverse_m);
+            reverse_m, splits);
+
+    if (splits > 1) {
+        // The combine has to exponentiate in the domain the kernel stored its
+        // maxima in, so it reads the same MODE the kernel was instantiated for.
+        constexpr bool USE_EXP2 = (MODE >= 1);
+        const int64_t n_rows = static_cast<int64_t>(B) * H * S;
+        // x is head_dim so a warp stays inside one row and the writes coalesce;
+        // y takes whatever is left of a 256-thread block.
+        const int ty = (256 / HEAD_DIM) > 1 ? (256 / HEAD_DIM) : 1;
+        const dim3 cblock(static_cast<unsigned>(HEAD_DIM),
+                          static_cast<unsigned>(ty));
+        const dim3 cgrid(static_cast<unsigned>((n_rows + ty - 1) / ty));
+        wmma_split_combine_kernel<scalar_t, HEAD_DIM, USE_EXP2>
+            <<<cgrid, cblock, 0, stream>>>(
+                part_o, part_m, part_l,
+                reinterpret_cast<scalar_t*>(out.data_ptr()),
+                H, S, splits, out_bshd, n_rows);
+    }
 }
 
 // Resolves the exp2 flag to one of the two instantiations. A runtime bool
@@ -855,6 +1148,42 @@ bool maybe_launch_wmma(const torch::Tensor& q, const torch::Tensor& k,
         return true;
     } else {
         return false;
+    }
+}
+
+
+// {grid blocks, blocks the card holds at once, BLOCK_M, BLOCK_N} for this
+// shape, on the
+// path an fp32 tensor actually takes -- fp16 fragments, whichever softmax mode
+// is live. Exported so a script can table the occupancy the split-KV gate is
+// built on without rederiving BLOCK_M or guessing where the register limit is.
+// {0,0,0} means this head_dim has no fp16 kernel.
+template <int HEAD_DIM>
+std::vector<int64_t> wmma_grid_info_hd(int B, int H, int S) {
+    using Cfg = WmmaCfg<__half, HEAD_DIM>;
+    if constexpr (!Cfg::SUPPORTED) {
+        return {0, 0, 0, 0};
+    } else {
+        int resident = 0;
+        switch (softmax_mode_flag()) {
+            case 2:  resident = wmma_resident_blocks<float, __half, HEAD_DIM, 2>(); break;
+            case 1:  resident = wmma_resident_blocks<float, __half, HEAD_DIM, 1>(); break;
+            default: resident = wmma_resident_blocks<float, __half, HEAD_DIM, 0>(); break;
+        }
+        const int64_t n_m = (S + Cfg::BLOCK_M - 1) / Cfg::BLOCK_M;
+        return {n_m * H * B, resident, Cfg::BLOCK_M, Cfg::BLOCK_N};
+    }
+}
+
+std::vector<int64_t> wmma_grid_info(int B, int H, int S, int head_dim) {
+    switch (head_dim) {
+        case 8:   return wmma_grid_info_hd<8>(B, H, S);
+        case 16:  return wmma_grid_info_hd<16>(B, H, S);
+        case 32:  return wmma_grid_info_hd<32>(B, H, S);
+        case 64:  return wmma_grid_info_hd<64>(B, H, S);
+        case 128: return wmma_grid_info_hd<128>(B, H, S);
+        case 256: return wmma_grid_info_hd<256>(B, H, S);
+        default:  return {0, 0, 0, 0};
     }
 }
 

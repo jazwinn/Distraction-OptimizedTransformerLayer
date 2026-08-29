@@ -218,6 +218,47 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("wmma_softmax_mode",
           []() { return softmax_mode_flag(); },
           "Which softmax mode the wmma attention kernel is currently using");
+    m.def("wmma_set_split_kv",
+          [](bool on) { split_kv_flag() = on; },
+          "Enable/disable the wmma kernel split-KV (Flash-Decoding) path. "
+          "Runtime-settable so both paths can be timed in one process.",
+          pybind11::arg("on"));
+    m.def("wmma_split_kv_enabled",
+          []() { return split_kv_flag(); },
+          "Whether the wmma kernel split-KV path is currently enabled");
+    m.def("wmma_set_split_count",
+          [](int n) { split_count_override() = n; },
+          "Force the wmma split count; 0 restores the measured rule. Used to "
+          "sweep counts a shape would not otherwise be given.",
+          pybind11::arg("n"));
+    m.def("wmma_split_count",
+          [](int B, int H, int S, int head_dim, bool is_causal) {
+              // BLOCK_N comes back from wmma_grid_info rather than being
+              // rederived here: it is a build-line macro that
+              // scripts/tune_block_shapes.py overrides, so a second copy of
+              // the rule would quietly disagree with the launcher.
+              auto info = wmma_grid_info(B, H, S, head_dim);
+              if (info[0] == 0) return 1;
+              return wmma_split_count(
+                  static_cast<int>(info[0]), static_cast<int>(info[1]),
+                  split_key_tiles(S, static_cast<int>(info[3]), is_causal),
+                  head_dim);
+          },
+          "How many ways the launcher would split the key range for this "
+          "shape. 1 means it declines to split.",
+          pybind11::arg("B"), pybind11::arg("H"), pybind11::arg("S"),
+          pybind11::arg("head_dim"), pybind11::arg("is_causal"));
+    m.def("wmma_grid_info",
+          [](int B, int H, int S, int head_dim) {
+              return wmma_grid_info(B, H, S, head_dim);
+          },
+          "{grid blocks, blocks the card holds at once, BLOCK_M, BLOCK_N} "
+          "for this "
+          "attention shape on the fp16 compute path. The occupancy the "
+          "split-KV gate is built on; blocks << resident means the grid "
+          "cannot fill the card. {0,0,0} if this head_dim has no kernel.",
+          pybind11::arg("B"), pybind11::arg("H"), pybind11::arg("S"),
+          pybind11::arg("head_dim"));
     m.def("wmma_set_causal_reverse",
           [](bool enabled) { causal_reverse_flag() = enabled; },
           "Enable/disable the wmma kernel's causal block-index reversal "

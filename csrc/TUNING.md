@@ -1074,6 +1074,173 @@ occupancy. **Static instruction count did not predict the sign of the result at
 any head_dim here.** Treat it as a check that an edit landed, not as a
 prediction that it helped.
 
+## wmma kernel: split-KV (Flash-Decoding), gated hard
+
+The attention grid is `(ceil(S/BLOCK_M), H, B)` -- query side only. Nothing in
+it scales with the KEY length, so a shape with few queries and many keys
+launches a grid too small to fill the card while each block walks a long serial
+key loop. No block shape fixes that; only splitting the key range does.
+
+`scripts/bench_wmma_occupancy.py`, `scripts/ab_wmma_split_kv.py`,
+`scripts/verify_wmma_split_kv.py`. Knobs: `WMMA_SPLIT_KV` /
+`wmma_set_split_kv()`, and `WMMA_SPLIT_COUNT` / `wmma_set_split_count()` to
+force a count the rule would not pick -- which is how the rule was chosen.
+
+### The prize, bounded before the code was written
+
+`bench_wmma_occupancy.py` tables blocks against what the occupancy API says the
+card holds, plus per-block cost normalised to the same (H, S, D) at a batch
+that saturates:
+
+| shape | blocks | resident | waves | n_kt | op us | per-block vs full |
+|:--|--:|--:|--:|--:|--:|--:|
+| B1 H4 S128 d32 c | 8 | 138 | 0.06 | 2 | 9.0 | **9.64x** |
+| B1 H8 S128 d32 c | 16 | 138 | 0.12 | 2 | 10.8 | **5.71x** |
+| B1 H8 S128 d64 c | 16 | 138 | 0.12 | 4 | 15.4 | **4.79x** |
+| B1 H8 S512 d32 c | 64 | 138 | 0.46 | 8 | 35.9 | 2.57x |
+| B8 H8 S128 d32 c | 128 | 138 | 0.93 | 2 | 13.6 | 0.90x |
+| B64 H8 S128 d32 c | 1024 | 138 | 7.42 | 2 | 112.9 | 0.93x |
+
+Two things the table settles up front. The idle capacity is real -- 12% of the
+card at B1, at 5.7x the per-block cost of the same kernel when full. And the
+ceiling is **small**, because `cap = min(resident/blocks, n_kt)` and at S 128
+with BLOCK_N 32 a causal block walks about **two** key tiles. A 94%-idle card
+does not help if there is nothing to divide.
+
+### Design
+
+One kernel, `splits` as a runtime argument rather than a template parameter:
+it changes only the prologue (which slice of the key range) and the epilogue
+(partial or finished row), never the inner loop, and measuring it found no
+register cost -- so it buys none of the instantiation blow-up a template would.
+
+Grid.x carries `n_m * splits`, since a grid has three axes and y/z are heads
+and batch. `splits` consecutive blocks share an m-tile, keeping the K/V a split
+group reads adjacent in L2.
+
+Each split takes a contiguous run of whole key tiles out of **this block's**
+range, not out of `[0, S)`. That is what makes it work under causal masking:
+slicing the dense range would leave the later splits of an early m-tile idle
+while a late m-tile still carried everything. A split that comes up empty
+stores its initial state -- zero-filled O, `-inf` max, zero sum -- which the
+combine pass weights to exactly zero. Cheaper than a launch-time special case
+and impossible to get wrong.
+
+`wmma_split_combine_kernel` rebases every partial onto the max over all splits
+before adding numerators and denominators. It is templated on the softmax mode,
+because that decides the domain the stored maxima are in.
+
+The workspace is **one** allocation with three views. Three separate `at::empty`
+calls cost enough host time at these sizes to swamp the device win.
+
+### The gate, and the two clauses that were bought with regressions
+
+```
+head_dim > 8, and blocks * 8 <= resident, and n_kt >= 4,
+then n = min(floor(resident / blocks), n_kt, 8)
+```
+
+**`blocks * 8 <= resident`** -- an eighth of the card, deliberately stricter
+than "there is spare capacity". Splitting adds a whole combine launch, and
+unless the grid is very small that launch costs more than the shortened key
+loop saves. Measured with the count the rule itself picks:
+
+| shape | blocks | waves | ratio |
+|:--|--:|--:|--:|
+| B1 H4 S128 d32 c | 8 | 0.06 | 1.122x |
+| B1 H8 S128 d64 c | 16 | 0.12 | 1.582x |
+| B1 H4 S256 d64 c | 16 | 0.12 | 2.526x |
+| B2 H8 S128 d32 c | 32 | 0.23 | **0.898x** |
+| B4 H8 S128 d32 c | 64 | 0.46 | **0.779x** |
+| B1 H8 S512 d64 c | 64 | 0.46 | **0.955x** |
+
+A looser `blocks * 4 <= resident` admits the 0.898x row; adding an
+`n_kt >= 16` clause for long key loops admits the 0.955x one. Both were tried
+and both lose.
+
+**`n_kt >= 4`** -- and this clause is the one the END-TO-END measurement bought,
+against what the op alone said:
+
+| shape | head_dim | n_kt | op | end to end |
+|:--|--:|--:|--:|--:|
+| B1 S128 d512 h8 | 64 | 4 | 1.807x | 1.061x |
+| B1 S128 d256 h8 | 32 | 2 | 1.084x | **0.963x** |
+
+The op-level win at `n_kt` 2 is real and still does not survive, because the
+op benchmark amortises the extra launch over a graph full of back-to-back
+attention calls while a six-layer model pays it six times against six much
+smaller savings. **An op-level A/B cannot see this**; only the model can.
+
+`floor`, never `ceiling`: a count that overfills the card serialises the extra
+blocks into a second wave and pays the combine pass for it.
+
+### Results
+
+Op level, causal, graph-timed, interleaved, symmetric sampling. Only two of the
+fourteen shapes now pass the gate; the other twelve run identical code and are
+the control:
+
+| shape | off us | on us | ratio | splits |
+|:--|--:|--:|--:|--:|
+| B1 H8 S128 d64 c | 22.0 | 12.8 | **1.713x** | 4 |
+| B1 H4 S256 d64 c | 40.8 | 15.2 | **2.677x** | 8 |
+| the 12 declined | | | 0.994x - 1.014x | 1 |
+
+End to end, 6 layers, causal, `ffn_dim == d_model`:
+
+| shape | off ms | on ms | ratio | splits |
+|:--|--:|--:|--:|--:|
+| B1 S256 d256 h4 | 0.712 | 0.513 | **1.389x** | yes |
+| B1 S128 d256 h4 | 0.410 | 0.346 | **1.183x** | yes |
+| B1 S128 d512 h8 | 0.695 | 0.663 | 1.049x | yes |
+| 6 declined rows | | | 1.007x (0.976x - 1.055x) | no |
+
+The declined rows are identical code both sides, so their spread **is** the
+harness noise floor: geomean 1.007x, +/-4%. The 1.049x row is inside it and is
+not claimed; 1.183x and 1.389x are well clear.
+
+Through the harness, `--accuracy-trials 3`: every trial PASS with **identical
+max_abs** split on and off (0.00113535, 0.000999093, 0.00133359), and its own
+speedup column moves 18.10x -> 21.02x and 13.37x -> 15.57x.
+
+`verify_wmma_split_kv.py` forces 2, 3, 4 and 8 splits over 16 cases -- dense,
+causal, both output layouts, `S` not a multiple of BLOCK_M, key-padding masks,
+and fully-masked query rows. Worst split-vs-single-pass disagreement 2.82e-04,
+error against float64 unchanged from the single-pass kernel, no NaN anywhere.
+Eight splits over a two-tile range is the empty-split path, and it is in there
+on purpose.
+
+### Three measurement traps, one of which invented an 8.2x
+
+- **A non-alternated sweep invented an 8.2x.** Timing each forced split count
+  once, in one sequential pass, reported `B1 H8 S512 d64` at 8.220x for n=3.
+  Alternating an n=1 baseline next to every count showed the shape is flat --
+  85-90 us at every count, ratio 0.955x-1.004x. Correctness was identical at
+  every count, so this was never a bug, only a benchmark. Same failure mode
+  csrc/TUNING.md already records for min-of-2 across processes. **A speedup
+  larger than the split count is arithmetically impossible; treat it as a
+  broken measurement, not a result.**
+- **Asymmetric sampling biased every ratio by 2.5%.** Timing `off` twice per
+  round and `on` once, then taking min of each, compares min-of-2 against
+  min-of-1. The declined rows -- identical code, true ratio exactly 1.000x --
+  read a geometric mean of **0.975x** under it. Two samples each fixed it to
+  1.007x. This is inherited from the older A/B scripts in this directory and
+  is worth fixing there too.
+- **The declined rows are a free control.** Any A/B over a gated optimization
+  gets one: the shapes the gate turns down run identical code, so their spread
+  is the harness noise floor, measured in the same process and the same run as
+  the result. No separate `--self-control` pass needed for them.
+
+### What this does NOT cover
+
+`B2 H2 S2048 d64 c` measures **1.679x at n=6** in the forced sweep and the gate
+declines it: 128 blocks against 138 resident is 0.93 waves, so `blocks * 8 <=
+resident` fails and `floor(138/128)` is 1 anyway. Taking it would need the
+count to exceed the spare capacity, which is exactly what the 0.555x
+ceiling-vs-floor result warns against. One data point, deliberately not fitted.
+`B1 H8 S512 d32 c` is a smaller version of the same miss: 1.276x forced at n=2,
+declined at 0.46 waves.
+
 ## fused_add_layernorm: two block reductions instead of three
 
 The block-per-row kernel reduced `sum(c)` and `sum(c*c)` separately, though both
