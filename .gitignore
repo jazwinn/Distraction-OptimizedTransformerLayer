@@ -4,3 +4,6 @@ __pycache__/
 *.bak
 .claude/
 dashboard/runs/
+
+# Sweep and benchmark output, regenerable
+*.log
