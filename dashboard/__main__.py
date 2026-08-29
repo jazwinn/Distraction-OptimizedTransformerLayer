@@ -10,7 +10,6 @@ so there is deliberately no flag to make it reachable from another machine.
 from __future__ import annotations
 
 import argparse
-import socket
 import sys
 import threading
 import webbrowser

@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PRESETS_PATH = os.path.join(HERE, "presets.json")

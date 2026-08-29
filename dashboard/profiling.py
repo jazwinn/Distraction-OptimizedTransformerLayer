@@ -649,15 +649,6 @@ def analyse(tables: Dict[str, List[Dict[str, str]]]) -> Dict[str, Any]:
     return analysis
 
 
-def human_ns(value: Optional[float]) -> str:
-    if value is None:
-        return "-"
-    for unit, scale in (("ns", 1.0), ("us", 1e3), ("ms", 1e6), ("s", 1e9)):
-        if abs(value) < scale * 1000 or unit == "s":
-            return f"{value / scale:.2f} {unit}"
-    return f"{value:.0f} ns"
-
-
 # --------------------------------------------------------------------------
 # Nsight Compute: per-kernel counters
 # --------------------------------------------------------------------------

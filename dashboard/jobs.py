@@ -31,7 +31,6 @@ import json
 import os
 import queue
 import subprocess
-import sys
 import threading
 import time
 from dataclasses import dataclass, field

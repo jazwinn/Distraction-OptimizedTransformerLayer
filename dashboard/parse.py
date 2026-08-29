@@ -271,11 +271,3 @@ class HarnessParser:
     def finish(self, exit_code: int) -> HarnessResult:
         self.result.exit_code = exit_code
         return self.result
-
-
-def parse_text(text: str, exit_code: int = 0) -> HarnessResult:
-    """Whole-output convenience wrapper, for tests and for re-reading a log."""
-    parser = HarnessParser()
-    for line in text.splitlines():
-        parser.feed(line)
-    return parser.finish(exit_code)
