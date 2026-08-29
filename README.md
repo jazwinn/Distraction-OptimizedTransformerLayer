@@ -382,7 +382,7 @@ limits — faster.
 
 ## Team
 
-**Solo project.*
+**Solo project **
 
 ---
 
