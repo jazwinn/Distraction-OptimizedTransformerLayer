@@ -133,6 +133,26 @@
             </details>
           </section>
 
+        </div>
+
+        <div class="stack">
+          <section class="card">
+            <div class="card-head">
+              <h2>Command</h2>
+              <button class="btn btn-sm" id="run-copy-cmd">copy</button>
+            </div>
+            <div class="card-body">
+              <pre class="command" id="run-command">&nbsp;</pre>
+              <div class="issues" id="run-issues" style="margin-top:12px"></div>
+              <div class="btn-row" style="margin-top:14px">
+                <button class="btn btn-primary" id="run-go">Run benchmark</button>
+                <button class="btn btn-danger" id="run-stop" disabled>Stop</button>
+                <span class="status-line" id="run-job-status">no job yet</span>
+                <span class="status-line" id="run-shape-note" style="margin-left:auto"></span>
+              </div>
+            </div>
+          </section>
+
           <section class="card">
             <div class="card-head">
               <h2>Measurement</h2>
@@ -155,25 +175,6 @@
                 <div class="fields" id="run-other" style="margin-top:12px"></div>
               </div>
             </details>
-          </section>
-        </div>
-
-        <div class="stack">
-          <section class="card">
-            <div class="card-head">
-              <h2>Command</h2>
-              <button class="btn btn-sm" id="run-copy-cmd">copy</button>
-            </div>
-            <div class="card-body">
-              <pre class="command" id="run-command">&nbsp;</pre>
-              <div class="issues" id="run-issues" style="margin-top:12px"></div>
-              <div class="btn-row" style="margin-top:14px">
-                <button class="btn btn-primary" id="run-go">Run benchmark</button>
-                <button class="btn btn-danger" id="run-stop" disabled>Stop</button>
-                <span class="status-line" id="run-job-status">no job yet</span>
-                <span class="status-line" id="run-shape-note" style="margin-left:auto"></span>
-              </div>
-            </div>
           </section>
         </div>
       </div>
