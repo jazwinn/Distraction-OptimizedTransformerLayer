@@ -169,6 +169,22 @@ def for_harness(form: Dict[str, Any], label: str = "") -> RunSpec:
     return RunSpec(argv=build_argv(form), env=build_env(form), label=label)
 
 
+DEVENV = os.path.join(REPO, "scripts", "devenv.bat")
+
+
+def through_devenv(argv: List[str]) -> List[str]:
+    """Run argv with MSVC on PATH, via the repository's own helper.
+
+    Invoked as `cmd.exe /c scripts\\devenv.bat <argv>`, which is the form
+    devenv.bat documents and the only one it supports -- it deliberately omits
+    setlocal so the environment it sets stays live for the command, which only
+    holds when it is the sole command of a one-shot cmd.
+    """
+    if not os.path.isfile(DEVENV):
+        return argv
+    return ["cmd.exe", "/c", DEVENV] + argv
+
+
 def script_path(name: str) -> Optional[str]:
     """Resolve a scripts/ entry by bare filename, or None if it is not one.
 

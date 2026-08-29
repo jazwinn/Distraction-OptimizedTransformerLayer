@@ -66,6 +66,7 @@ const VIEW_TITLES = {
   run: ['Run', 'One configuration on one shape'],
   compare: ['Compare', 'Two configurations, timed back to back against a control'],
   sweep: ['Sweep', 'One configuration across many shapes'],
+  profile: ['Profile', 'One traced run, and where its GPU time actually goes'],
   scripts: ['Scripts', "The repository's own A/B and verification scripts"],
   presets: ['Presets', 'The saved shapes, written to presets.json'],
   history: ['History', 'Finished jobs and where their logs are'],
@@ -73,8 +74,9 @@ const VIEW_TITLES = {
 
 const state = {
   spec: null,
-  forms: { run: {}, cmpShape: {}, cmpA: {}, cmpB: {}, sweep: {}, script: {} },
-  jobs: { run: null, compare: null, sweep: null, script: null },
+  forms: { run: {}, cmpShape: {}, cmpA: {}, cmpB: {}, sweep: {}, script: {},
+           profile: {} },
+  jobs: { run: null, compare: null, sweep: null, script: null, profile: null },
   polls: {},
   // Each view's Run/Stop pair, so the queue poll can put them back if a job's
   // own polling ever stops reporting. See reconcileControls().
@@ -176,7 +178,13 @@ function makeField(spec, form, onChange) {
     const showNote = () => {
       const active = input.value || effectiveValue;
       const text = help[active];
-      note.textContent = text ? active + ': ' + text : '';
+      // No "auto: " prefix: the select directly above already says which value
+      // this describes, and on one clamped line those six characters are a
+      // third of what there is room for.
+      note.textContent = text || '';
+      // Clamped in CSS, so the whole of it lives here instead -- these notes
+      // carry measured numbers that are worth keeping reachable.
+      if (text) note.title = active + ': ' + text; else note.removeAttribute('title');
       note.hidden = !text;
     };
     wrap.appendChild(note);
@@ -1971,6 +1979,453 @@ function setupSweep() {
   preflight();
 }
 
+/* ---------------------------------------------------------- profile view -- */
+
+/* Nanoseconds, at whatever scale reads. Every number nsys hands back is in ns,
+ * and a table of nine-digit integers is unreadable. */
+function ns(value) {
+  if (value === null || value === undefined) return '–';
+  const abs = Math.abs(value);
+  if (abs < 1e3) return value.toFixed(0) + ' ns';
+  if (abs < 1e6) return (value / 1e3).toFixed(2) + ' µs';
+  if (abs < 1e9) return (value / 1e6).toFixed(3) + ' ms';
+  return (value / 1e9).toFixed(3) + ' s';
+}
+
+/* C++ kernel signatures run to hundreds of characters. The part that
+ * identifies the kernel is the template's own name, so the table shows that and
+ * keeps the full signature on the row's tooltip. */
+function shortKernel(name) {
+  if (!name) return '';
+  let text = String(name).replace(/^void\s+/, '').replace(/<unnamed>::/g, '');
+
+  // Every CUTLASS GEMM arrives as cutlass::Kernel2<the_name_you_want>, so the
+  // wrapper is the one thing the name does not tell you.
+  const cutlass = text.match(/\b(cutlass_\w+)/);
+  if (cutlass) return cutlass[1];
+
+  let head = text.split(/[<(]/)[0]
+    .replace(/^(at::native|at_cuda_detail::cub[\w:]*?|c10|thrust[\w:]*?)::/, '')
+    .replace(/::$/, '');
+
+  // ATen routes most elementwise work through two or three templates, so the
+  // template alone names a dozen different kernels. The functor inside it is
+  // what actually ran.
+  const functor = text.match(
+    /\b([A-Za-z_]\w*(?:Functor\w*|KernelImpl|Ops|CUDAKernel\w*))\b/);
+  if (functor && head && functor[1] !== head && head.indexOf(functor[1]) === -1) {
+    return head + ' · ' + functor[1];
+  }
+  return head || text.slice(0, 60);
+}
+
+/* Kernels this repository built, as opposed to ATen's and cuBLAS's. The NVTX
+ * range already says which model issued a kernel; this says whose code it is,
+ * which is the difference between "my attention kernel is the bottleneck" and
+ * "the GEMM I do not control is". */
+const OURS = /wmma_|tile_|fused_attention|fused_add_layernorm|warp_add_layernorm|gemm_bias_gelu|split_combine|identity_kernel/i;
+const THEIRS = /^(void )?(at::|c10::|cutlass|ampere_|sm\d+_|cublas|gemv|splitKreduce)/;
+
+function kernelOrigin(name) {
+  if (THEIRS.test(name) && !OURS.test(name)) return 'library';
+  return OURS.test(name) ? 'ours' : 'library';
+}
+
+const PROFILE_COLUMNS = [
+  { key: 'share', title: 'share', type: 'num',
+    value: (row) => row.share,
+    render: (cell, row) => {
+      // A proportion, drawn as a proportion. One measure, one hue.
+      const wrap = el('div', 'share-cell');
+      const track = el('div', 'share-track');
+      const fill = el('div', 'share-fill');
+      fill.style.width = (100 * row.share).toFixed(1) + '%';
+      track.appendChild(fill);
+      wrap.appendChild(track);
+      wrap.appendChild(el('span', 'share-value', (100 * row.share).toFixed(1) + '%'));
+      cell.appendChild(wrap);
+    } },
+  { key: 'name', title: 'kernel', left: true, type: 'text',
+    value: (row) => row.short,
+    render: (cell, row) => {
+      const tag = el('span', 'tag ' + (row.origin === 'ours' ? 'is-info' : ''),
+        row.origin === 'ours' ? 'ours' : 'library');
+      tag.style.marginRight = '8px';
+      cell.appendChild(tag);
+      cell.appendChild(document.createTextNode(row.short));
+      cell.title = row.name;
+    } },
+  { key: 'total', title: 'total', type: 'num',
+    value: (row) => row.total_ns,
+    render: (cell, row) => { cell.textContent = ns(row.total_ns); } },
+  { key: 'instances', title: 'launches', type: 'num',
+    value: (row) => row.instances,
+    render: (cell, row) => { cell.textContent = row.instances.toLocaleString(); } },
+  { key: 'avg', title: 'avg', type: 'num',
+    value: (row) => row.avg_ns,
+    render: (cell, row) => { cell.textContent = ns(row.avg_ns); } },
+  { key: 'med', title: 'median', type: 'num',
+    value: (row) => row.med_ns,
+    render: (cell, row) => { cell.textContent = ns(row.med_ns); } },
+  { key: 'max', title: 'max', type: 'num',
+    value: (row) => row.max_ns,
+    render: (cell, row) => { cell.textContent = ns(row.max_ns); } },
+];
+
+const MEMORY_COLUMNS = [
+  { key: 'op', title: 'operation', left: true, type: 'text',
+    value: (row) => row.op,
+    render: (cell, row) => { cell.textContent = row.op; } },
+  { key: 'count', title: 'count', type: 'num',
+    value: (row) => row.count,
+    render: (cell, row) => { cell.textContent = row.count; } },
+  { key: 'total', title: 'total', type: 'num',
+    value: (row) => row.total_ns,
+    render: (cell, row) => { cell.textContent = ns(row.total_ns); } },
+  { key: 'avg', title: 'avg', type: 'num',
+    value: (row) => row.avg_ns,
+    render: (cell, row) => { cell.textContent = ns(row.avg_ns); } },
+];
+
+function setupProfile() {
+  const form = state.forms.profile;
+  // The server's reduced iteration counts are the starting point, so the form
+  // shows what will actually run rather than the harness's own defaults.
+  Object.assign(form, state.spec.profile_defaults || {});
+
+  const preflight = makePreflight(() => form, $('prof-command'), $('prof-issues'),
+    $('prof-derived'));
+
+  renderGroup($('prof-shape'), 'shape', form, preflight);
+  renderGroup($('prof-timing'), 'timing', form, preflight);
+  renderGroup($('prof-optimization'), 'optimization', form, preflight);
+  renderEnv($('prof-env'), form, preflight);
+  fillPresetSelect($('prof-preset'), (preset) => applyPreset($('prof-shape'), preset));
+
+  // The reduced counts have to reach the fields too, or the form would show
+  // the harness's defaults while the server quietly ran something else.
+  Object.keys(state.spec.profile_defaults || {}).forEach((key) => {
+    setFieldValue($('prof-timing'), key, state.spec.profile_defaults[key]);
+  });
+
+  renderTools($('prof-tools-body'), state.spec.tools || {});
+
+  // Both routes to counter permission can look satisfied while collection still
+  // fails, so the only trustworthy answer is to go and collect one.
+  $('prof-ncu-probe').addEventListener('click', async () => {
+    const button = $('prof-ncu-probe');
+    button.disabled = true;
+    const original = button.textContent;
+    button.textContent = 'testing…';
+    const { data } = await postJSON('/api/profile/ncu-probe', {});
+    button.disabled = false;
+    button.textContent = original;
+    if (!data) return;
+    if (data.error && !data.probed) {
+      appendLog($('prof-log'), ['[dashboard] ' + data.error], true);
+      return;
+    }
+    state.spec.tools = Object.assign({}, state.spec.tools, {
+      ncu_counters_allowed: data.ok === true,
+      ncu_reason: data.ok ? 'measured: ncu collected a counter'
+                          : (data.error || 'ncu could not collect a counter'),
+      ncu_measured: true,
+    });
+    renderTools($('prof-tools-body'), state.spec.tools);
+  });
+
+  const ui = {
+    log: $('prof-log'), status: $('prof-job-status'), go: $('prof-go'),
+    stop: $('prof-stop'), follow: $('prof-follow'), issues: $('prof-issues'),
+    resultsCard: $('prof-results-card'),
+    render: renderProfileResults,
+  };
+
+  state.uis['profile'] = ui;
+  $('prof-devenv').addEventListener('change', () => {
+    form.devenv = $('prof-devenv').checked;
+  });
+  $('prof-go').addEventListener('click', () => {
+    form.devenv = $('prof-devenv').checked;
+    submit('profile', { mode: 'profile', form }, ui);
+  });
+  $('prof-stop').addEventListener('click', () => requestStop('profile', ui));
+
+  $('prof-open').addEventListener('click', async () => {
+    const { data } = await postJSON('/api/profile/open',
+      { report: profileState.report });
+    if (data && data.error) appendLog($('prof-log'), ['[dashboard] ' + data.error], true);
+  });
+  $('prof-delete').addEventListener('click', async () => {
+    const { data } = await postJSON('/api/profile/delete',
+      { report: profileState.report });
+    if (data && data.removed) {
+      appendLog($('prof-log'), ['[dashboard] removed ' + data.removed.join(', ')], true);
+      $('prof-report-card').hidden = true;
+    }
+  });
+
+  preflight();
+}
+
+/* What is installed and what it will let us do. The Nsight Compute row is the
+ * point of this card: on a stock Windows box its counters are admin-only, and a
+ * button that fails with ERR_NVGPUCTRPERM teaches nothing. */
+function renderTools(container, tools) {
+  clear(container);
+
+  const row = (label, ok, detail, note) => {
+    const line = el('div', 'tool-row');
+    const tag = el('span', 'tag ' + (ok ? 'is-good' : 'is-warning'));
+    tag.appendChild(el('span', null, ok ? '✓' : '⚠'));
+    tag.appendChild(document.createTextNode(ok ? 'ready' : 'unavailable'));
+    line.appendChild(tag);
+    line.appendChild(el('span', 'tool-name', label));
+    line.appendChild(el('span', 'tool-detail', detail || ''));
+    container.appendChild(line);
+    if (note) {
+      const prose = el('p', 'prose');
+      prose.style.margin = '6px 0 12px';
+      prose.textContent = note;
+      container.appendChild(prose);
+    }
+  };
+
+  row('Nsight Systems', !!tools.nsys_available,
+    tools.nsys ? tools.nsys.split(/[\\/]/).slice(-3, -1).join('/') : 'not found',
+    tools.nsys_available ? '' : 'Install it, or set NSYS_PATH to nsys.exe.');
+
+  // Until it has actually been measured, say so rather than guessing.
+  const ncuReady = tools.ncu_available && tools.ncu_counters_allowed === true;
+  const ncuUnknown = tools.ncu_available && !tools.ncu_measured
+    && tools.ncu_counters_allowed !== true;
+  const ncuDetail = tools.ncu
+    ? tools.ncu.split(/[\\/]/).slice(-4, -3).join('/') : 'not found';
+  if (ncuUnknown) {
+    const line = el('div', 'tool-row');
+    const tag = el('span', 'tag');
+    tag.appendChild(el('span', null, '?'));
+    tag.appendChild(document.createTextNode('not tested'));
+    line.appendChild(tag);
+    line.appendChild(el('span', 'tool-name', 'Nsight Compute'));
+    line.appendChild(el('span', 'tool-detail', ncuDetail));
+    container.appendChild(line);
+    const note = el('p', 'prose');
+    note.style.margin = '6px 0 12px';
+    note.textContent = 'Whether counters can be collected cannot be read off the '
+      + 'registry or from elevation: both can look satisfied while collection '
+      + 'still fails, and a registry change does nothing until the driver '
+      + 'reloads. Press "test counters" to find out. ' + (tools.ncu_reason || '');
+    container.appendChild(note);
+  } else {
+    row('Nsight Compute', ncuReady, ncuDetail,
+      ncuReady
+        ? 'Measured: ncu collected a counter. Nothing here drives ncu yet, so '
+          + 'this is detection only.'
+        : (tools.ncu_available
+          ? (tools.ncu_reason || 'counter collection failed') + ' '
+            + (tools.ncu_fixes || []).join(' ')
+          : 'Not found.'));
+  }
+  if (tools.elevated === true) {
+    const note = el('p', 'prose');
+    note.style.margin = '6px 0 0';
+    note.textContent = 'This server is running elevated, so everything it '
+      + 'launches — benchmarks included — runs elevated too.';
+    container.appendChild(note);
+  }
+}
+
+const profileState = { ranges: {}, range: '', report: '' };
+
+function renderProfileResults(rows, data) {
+  const step = (data.steps || []).find((s) => s.meta && s.meta.role === 'analyse');
+  const result = (step && step.result) || null;
+  profileState.report = (step && step.meta && step.meta.report) || '';
+  if (!result) return;
+
+  const analysis = result.analysis || {};
+  profileState.ranges = analysis.ranges || {};
+
+  renderProfileSummary($('prof-summary'), analysis);
+  $('prof-results-card').hidden = false;
+
+  renderRangePicker(analysis.ranges || {});
+  renderProfileKernels();
+
+  renderProfileMemory(result.tables || {}, result.skipped || {});
+  renderProfileReport();
+}
+
+/* The headline: is this shape doing work, or waiting to be told to? */
+function renderProfileSummary(container, analysis) {
+  clear(container);
+  const opt = analysis.optimized;
+  const launch = analysis.launch_api;
+  if (!opt) {
+    const line = el('p', 'prose');
+    line.textContent = 'No NVTX ranges were found in the trace. The harness only '
+      + 'emits them when BENCH_NVTX=1, which the dashboard sets for a profile '
+      + 'run — if this run came from somewhere else, that is why.';
+    container.appendChild(line);
+    return;
+  }
+
+  const busyPct = 100 * (opt.busy_fraction || 0);
+  const headline = el('div', 'headline');
+  headline.appendChild(heroBlock(busyPct.toFixed(1) + '%',
+    'of one forward, the GPU is running a kernel',
+    busyPct >= 70 ? 'good' : 'critical'));
+  const tiles = [
+    [ns(opt.busy_ns), 'busy per forward'],
+    [ns(opt.idle_ns), 'idle per forward'],
+    [String(opt.kernels), 'kernels per forward'],
+    [ns(opt.largest_gap_ns), 'largest single gap'],
+  ];
+  if (analysis.custom_kernels && analysis.custom_kernels.count) {
+    tiles.push([(100 * analysis.custom_kernels.share).toFixed(0) + '%',
+      'in kernels from csrc/',
+      'The share of the optimized model’s GPU time spent in kernels this '
+      + 'repository built, as opposed to ATen, cuBLAS and CUTLASS. It is the '
+      + 'ceiling on what optimizing your own code can win.']);
+  }
+  headline.appendChild(tileRow(tiles));
+  container.appendChild(headline);
+
+  // The check that caught a bad profile the first time this ran: the optimized
+  // model was entirely ATen, cuBLAS and CUTLASS, because the extension had not
+  // loaded and optimized/ fell back to SDPA without saying so. A breakdown of
+  // somebody else's kernels presented as yours is worse than no breakdown.
+  const custom = analysis.custom_kernels;
+  if (custom && custom.count === 0) {
+    const alarm = el('div', 'v-call');
+    alarm.style.marginTop = '16px';
+    const tag = el('span', 'tag is-critical');
+    tag.appendChild(el('span', null, '✖'));
+    tag.appendChild(document.createTextNode('no custom kernels ran'));
+    alarm.appendChild(tag);
+    alarm.appendChild(el('span', null,
+      'Every kernel under "optimized" came from ATen, cuBLAS or CUTLASS, so '
+      + 'this profile is of the fallback path, not of your code. Check the '
+      + 'prepare step in the log: if the extension did not load, the harness '
+      + 'runs SDPA instead and reports no error.'));
+    container.appendChild(alarm);
+  }
+
+  $('prof-range-note').textContent = 'median of ' + opt.forwards
+    + ' optimized forward' + (opt.forwards === 1 ? '' : 's');
+
+  const verdict = el('div', 'verdict');
+  verdict.style.marginTop = '18px';
+
+  const line = el('div');
+  line.innerHTML = 'Each figure is the <b>median</b> forward, not the total. The '
+    + 'first forward a model runs pays for cuBLAS and module loading, and '
+    + 'averaging that in would report the GPU as almost entirely idle.';
+  verdict.appendChild(line);
+
+  // The finding this whole view exists to make reproducible: a shape can be
+  // slow because the kernels are slow, or because there are too many of them.
+  const call = el('div', 'v-call');
+  let tone, glyph, text;
+  if (busyPct >= 80) {
+    tone = 'is-good'; glyph = '✓';
+    text = 'The GPU is busy nearly all of the forward, so the time is in the '
+      + 'kernels themselves — the table below says which.';
+  } else if (busyPct >= 50) {
+    tone = 'is-warning'; glyph = '⚠';
+    text = 'A fifth to a half of the forward is gaps between kernels. Fusing '
+      + 'adjacent kernels or capturing a CUDA graph buys back time that no '
+      + 'kernel optimization can.';
+  } else {
+    tone = 'is-critical'; glyph = '✖';
+    text = 'Most of the forward is the GPU waiting. This shape is launch-bound, '
+      + 'not compute-bound: making any single kernel faster will barely move it.';
+  }
+  const tag = el('span', 'tag ' + tone);
+  tag.appendChild(el('span', null, glyph));
+  tag.appendChild(document.createTextNode(
+    busyPct >= 80 ? 'kernel-bound' : (busyPct >= 50 ? 'partly launch-bound'
+                                                    : 'launch-bound')));
+  call.appendChild(tag);
+  call.appendChild(el('span', null, text));
+  verdict.appendChild(call);
+
+  if (launch && launch.calls) {
+    const api = el('div');
+    api.style.marginTop = '10px';
+    api.innerHTML = '<b>' + launch.calls.toLocaleString() + '</b> cudaLaunchKernel '
+      + 'calls across the whole trace, ' + ns(launch.avg_ns) + ' of CPU each.';
+    verdict.appendChild(api);
+  }
+  container.appendChild(verdict);
+}
+
+/* One button per NVTX range. The optimized model leads, because it is the one
+ * being worked on; the baseline is there to compare against. */
+function renderRangePicker(ranges) {
+  const picker = $('prof-range-pick');
+  clear(picker);
+  const names = Object.keys(ranges).sort((a, b) => {
+    const rank = (n) => (n === 'optimized' ? 0 : (n === 'baseline' ? 1 : 2));
+    return rank(a) - rank(b) || a.localeCompare(b);
+  });
+  if (!names.length) { $('prof-kernels-card').hidden = true; return; }
+  if (names.indexOf(profileState.range) === -1) profileState.range = names[0];
+
+  names.forEach((name) => {
+    const button = el('button', null, name);
+    button.setAttribute('aria-pressed', String(name === profileState.range));
+    button.addEventListener('click', () => {
+      profileState.range = name;
+      renderRangePicker(profileState.ranges);
+      renderProfileKernels();
+    });
+    picker.appendChild(button);
+  });
+  $('prof-kernels-card').hidden = false;
+}
+
+function renderProfileKernels() {
+  const bucket = profileState.ranges[profileState.range];
+  if (!bucket) return;
+  const rows = bucket.kernels.map((kernel) => Object.assign({}, kernel, {
+    short: shortKernel(kernel.name),
+    origin: kernelOrigin(kernel.name),
+    // The filter's free-text box matches on label.
+    label: shortKernel(kernel.name),
+  }));
+  renderTable($('prof-kernels'), rows, null, PROFILE_COLUMNS);
+}
+
+function renderProfileMemory(tables, skipped) {
+  const rows = (tables.cuda_gpu_mem_time_sum || []).map((row) => ({
+    op: row['Operation'] || row['Name'] || '',
+    label: row['Operation'] || row['Name'] || '',
+    count: Number(row['Count'] || row['Instances'] || 0),
+    total_ns: Number(row['Total Time (ns)'] || 0),
+    avg_ns: Number(row['Avg (ns)'] || 0),
+  }));
+  if (!rows.length) {
+    // Usually correct rather than broken: the harness generates its input on
+    // the device, so a clean run copies nothing.
+    $('prof-memory-card').hidden = true;
+    return;
+  }
+  $('prof-memory-card').hidden = false;
+  renderTable($('prof-memory'), rows, null, MEMORY_COLUMNS);
+}
+
+async function renderProfileReport() {
+  if (!profileState.report) { $('prof-report-card').hidden = true; return; }
+  const name = profileState.report.split(/[\\/]/).pop();
+  $('prof-report-path').textContent = profileState.report;
+  $('prof-report-card').hidden = false;
+  const { data } = await api('/api/profile/report?name=' + encodeURIComponent(name));
+  $('prof-report-size').textContent = (data && data.exists)
+    ? data.human + ' on disk' : 'not on disk';
+}
+
 /* ---------------------------------------------------------- scripts view -- */
 
 function setupScripts() {
@@ -2165,7 +2620,7 @@ function loadPresetRows() {
 /* Every control fed by presets, rebuilt after a save; otherwise they keep
  * offering shapes that no longer exist. */
 function refreshPresetConsumers() {
-  ['run-preset', 'cmp-preset'].forEach((id) => {
+  ['run-preset', 'cmp-preset', 'prof-preset'].forEach((id) => {
     const select = $(id);
     if (!select) return;
     while (select.options.length > 1) select.remove(1);
@@ -2485,7 +2940,8 @@ function setupChrome() {
   });
 
   // Alt+1..6 moves between views without leaving the keyboard.
-  const order = ['run', 'compare', 'sweep', 'scripts', 'presets', 'history'];
+  const order = ['run', 'compare', 'sweep', 'profile', 'scripts', 'presets',
+                 'history'];
   window.addEventListener('keydown', (event) => {
     if (!event.altKey || event.ctrlKey || event.metaKey) return;
     const index = Number(event.key) - 1;
@@ -2512,6 +2968,7 @@ async function boot() {
   setupRun();
   setupCompare();
   setupSweep();
+  setupProfile();
   setupScripts();
   setupPresets();
 

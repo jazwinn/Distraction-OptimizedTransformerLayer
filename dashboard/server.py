@@ -40,8 +40,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs
 
-from . import argspec, knobs, presets, runspec
-from .jobs import Job, JobQueue, Step, read_history
+from . import argspec, knobs, presets, profiling, runspec
+from .jobs import Job, JobQueue, RUNS_DIR, Step, read_history
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(HERE, "static")
@@ -212,6 +212,23 @@ def probe_extension(force: bool = False) -> Dict[str, Any]:
     return result
 
 
+_TOOLS: Dict[str, Any] = {}
+_TOOLS_LOCK = threading.Lock()
+
+
+def tools_cached() -> Dict[str, Any]:
+    """Which profilers exist and what they will let us do.
+
+    Cached because it shells out to PowerShell for the counter-permission
+    registry read, and the answer only changes when someone installs a tool or
+    reboots after changing the key -- neither of which happens mid-session.
+    """
+    with _TOOLS_LOCK:
+        if not _TOOLS:
+            _TOOLS.update(profiling.tool_status())
+        return dict(_TOOLS)
+
+
 def probe_cached() -> Dict[str, Any]:
     with _probe_lock:
         return _probe_cache or {"probed": False, "loaded": None, "tile": None,
@@ -304,6 +321,44 @@ def _blocking_issues(form: Dict[str, Any]) -> List[Dict[str, str]]:
     return issues
 
 
+def _report_path(name: Any) -> Optional[str]:
+    """Resolve a report name against runs/, or None.
+
+    Matched against a directory listing rather than sanitised, the same way
+    runspec.script_path() resolves a script: the check is then on the file that
+    will actually be opened or deleted, and no spelling of a name reaches
+    outside runs/.
+    """
+    if not isinstance(name, str) or not name:
+        return None
+    base = os.path.basename(name)
+    try:
+        entries = os.listdir(RUNS_DIR)
+    except OSError:
+        return None
+    if base not in entries or not base.endswith(".nsys-rep"):
+        return None
+    full = os.path.join(RUNS_DIR, base)
+    return full if os.path.isfile(full) else None
+
+
+def report_info(name: str) -> Dict[str, Any]:
+    """Size on disk, for a view that has to say what it is keeping."""
+    path = _report_path(name)
+    if path is None:
+        return {"exists": False}
+    total = 0
+    for suffix in (".nsys-rep", ".sqlite"):
+        mate = os.path.splitext(path)[0] + suffix
+        try:
+            total += os.path.getsize(mate)
+        except OSError:
+            pass
+    return {"exists": True, "name": os.path.basename(path),
+            "path": path, "bytes": total,
+            "human": knobs.human_bytes(total)}
+
+
 def _shape_label(form: Dict[str, Any]) -> str:
     def value(key: str, fallback: Any) -> Any:
         got = form.get(key)
@@ -318,6 +373,18 @@ def _impl_label(form: Dict[str, Any]) -> str:
              ("attn_backend", "attn_impl", "attn_fp16", "linear_gelu", "cuda_graph")
              if form.get(key) not in (None, "")]
     return " ".join(parts) if parts else "defaults"
+
+
+# A traced run should be short. Tracing records every launch, and the analysis
+# step then pays for each one -- a default benchmark run is tens of thousands of
+# them, which turns a 10 s measurement into minutes of export for no extra
+# insight. These are starting points; the form overrides any of them.
+PROFILE_DEFAULTS: Dict[str, Any] = {
+    "accuracy_trials": 1,
+    "warmup": 1,
+    "repeats": 5,
+    "benchmark_rounds": 1,
+}
 
 
 def build_job(payload: Dict[str, Any]) -> Tuple[Optional[Job], List[Dict[str, str]]]:
@@ -462,6 +529,96 @@ def build_job(payload: Dict[str, Any]) -> Tuple[Optional[Job], List[Dict[str, st
             return None, issues
         return (Job("compare", steps,
                     title=f"{label_a} vs {label_b} · {kept} shapes"), issues)
+
+    if mode == "profile":
+        form = form_of("form")
+        if form is None:
+            return None, bad_shape
+
+        tools = tools_cached()
+        if not tools["nsys_available"]:
+            return None, [{"level": "error",
+                           "message": "Nsight Systems was not found. Install it, "
+                                      "or point NSYS_PATH at nsys.exe."}]
+
+        merged = dict(PROFILE_DEFAULTS)
+        merged.update({key: value for key, value in form.items()
+                       if value not in (None, "")})
+        issues = _blocking_issues(merged)
+        if any(issue["level"] == "error" for issue in issues):
+            return None, issues
+
+        label = f"{_shape_label(merged)} | {_impl_label(merged)}"
+        spec = runspec.for_harness(merged, label)
+        report = os.path.join(RUNS_DIR, "PLACEHOLDER")
+
+        # Build the extension first, in a process nsys is not watching. Under
+        # the profiler the build fails -- torch's JIT loader runs ninja on every
+        # load, nsys injects into it, and the compile dies -- and optimized/
+        # then falls back to SDPA silently, so the profile measures ATen and
+        # says nothing. A warm cache loads fine under the same profiler, so one
+        # untraced build up front removes the whole failure mode.
+        prepare_argv = [sys.executable, "-u", "-c", _PROBE_SOURCE.format(repo=REPO)]
+        if form.get("devenv"):
+            prepare_argv = runspec.through_devenv(prepare_argv)
+
+        prepare = Step(
+            spec=runspec.RunSpec(
+                argv=prepare_argv,
+                cwd=REPO,
+                label="prepare",
+            ),
+            label="prepare",
+            parse_output=False,
+        )
+        prepare.meta = {"role": "prepare"}
+
+        # Two steps, because `nsys stats` exports the trace to SQLite first and
+        # on a real run that is slow enough to look like a hang. Split, the step
+        # list says which half is working.
+        # Under the profiler the extension's build can fail where it succeeds
+        # untraced, and the harness then runs the fallback without saying so.
+        # This is the escape hatch for that; the kernel table reports whether it
+        # made any difference.
+        capture_argv = profiling.capture_argv(tools["nsys"], spec.argv, report)
+        if form.get("devenv"):
+            capture_argv = runspec.through_devenv(capture_argv)
+
+        capture = Step(
+            spec=runspec.RunSpec(
+                argv=capture_argv,
+                env=profiling.capture_env(spec.env),
+                cwd=spec.cwd,
+                label="capture",
+            ),
+            label="capture",
+            # Timings from a traced run are inflated and are not benchmark
+            # numbers. Parsing them would put a speedup on screen that means
+            # something different from every other speedup in this tool.
+            parse_output=False,
+        )
+        capture.meta = {"role": "capture", "shape": _shape_label(merged),
+                        "config": _impl_label(merged)}
+
+        analyse = Step(
+            spec=runspec.RunSpec(
+                argv=profiling.stats_argv(tools["nsys"], report + ".nsys-rep"),
+                cwd=spec.cwd,
+                label="analyse",
+            ),
+            label="analyse",
+            parser_factory=profiling.StatsParser,
+        )
+        analyse.meta = {"role": "analyse"}
+
+        job = Job("profile", [prepare, capture, analyse], title=f"profile {label}")
+        # The report is named after the job, which only exists once the job
+        # does, so the placeholder is replaced now that the id is known.
+        for step in job.steps:
+            step.spec.argv = [part.replace("PLACEHOLDER", job.id)
+                              for part in step.spec.argv]
+        analyse.meta["report"] = os.path.join(RUNS_DIR, job.id + ".nsys-rep")
+        return job, issues
 
     if mode == "sweep":
         form = form_of("form")
@@ -647,6 +804,8 @@ class Handler(BaseHTTPRequestHandler):
                 "scripts": list_scripts(),
                 "gpu": gpu_status(),
                 "extension": probe_cached(),
+                "tools": tools_cached(),
+                "profile_defaults": PROFILE_DEFAULTS,
                 "repo": REPO,
                 "shape_keys": list(presets.SHAPE_KEYS),
             })
@@ -655,6 +814,10 @@ class Handler(BaseHTTPRequestHandler):
             data = presets.load()
             return self._json({"presets": describe_presets(),
                                "path": data["path"], "error": data["error"]})
+
+        if path == "/api/profile/report":
+            name = (query.get("name") or [""])[0]
+            return self._json(report_info(name))
 
         if path == "/api/gpu":
             return self._json(gpu_status())
@@ -743,6 +906,43 @@ class Handler(BaseHTTPRequestHandler):
                                             "would build CUDA alongside it and "
                                             "spoil the measurement"}, 409)
             return self._json(probe_extension(force=True))
+
+        if path == "/api/profile/ncu-probe":
+            # Takes the GPU for a few seconds, so it waits its turn like every
+            # other thing here that opens a CUDA context.
+            if QUEUE.status()["running"]:
+                return self._json({"error": "a benchmark is running; probing "
+                                            "would take the GPU alongside it"}, 409)
+            result = profiling.probe_ncu()
+            with _TOOLS_LOCK:
+                _TOOLS["ncu_counters_allowed"] = result["ok"]
+                if result.get("error"):
+                    _TOOLS["ncu_reason"] = result["error"]
+                elif result["ok"]:
+                    _TOOLS["ncu_reason"] = "measured: ncu collected a counter"
+            return self._json(result)
+
+        if path in ("/api/profile/open", "/api/profile/delete"):
+            report = _report_path(payload.get("report"))
+            if report is None:
+                return self._json({"error": "no such report"}, 404)
+            if path.endswith("/open"):
+                viewer = tools_cached().get("nsys_ui")
+                if not viewer:
+                    return self._json({"error": "Nsight Systems UI not found"}, 404)
+                # Detached: the viewer outlives this request, and waiting on a
+                # GUI would hold the handler thread open for as long as it is.
+                subprocess.Popen([viewer, report], cwd=REPO)
+                return self._json({"opened": report})
+            removed = []
+            for suffix in (".nsys-rep", ".sqlite"):
+                mate = os.path.splitext(report)[0] + suffix
+                try:
+                    os.remove(mate)
+                    removed.append(os.path.basename(mate))
+                except OSError:
+                    pass
+            return self._json({"removed": removed})
 
         if path.startswith("/api/job/") and path.endswith("/stop"):
             job_id = path[len("/api/job/"):-len("/stop")]

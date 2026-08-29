@@ -29,6 +29,8 @@
         <span class="glyph" aria-hidden="true">&#8646;</span> Compare</button>
       <button class="nav-item" role="tab" data-tab="sweep" aria-selected="false">
         <span class="glyph" aria-hidden="true">&#9776;</span> Sweep</button>
+      <button class="nav-item" role="tab" data-tab="profile" aria-selected="false">
+        <span class="glyph" aria-hidden="true">&#9679;</span> Profile</button>
       <button class="nav-item" role="tab" data-tab="scripts" aria-selected="false">
         <span class="glyph" aria-hidden="true">&gt;_</span> Scripts</button>
       <button class="nav-item" role="tab" data-tab="presets" aria-selected="false">
@@ -355,6 +357,121 @@
             <label class="checkline"><input type="checkbox" id="sweep-follow" checked> follow</label>
           </div>
           <pre class="log" id="sweep-log"></pre>
+        </section>
+      </div>
+    </section>
+
+    <!-- =========================== PROFILE =========================== -->
+    <section class="view" id="panel-profile" role="tabpanel">
+      <div class="grid-2">
+        <section class="card">
+          <div class="card-head">
+            <h2>Shape</h2>
+            <select id="prof-preset" class="btn btn-sm" style="height:26px">
+              <option value="">load preset&hellip;</option>
+            </select>
+          </div>
+          <div class="card-body">
+            <div class="fields is-tight" id="prof-shape"></div>
+            <div class="derived" id="prof-derived"></div>
+          </div>
+          <div class="card-body" style="border-top:1px solid var(--line)">
+            <div class="fields" id="prof-timing"></div>
+            <p class="prose" style="margin-top:10px">Deliberately short. Tracing
+              records every launch and the analysis step then pays for each one,
+              so a full benchmark's worth of iterations costs minutes of export
+              and tells you nothing the first few forwards do not.</p>
+          </div>
+          <div class="card-body" style="border-top:1px solid var(--line)">
+            <div class="card-head" style="padding:0 0 8px; border:0">
+              <h2>Profilers</h2>
+              <button class="btn btn-sm" id="prof-ncu-probe">test counters</button>
+            </div>
+            <div id="prof-tools-body"></div>
+          </div>
+        </section>
+
+        <div class="stack">
+          <section class="card">
+            <div class="card-head">
+              <h2>Configuration</h2>
+              <span class="sub">what to profile</span>
+            </div>
+            <div class="card-body"><div class="fields" id="prof-optimization"></div></div>
+            <details class="disclosure">
+              <summary>Kernel switches</summary>
+              <div class="disclosure-body"><div class="fields" id="prof-env"></div></div>
+            </details>
+            <div class="card-body">
+              <pre class="command is-compact" id="prof-command">&nbsp;</pre>
+              <label class="checkline" style="margin-top:12px">
+                <input type="checkbox" id="prof-devenv">
+                launch through <code>scripts/devenv.bat</code></label>
+              <p class="prose" style="margin-top:6px">Try this if the kernel table
+                comes back with nothing from <code>csrc/</code>. Inside a traced
+                process the extension's build can fail where it succeeds
+                untraced, and the harness then runs the SDPA fallback without
+                reporting an error. Putting MSVC on PATH first means nothing has
+                to be spawned to find it.</p>
+              <div class="issues" id="prof-issues" style="margin-top:12px"></div>
+              <div class="btn-row" style="margin-top:14px">
+                <button class="btn btn-primary" id="prof-go">Profile</button>
+                <button class="btn btn-danger" id="prof-stop" disabled>Stop</button>
+                <span class="status-line" id="prof-job-status">no job yet</span>
+              </div>
+            </div>
+          </section>
+
+        </div>
+      </div>
+
+      <div class="stack" style="margin-top:16px">
+        <section class="card" id="prof-results-card" hidden>
+          <div class="card-head">
+            <h2>Where the time goes</h2>
+            <span class="sub" id="prof-range-note"></span>
+          </div>
+          <div class="card-body" id="prof-summary"></div>
+        </section>
+
+        <section class="card" id="prof-kernels-card" hidden>
+          <div class="card-head">
+            <h2>Kernels</h2>
+            <div class="seg-toggle" role="group" aria-label="Which model" id="prof-range-pick"></div>
+            <button class="btn btn-sm" data-view="prof-kernels" aria-haspopup="dialog" aria-expanded="false" title="Filter and sort this table">Filter &amp; sort</button>
+            <button class="btn btn-sm" data-csv="prof-kernels">copy CSV</button>
+          </div>
+          <div class="card-body scroll-x" style="padding:0"><div class="table-note" id="prof-kernels-note" hidden></div>
+          <table class="data" id="prof-kernels"></table></div>
+        </section>
+
+        <section class="card" id="prof-memory-card" hidden>
+          <div class="card-head">
+            <h2>Memory traffic</h2>
+            <button class="btn btn-sm" data-csv="prof-memory">copy CSV</button>
+          </div>
+          <div class="card-body scroll-x" style="padding:0"><div class="table-note" id="prof-memory-note" hidden></div>
+          <table class="data" id="prof-memory"></table></div>
+        </section>
+
+        <section class="card" id="prof-report-card" hidden>
+          <div class="card-head"><h2>Report</h2></div>
+          <div class="card-body">
+            <pre class="command is-compact" id="prof-report-path">&nbsp;</pre>
+            <div class="btn-row" style="margin-top:12px">
+              <button class="btn btn-sm" id="prof-open">open in Nsight Systems</button>
+              <button class="btn btn-sm btn-danger" id="prof-delete">delete</button>
+              <span class="status-line" id="prof-report-size"></span>
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <h2>Log</h2>
+            <label class="checkline"><input type="checkbox" id="prof-follow" checked> follow</label>
+          </div>
+          <pre class="log" id="prof-log"></pre>
         </section>
       </div>
     </section>

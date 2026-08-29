@@ -19,9 +19,16 @@ python -m dashboard --no-browser   # do not open a tab
 
 It **does not change how anything is measured.** Every number in the table is
 printed by the harness itself; this reads that output and lays it out. Nothing
-in `torch_transformer_benchmark.py`, `optimized/`, `csrc/`, `kernel_ext.py` or
-`scripts/` was modified to make this work — the only edit outside this folder is
-`dashboard/runs/` in `.gitignore`.
+in `optimized/`, `csrc/`, `kernel_ext.py` or `scripts/` was modified to make this
+work.
+
+Two edits exist outside this folder. `dashboard/runs/` is in `.gitignore`, and
+`torch_transformer_benchmark.py` gained an NVTX wrapper for the Profile tab —
+about twenty lines in one place, inert unless `BENCH_NVTX=1` is set, which only a
+profile run does. A normal run constructs nothing and behaves exactly as before.
+Without it a profiler cannot tell the baseline's kernels from the optimized
+model's, because they run in one process and share their ATen and cuBLAS kernels
+by name.
 
 The command it is about to run is always shown before it runs, so any row in the
 table can be traced back to something you could paste into a terminal yourself.
@@ -77,6 +84,59 @@ runs. Half a pair is not a comparison.
 
 **Sweep** — one configuration across many shapes, one child process per shape,
 rows filling in as each finishes.
+
+**Profile** — one traced run under Nsight Systems, and where its GPU time
+actually goes. Three steps: *prepare* builds the extension, *capture* runs the
+harness under `nsys`, *analyse* turns `nsys stats` into tables.
+
+The headline is the share of a forward the GPU spends running a kernel. Above
+about 80% the time is in the kernels themselves and the table below says which;
+under about 50% the shape is launch-bound, and no amount of kernel optimization
+will move it much. Everything is the **median forward**, never the total: the
+first forward pays for cuBLAS and module loading, and one measured run had it at
+24 s against 4.7 ms for every other forward.
+
+Four things about it are worth knowing:
+
+* **Traced timings are not benchmark timings.** Tracing inflates them, so the
+  capture step's output is not parsed and no speedup is shown. Use Run for
+  numbers and Profile for proportions.
+
+* **The iteration counts are deliberately small** (`--accuracy-trials 1
+  --warmup 1 --repeats 5 --benchmark-rounds 1`). Tracing records every launch and
+  the analysis pays for each one.
+
+* **Attribution comes from NVTX.** Both models run in one process and share ATen
+  and cuBLAS kernels by name, so the only thing separating them is the range the
+  harness emits when `BENCH_NVTX=1`, which the dashboard sets. A run without it
+  emits nothing and the view says so.
+
+* **CUDA graphs are traced at node granularity.** `nsys` records a graph launch
+  as one opaque entry by default, which made a graphed forward read as "2 kernels"
+  and hid everything inside it. `--cuda-graph-trace=node` is not optional here.
+
+The traced harness runs through `_profile_shim.py`, and it has to. Torch
+resolves the MSVC linker by shelling out to `where cl`; inside a profiled
+process that returns empty output, and torch's guard (`len(cl_paths) >= 1`, true
+even for `[""]`) turns that into `command = "/link.exe"`. The link fails, the
+extension does not load, and `optimized/` falls back to SDPA **without reporting
+an error** -- so the profile measures ATen and looks entirely plausible. The
+shim answers that one call from `shutil.which` and touches nothing else.
+
+If the summary ever says **no custom kernels ran**, that is what has happened
+again. The *launch through `scripts/devenv.bat`* checkbox is a second thing to
+try, though it did not help this particular failure. Which kernels count as
+yours is read from `csrc/` by scanning for `__global__` definitions, so renaming
+or adding one needs no change here.
+
+Reports accumulate in `runs/` as `<job-id>.nsys-rep` plus a `.sqlite` export,
+about a megabyte per run. The Report card shows the size, opens the trace in the
+Nsight Systems GUI, and deletes both files.
+
+**Nsight Compute** is detected but not driven. Collecting hardware counters
+returns `ERR_NVGPUCTRPERM` unless the process is elevated or
+`RmProfilingAdminOnly` is 0 under `HKLM\SYSTEM\CurrentControlSet\Services\nvlddmkm\Global\NVTweak`. The Profilers card states
+which applies rather than offering a button that cannot work.
 
 **Scripts** — every `scripts/*.py`, with a form built from its own argparse
 where it has one and a free-text box where it does not. Output is streamed raw;

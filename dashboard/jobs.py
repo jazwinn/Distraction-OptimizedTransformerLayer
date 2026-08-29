@@ -76,6 +76,10 @@ class Step:
     spec: RunSpec
     label: str
     parse_output: bool = True
+    # A step whose output is not the harness's supplies its own parser, as long
+    # as it offers the same feed()/result/finish() surface HarnessParser does.
+    # nsys stats uses this to stream its CSV in through the same machinery.
+    parser_factory: Optional[Callable[[], Any]] = None
     # Filled in as it runs.
     status: str = "pending"          # pending | running | done | failed | stopped
     exit_code: Optional[int] = None
@@ -240,7 +244,10 @@ class Job:
         # the log pane fill in live instead of all at once at the end.
         environment["PYTHONUNBUFFERED"] = "1"
 
-        parser = HarnessParser() if step.parse_output else None
+        if step.parser_factory is not None:
+            parser = step.parser_factory()
+        else:
+            parser = HarnessParser() if step.parse_output else None
 
         try:
             process = subprocess.Popen(
@@ -299,7 +306,8 @@ class Job:
             step.status = "stopped"
         elif process.returncode == 0:
             step.status = "done"
-        elif process.returncode == 2 and parser is not None:
+        elif (process.returncode == 2 and parser is not None
+              and step.parser_factory is None):
             # The harness's documented "accuracy failed" exit. The run produced
             # a real verdict, so this is a result, not a crash.
             step.status = "done"

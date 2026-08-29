@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import copy
 import math
+import os
 import statistics
 import time
 from dataclasses import dataclass
@@ -594,6 +595,36 @@ class TimingResult:
         return min(self.samples_ms)
 
 
+class _NvtxTagged(nn.Module):
+    """Wraps a model in an NVTX range so a profiler can tell whose kernels are whose.
+
+    Both models run in one process, and the ATen and cuBLAS kernels they share
+    have identical names, so a profile cannot attribute them by name alone. An
+    NVTX range around each forward is the only thing that separates them:
+    Nsight Systems projects GPU work onto these ranges, which is what makes
+    "where does the optimized model spend its time" answerable.
+
+    Only used when BENCH_NVTX=1. A normal run is not wrapped at all, so the
+    measurement this harness exists to make cannot pay for a profiling feature.
+    """
+
+    def __init__(self, inner: nn.Module, name: str) -> None:
+        super().__init__()
+        self.inner = inner
+        self.name = name
+
+    def forward(self, *args, **kwargs):
+        torch.cuda.nvtx.range_push(self.name)
+        try:
+            return self.inner(*args, **kwargs)
+        finally:
+            torch.cuda.nvtx.range_pop()
+
+
+def maybe_tag_nvtx(model: nn.Module, name: str) -> nn.Module:
+    return _NvtxTagged(model, name) if os.environ.get("BENCH_NVTX") == "1" else model
+
+
 def warmup_model(
     model: nn.Module,
     x: torch.Tensor,
@@ -908,6 +939,12 @@ def main() -> int:
     # Compile only after model construction, weight copy, device transfer, and eval().
     baseline = maybe_compile(baseline, args.compile_baseline, args.compile_mode)
     optimized = maybe_compile(optimized, args.compile_user, args.compile_mode)
+
+    # Tag last of all. Wrapping earlier would prefix the state_dict keys that
+    # copy_model_weights matches on, and would hide the model torch.compile is
+    # meant to trace.
+    baseline = maybe_tag_nvtx(baseline, "baseline")
+    optimized = maybe_tag_nvtx(optimized, "optimized")
 
     print("=== Configuration ===")
     print(config)
