@@ -7,3 +7,4 @@ dashboard/runs/
 
 # Sweep and benchmark output, regenerable
 *.log
+attention_dispatch_graph.md

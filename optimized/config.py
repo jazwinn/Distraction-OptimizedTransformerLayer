@@ -117,6 +117,35 @@ _OUT_LAYOUT_BSHD = 1
 # does not.
 LINEAR_GELU = "auto"
 
+# Fused post-attention block: add+LayerNorm, Linear+GELU, Linear, add+LayerNorm
+# in one kernel. --ffn-block overrides this for a single run.
+#
+#   "auto"  use it where it is faster, which is d_model <= _FFN_BLOCK_MAX_D
+#   "off"   always run the unfused chain
+#   "force" use it wherever the kernel covers the shape, ignoring the width
+#           gate -- for A/B only, since it loses above the gate
+#
+# The kernel itself covers d_model and ffn_dim up to 128; this is a *preference*,
+# not a coverage rule, and it lives here for the same reason attention's does --
+# the extension answers "can I serve this", the caller decides "should I".
+FFN_BLOCK = "auto"
+
+# Above this d_model the fused block loses to the unfused chain, so "auto"
+# declines it. Measured on the RTX 3070 against the real chain -- the tuned
+# linear_gelu kernel, not F.linear:
+#
+#   d_model 32 (grading shape 7):  5.60x
+#   d_model 128 shape 1:  0.979x   shape 5: 0.959x   shape 13: 0.919x
+#   d_model 128 shape 6:  0.897x
+#
+# The crossover is structural. The second GEMM reduces over ffn_dim, so a block
+# must own every column of the intermediate, which pins the row tile to 16 -- one
+# wmma m-tile. linear_gelu is free to pick a much larger BM and gets better
+# arithmetic intensity per weight load. Below d_model 64 the GEMMs are small
+# enough that collapsing four launches into one outweighs the worse tiling;
+# above it, it does not.
+_FFN_BLOCK_MAX_D = 64
+
 # Math ids, matching kGemmMath* in csrc/linear_gelu.cuh.
 _GEMM_MATH_CODE = {"auto": -1, "tf32": 0}
 

@@ -12,7 +12,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .kernels import _add_layernorm, _attention_dispatch, _linear_gelu
+from .kernels import (_add_layernorm, _attention_dispatch, _ffn_block,
+                      _linear_gelu)
 from .util import _version_or_none
 
 
@@ -191,6 +192,16 @@ class MyTransformerBlock(nn.Module):
         """
         # ====================== your codes here ======================
         attn_out = self.attention(normed, valid_token_mask, self.causal, mask_is_trivial)
+
+        # Everything from here to the end of the block is row-local, so on the
+        # unmasked path it collapses into one kernel. Tried first because when
+        # it applies it replaces all four calls below, not just one.
+        if valid_token_mask is None or mask_is_trivial:
+            fused = _ffn_block(x, attn_out, self.norm2, self.ffn_in,
+                               self.ffn_out, next_norm)
+            if fused is not None:
+                return fused
+
         x, normed = _add_layernorm(x, attn_out, self.norm2)
 
         ffn_out = self.ffn_out(_linear_gelu(normed, self.ffn_in))

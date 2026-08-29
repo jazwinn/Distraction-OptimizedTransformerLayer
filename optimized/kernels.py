@@ -88,6 +88,34 @@ def _linear_gelu(x: torch.Tensor, lin: "MyLinear") -> torch.Tensor:
     return F.gelu(lin(x), approximate="none")
 
 
+def _ffn_block(x, attn_out, norm1, ffn_in, ffn_out, norm2):
+    """The whole post-attention block in one kernel, or None to run it unfused.
+
+    None rather than an exception on every decline: this is a speed preference,
+    and the caller has a correct path either way. The width gate is here rather
+    than in the kernel because the kernel covers up to d_model 128 and only
+    *wins* up to 64 -- see config._FFN_BLOCK_MAX_D for the measured crossover.
+
+    Not reached on the padded path. Padded rows are zeroed between the add and
+    the norm, and the reference normalises the zeroed rows rather than the raw
+    sum, so that pair genuinely cannot fuse.
+    """
+    if config.FFN_BLOCK == "off":
+        return None
+    if config.FFN_BLOCK != "force" and x.shape[-1] > config._FFN_BLOCK_MAX_D:
+        return None
+    kernels = _custom_kernels()
+    if kernels is None or not hasattr(kernels, "fused_ffn_block"):
+        return None
+    out = kernels.fused_ffn_block(
+        x, attn_out, norm1.weight, norm1.bias,
+        ffn_in.weight, ffn_in.bias, ffn_out.weight, ffn_out.bias,
+        norm2.weight, norm2.bias, norm1.eps,
+    )
+    # Empty list is the kernel declining a shape it has no instantiation for.
+    return (out[0], out[1]) if out else None
+
+
 def _attention_dispatch(
     q: torch.Tensor,
     k: torch.Tensor,

@@ -59,6 +59,7 @@
 #include "attention_dispatch.cuh"
 #include "add_layernorm.cuh"
 #include "linear_gelu.cuh"
+#include "ffn_block.cuh"
 #include "tile_attention.h"
 
 #include <torch/extension.h>
@@ -107,6 +108,15 @@ torch::Tensor smoke_test_identity(torch::Tensor x) {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("smoke_test_identity", &smoke_test_identity,
           "Copies input to output via a trivial CUDA kernel (build smoke test)");
+    m.def("fused_ffn_block", &fused_ffn_block,
+          "Fused add+LayerNorm, Linear+GELU, Linear, add+LayerNorm. "
+          "Returns {x2, normed2}, or an empty list when the shape is not covered.",
+          pybind11::arg("x"), pybind11::arg("attn_out"),
+          pybind11::arg("norm1_w"), pybind11::arg("norm1_b"),
+          pybind11::arg("ffn_in_w"), pybind11::arg("ffn_in_b"),
+          pybind11::arg("ffn_out_w"), pybind11::arg("ffn_out_b"),
+          pybind11::arg("norm2_w"), pybind11::arg("norm2_b"),
+          pybind11::arg("eps"));
     m.def("linear_gelu", &linear_gelu,
           "GELU(x @ weight^T + bias) in one kernel; undefined tensor if unsupported",
           pybind11::arg("x"),

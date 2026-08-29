@@ -2196,3 +2196,51 @@ It was caught by the control column (0.44x on one row, where the true value is
 discarded and re-run. Every number above comes from a run whose control column
 sits inside 0.91x-1.07x. This is what the control row is for; a table without
 one would have shipped the contaminated ranking.
+
+## Fused post-attention block: why the gate is d_model 64
+
+`ffn_block.cuh` runs add+LayerNorm, Linear+GELU, ffn_out and add+LayerNorm as
+one kernel, keeping `h`, `y` and `n1` on chip instead of round-tripping each to
+HBM. It covers d_model and ffn_dim up to 128, and `config._FFN_BLOCK_MAX_D`
+declines it above 64.
+
+The bound is a preference, not coverage, so it lives in `optimized/kernels.py`
+alongside the other "should I" decisions rather than in the kernel's `SUPPORTED`.
+
+A/B against the real chain, interleaved in one process, best round per side,
+RTX 3070 idle. The chain is what `MyTransformerBlock.forward` actually runs --
+the tuned `linear_gelu` kernel for the first GEMM, not `F.linear`:
+
+| case | rows | d_model | chain ms | fused ms | fused/chain |
+|:--|--:|--:|--:|--:|--:|
+| shape 7  | 8192    |  32 | 0.0815  | 0.0146  | **5.597x** |
+| shape 1  | 8192    | 128 | 0.1450  | 0.1481  | 0.979x |
+| shape 5  | 16384   | 128 | 0.2722  | 0.2838  | 0.959x |
+| shape 13 | 65536   | 128 | 1.0357  | 1.1274  | 0.919x |
+| shape 6  | 1280000 | 128 | 20.0054 | 22.3099 | 0.897x |
+
+Control (chain against itself, true value 1.000x) read 1.000x-1.086x, so the
+d_model 128 losses of 2%-10% clear the noise floor and the gate is real.
+
+**The first measurement of this was wrong and worth recording.** Timing the chain
+with `F.gelu(F.linear(...))` for the first GEMM made the fused kernel look like a
+1.10x-1.16x win at d_model 128. That is not the chain the model runs. Against the
+tuned `linear_gelu` the same kernel loses. Rule 1 says never compare across runs;
+this is its neighbour -- never compare against a baseline the product does not
+use.
+
+Why the crossover is structural rather than tunable: the second GEMM reduces over
+ffn_dim, so a block cannot emit any output column until it holds the whole
+intermediate row. That pins the row tile to 16, one wmma m-tile, where
+`linear_gelu` is free to pick a much larger one and gets far better arithmetic
+intensity per weight load. Below d_model 64 the GEMMs are small enough that
+collapsing four launches into one outweighs the worse tiling; above it, it does
+not. Raising `_FFN_BLOCK_MAX_D` needs a kernel that tiles ffn_dim, not a new
+number here.
+
+End to end, shape 7 goes 9.6x -> 12.514x (optimized 0.41 ms -> 0.2918 ms) with
+`max_abs` 0.00137496 against the 2e-3 budget, unchanged from the unfused path.
+
+The padded path never reaches this kernel: padded rows are zeroed *between* the
+add and the norm, and the reference normalises the zeroed rows rather than the
+raw sum, so that pair cannot fuse without changing the answer.
