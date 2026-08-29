@@ -1,4 +1,4 @@
-# Optimizing a Transformer's Attention Layer
+# Distraction — engineering record
 
 Everything measured, and the record of what was built, what broke, and what each fix was
 actually worth. [README.md](README.md) covers installing, building and how the code works;

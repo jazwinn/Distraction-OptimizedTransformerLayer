@@ -7,8 +7,9 @@
 // plain list of preferences.
 //
 // The three candidates live in attention_scalar.cuh, attention_wmma.cuh and
-// tile_attention.cu; the SDPA fallback for everything none of them covers is at
-// the bottom of the unnamed namespace here.
+// tile_attention.cu. There is no fourth: nothing here falls back to SDPA or to
+// any other prebuilt attention, and a case none of them covers raises at the
+// bottom of fused_attention_forward.
 
 #pragma once
 
@@ -325,9 +326,9 @@ torch::Tensor to_bshd(const torch::Tensor& t) {
 //                      1 -> [B, S, H*head_dim], ready for out_proj
 //
 // returns            : the requested layout, always. The wmma and scalar
-//                      kernels write layout 1 directly; the tile kernels and
-//                      the SDPA fallback produce layout 0 and are converted
-//                      here, so the caller never has to ask which it got.
+//                      kernels write layout 1 directly; the tile kernels
+//                      produce layout 0 and are converted here, so the caller
+//                      never has to ask which it got.
 torch::Tensor fused_attention_forward(torch::Tensor q,
                                       torch::Tensor k,
                                       torch::Tensor v,

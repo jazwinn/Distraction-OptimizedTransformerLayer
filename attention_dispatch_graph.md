@@ -5,14 +5,10 @@ Every decision is made on the host before anything is launched; the device only 
 Edge labels below indicate dispatch conditions, kept concise so arrows remain compact. The full rule behind each label is documented in the reference table following each diagram.
 
 Sections 1-3 draw **only the default path**: every knob at the value
-`optimized/config.py` ships (`ATTENTION_IMPL`, `ATTENTION_FP16`, `LINEAR_GELU`,
+`optimized/config.py` ships (`ATTENTION_IMPL`, `ATTENTION_PRECISION`, `LINEAR_GELU`,
 `FFN_BLOCK` and `CUDA_GRAPH` all `"auto"`, `MICROBATCH_FALLBACK` on). Branches a
-forced `--attn-impl` or `--attn-fp16` opens are listed under each diagram rather
+forced `--attn-impl` or `--attn-precision` opens are listed under each diagram rather
 than drawn, because nothing in a normal run can reach them.
-
-> [!NOTE]
-> **In-Flight Refactoring**  
-> [`csrc/kernel_common.cuh`](file:///C:/Users/ngjaz/OneDrive/Documents/OptimizingTransformerLayer/csrc/kernel_common.cuh), [`csrc/attention_wmma.cuh`](file:///C:/Users/ngjaz/OneDrive/Documents/OptimizingTransformerLayer/csrc/attention_wmma.cuh), and [`csrc/attention_dispatch.cuh`](file:///C:/Users/ngjaz/OneDrive/Documents/OptimizingTransformerLayer/csrc/attention_dispatch.cuh) are mid-refactor in the working tree: the kernel choice (`Impl`) and the arithmetic precision (`AttnPrecision`) are being split into two orthogonal axes. Sections 2 and 3 detail these two axes as currently structured in the source. Three loose ends remain open—see [Status](#status) for details.
 
 ---
 
@@ -72,7 +68,7 @@ flowchart TD
 
 | Label | Rule | Source Location |
 | :--- | :--- | :--- |
-| `hit` | `(shape, dtype, device, use_mask, backend, impl, linear_gelu, attn_fp16)` is present in `_graphs` | [`graphs._graph_key`](file:///C:/Users/ngjaz/OneDrive/Documents/OptimizingTransformerLayer/optimized/graphs.py) |
+| `hit` | `(shape, dtype, device, use_mask, impl, linear_gelu, precision)` is present in `_graphs`. `ATTENTION_BACKEND` is deliberately absent: it has one legal value, so it can never make two calls differ | [`graphs._graph_key`](file:///C:/Users/ngjaz/OneDrive/Documents/OptimizingTransformerLayer/optimized/graphs.py) |
 | `miss` | Not cached, or `_graph_eligible` declines: graphs disabled, non-CUDA device, capture already in progress, `_GRAPH_MAX_ENTRIES` reached, or activation exceeds `_GRAPH_MAX_ACTIVATION` | [`graphs._graph_eligible`](file:///C:/Users/ngjaz/OneDrive/Documents/OptimizingTransformerLayer/optimized/graphs.py) |
 | `1` | Batch size is 1, or `MICROBATCH_FALLBACK` is off — single whole-batch eager pass | [`model.forward`](file:///C:/Users/ngjaz/OneDrive/Documents/OptimizingTransformerLayer/optimized/model.py) |
 | `n` | Batch size > 1: predict peak memory, split up front if exceeding 85% device VRAM, then halve on every `OutOfMemoryError` | [`model._forward_chunk_on_oom`](file:///C:/Users/ngjaz/OneDrive/Documents/OptimizingTransformerLayer/optimized/model.py) |
@@ -176,11 +172,11 @@ The generic scalar node acts as the coverage floor. Non-standard `head_dim` valu
 
 ## 3. Attention: Arithmetic Precision Axis
 
-Orthogonal to Section 2: `Impl` designates kernel architecture, while `AttnPrecision` specifies the numeric contracting precision for its GEMMs. These were previously unified in a single parameter, which forced `tile-fp16` to specify both simultaneously while WMMA precision was controlled by a global `--attn-fp16` flag.
+Orthogonal to Section 2: `Impl` designates kernel architecture, while `AttnPrecision` specifies the numeric contracting precision for its GEMMs. These were previously unified in a single parameter, which forced `tile-fp16` to specify both simultaneously while WMMA precision was controlled by a global `--attn-fp16` flag. Splitting them landed in `99c8cd8`; `--attn-impl tile-fp16` and friends were removed rather than kept as aliases -- pass the kernel to `--attn-impl` and the arithmetic to `--attn-precision`.
 
 ```mermaid
 flowchart TD
-    prec(["ATTENTION_FP16 = auto"])
+    prec(["ATTENTION_PRECISION = auto"])
     kern{"Kernel from<br/>Section 2"}
     dt{"Input Dtype"}
 
@@ -210,11 +206,11 @@ flowchart TD
 | Label | Rule |
 | :--- | :--- |
 | `wmma` / `scalar` | Whichever kernel Section 2 selected. `auto` never picks tile, so no `MathMode` is ever computed |
-| `FP32` | The only dtype with a choice to make. `ATTENTION_FP16 == "auto"` pushes `wmma_set_fp16(True)` once, on change rather than per call, and `AttnPrecision::Auto` then reads that flag -- so the default resolves to FP16 fragments every time |
+| `FP32` | The only dtype with a choice to make. `ATTENTION_PRECISION == "auto"` pushes `wmma_set_fp16(True)` once, on change rather than per call (`kernels._sync_attention_precision`), and `AttnPrecision::Auto` then reads that flag -- so the default resolves to FP16 fragments every time |
 | `16-bit` | Tensors supplied in `fp16` or `bfloat16` contract in their native precision. The precision argument applies solely to **fp32 inputs** -- narrowing further is impossible, and widening back cannot restore lost mantissa bits |
 
 **Not drawn.** `AttnPrecision::Fp16`, `Bf16` and `Tf32` are explicit requests that
-override the flag, and `--attn-fp16 tf32` flips the flag itself so `Auto`
+override the flag, and `--attn-precision tf32` flips the flag itself so `Auto`
 resolves to TF32 fragments (16x16x8) instead. BF16 fragments exist for
 measurement only. None of the three is reachable with the shipped defaults; the
 combinations that exist at all are below.
@@ -413,13 +409,20 @@ Fallbacks occur exclusively on coverage constraints: `float32` input, `K % 4 == 
 
 ---
 
-## 9. Current Working Tree Status
+## 9. Status
 
-The two-axis dispatch refactoring documented in Sections 2 and 3 reflects the active working tree state. Three tasks remain to complete the build:
+The two-axis dispatch split documented in Sections 2 and 3 is **complete** as of `99c8cd8`
+("Separate the attention kernel from the arithmetic it uses"), and the source comments describing
+it have been brought in line. Nothing is open.
 
-1. **Enum Alignment**: `run_kernel` in [`csrc/attention_dispatch.cuh`](file:///C:/Users/ngjaz/OneDrive/Documents/OptimizingTransformerLayer/csrc/attention_dispatch.cuh) retains legacy `case Impl::TileBf16`, `TileTf32`, and `TileFp16` cases. These must be replaced by `tile_math_for(prec)`.
-2. **Precision Initialization**: `AttnArgs::prec` is declared and read in `launch_wmma`, but its instantiation in `fused_attention_forward` is currently uninitialized (defaulting to `Auto`), preventing explicit caller precision overrides.
-3. **API & Binding Propagation**: Precision parameters require full wiring through `fused_attention_forward` (currently taking only `impl` and `out_layout`), PyBind signatures, `config._IMPL_CODE`, `--attn-impl`, `--attn-fp16`, and `tile_workspace_bytes`.
-
-### Stale Comments & Header Documentation
-The directory overview header in [`csrc/fused_attention.cu`](file:///C:/Users/ngjaz/OneDrive/Documents/OptimizingTransformerLayer/csrc/fused_attention.cu) contains outdated notes indicating `head_dim` is restricted to $\{8,16,32,64\}$, that uncovered dimensions fall back to SDPA, and that `auto` declines `head_dim == 128`. All three statements have been superseded by generic scalar dispatch and SDPA removal.
+The split touched three layers, all landed: `run_kernel` carries only the four kernel choices and
+derives the tile math mode through `tile_math_for(prec)`; `AttnArgs::prec` is populated in
+`fused_attention_forward` and read by both `launch_wmma` and the tile launcher; and
+`--attn-precision` is its own flag, backed by `config.ATTENTION_PRECISION` and
+`config._PRECISION_CODE`. The old fused spellings (`tile-fp16`, `tile-tf32`, `tile-bf16`) were
+removed rather than kept as aliases: `--attn-impl` rejects them in
+[`optimized/cli.py`](optimized/cli.py) and [`dashboard/argspec.py`](dashboard/argspec.py), and
+`impl > 3` raises in [`csrc/attention_dispatch.cuh`](csrc/attention_dispatch.cuh) with a message
+naming the two axes to move to. `optimized/graphs.py` keys captures on `ATTENTION_PRECISION` rather
+than the former `attn_fp16`, and drops `ATTENTION_BACKEND` from the key entirely now that it has one
+legal value.

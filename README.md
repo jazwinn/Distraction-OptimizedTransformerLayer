@@ -1,4 +1,6 @@
-# Optimizing a Transformer Layer
+# Distraction
+
+*A faster attention layer for Transformers*
 
 An optimized Transformer layer for **TikTok TechJam 2026, Problem Statement 3** — accelerate a
 standard Transformer layer with custom GPU kernels while staying inside a strict

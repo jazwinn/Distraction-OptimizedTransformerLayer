@@ -16,7 +16,7 @@
 //                           fused_add_layernorm()
 //   linear_gelu.cuh         GEMM with a bias + GELU epilogue, and linear_gelu()
 //   tile_attention.h/.cu    attention on the CUDA tile programming model
-//                           (impl=3/4/5/6). A SEPARATE translation unit: it
+//                           (impl=3). A SEPARATE translation unit: it
 //                           needs -std=c++20 -enable-tile, which the torch
 //                           headers here do not survive. tile_attention.h is
 //                           the plain-pointer boundary between the two.
@@ -27,33 +27,43 @@
 // FlashAttention-style -- the [B,H,S,S] score matrix is never written to global
 // memory. K/V are streamed through shared memory a tile at a time and the
 // softmax is accumulated online (running max + running sum). Three
-// implementations of the same math:
+// implementations of the same math, on TWO independent axes: which kernel
+// (impl, below) and what arithmetic its GEMMs contract in (precision, passed
+// separately -- see the table in kernel_common.cuh).
 //
 //   wmma    tensor cores via nvcuda::wmma, 64 queries x 32 keys per block, 4
-//           warps. fp32 goes through TF32 fragments with fp32 accumulate --
-//           what cuBLAS does for the baseline under allow_tf32, so this path is
-//           *closer* to the reference than the scalar one, not further.
-//           half/bfloat16 use native 16x16x16 fragments. SM 8.0+, head_dim in
-//           {8,16,32,64,128}.
+//           warps. tf32 fragments with fp32 accumulate are what cuBLAS does for
+//           the baseline under allow_tf32, so that path is *closer* to the
+//           reference than the scalar one, not further; half/bfloat16 use
+//           native 16x16x16 fragments. No fp32 arithmetic -- no shipped tensor
+//           core has it. SM 8.0+, head_dim in {8,16,32,64,128,256} (impl=2).
 //
 //   scalar  one thread per query row, plain fp32 FMA. No tensor cores and no
 //           TF32 rounding, so it is the pre-Ampere path and the exact-arithmetic
-//           reference for A/B comparison (impl=1). head_dim in {8,16,32,64}.
+//           reference for A/B comparison (impl=1). fp32 only. Six tuned
+//           head_dims {8,16,32,64,128,256}, and behind them a generic kernel
+//           that takes ANY head_dim from 1 to 2048 -- so the scalar ALGORITHM
+//           covers every shape the others decline.
 //
-//   tile    the same math on the CUDA tile programming model. float32 and
-//           head_dim in {8,16,32,64}, and only when the build found CUDA 13.3+.
-//           impl=3/4/5/6 select fp32, bf16, tf32 and fp16 operands; none is
-//           picked by impl=0.
+//   tile    the same math on the CUDA tile programming model (impl=3). float32
+//           tensors in and out, head_dim in {8,16,32,64,128,256}, and only when
+//           the build found CUDA 13.3+. All four math modes exist here; the
+//           precision axis picks between them. Not picked by impl=0 -- it is a
+//           separate programming model to opt into deliberately.
 //
-// A head_dim outside those sets -- 24 or 48, say, or the 256 the grading set
-// contains -- falls back to SDPA. head_dim is a template parameter, so each
-// supported value is a separately compiled kernel and the set cannot be
-// open-ended.
+// head_dim is a template parameter, so each tuned value is a separately
+// compiled kernel and that set cannot be open-ended. A head_dim outside it --
+// 24 or 48, say -- lands on the generic scalar kernel. Nothing falls back to
+// SDPA: there is no prebuilt attention in this extension at all, and a case no
+// kernel covers RAISES from fused_attention_forward rather than being served
+// quietly by ATen. With the generic kernel behind everything, that line is
+// reached only past head_dim 2048.
 //
-// impl=0 (auto) does not simply take the first of the three that covers a case:
-// at head_dim 128 the wmma kernel is correct and slower than SDPA, so auto
-// declines it there and the fallback serves the call instead. Coverage and
-// preference are separate questions -- see run_kernel() in
+// impl=0 (auto) asks one question -- does anything cover this -- and tries wmma
+// before scalar, because wmma is faster everywhere the two overlap. It used to
+// also ask whether wmma was the FASTEST way to serve the case and hand the rest
+// to SDPA, which put two of the fourteen grading shapes (head_dim 256, and
+// head_dim 128 at S 128) on a prebuilt attention. See run_kernel() in
 // attention_dispatch.cuh.
 
 #include "attention_dispatch.cuh"
