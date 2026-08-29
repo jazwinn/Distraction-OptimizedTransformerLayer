@@ -31,6 +31,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from typing import List, Optional
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -254,6 +255,111 @@ def tile_enabled() -> bool:
     return _tile_enabled
 
 
+# Process names that mean a build really is in flight. ninja is the one that
+# carries the check: it stays resident for the whole build, so the gap between
+# two compile steps does not read as an idle lock.
+_BUILD_PROCESS_NAMES = (
+    "ninja", "nvcc", "cicc", "ptxas", "cudafe++", "nvlink", "fatbinary", "cl",
+)
+
+# torch.utils.cpp_extension serialises concurrent builds with a FileBaton on
+# <build_dir>/lock: whoever creates the file builds, everyone else sits in
+# `while os.path.exists(lock): sleep(0.1)`. Nothing is recorded in the file, the
+# wait has no timeout and staleness is never checked -- so a builder that dies
+# before releasing it (Ctrl-C, the dashboard's Stop button, a killed subprocess)
+# leaves the lock behind, and every later load() in every later process blocks
+# forever at ~0.6% of a core. That looks exactly like a very slow compile, which
+# is what makes it expensive: the tell is that no compiler process exists.
+#
+# The dashboard spawns a build step and a probe subprocess per run, so it wedges
+# two processes per attempt and the probe only gives up at its own 10-minute
+# timeout.
+#
+# So before handing control to load(), drop a lock that demonstrably has no
+# owner. "No owner" needs two independent signals, because deleting a LIVE lock
+# is worse than waiting on a dead one -- it lets two ninja invocations write the
+# same object files at once:
+#
+#   age       torch writes the lock within a second of deciding to build, so
+#             anything older than the threshold has long outlived that window
+#   liveness  ninja is resident for the whole build, so if no compiler process
+#             exists at all, nothing can be holding it
+#
+# If the liveness probe cannot run (no tasklist or ps, a sandbox), it says so
+# rather than guessing, and we fall back to age alone at a threshold no build of
+# this project comes close to.
+_STALE_LOCK_SECONDS = 90
+_STALE_LOCK_SECONDS_BLIND = 20 * 60
+
+
+def _a_build_is_running() -> Optional[bool]:
+    """True / False, or None when the check itself could not be made."""
+    try:
+        if sys.platform == "win32":
+            proc = subprocess.run(["tasklist", "/fo", "csv", "/nh"],
+                                  capture_output=True, text=True, timeout=20)
+            names = tuple(n + ".exe" for n in _BUILD_PROCESS_NAMES)
+        else:
+            proc = subprocess.run(["ps", "-eo", "comm="],
+                                  capture_output=True, text=True, timeout=20)
+            names = _BUILD_PROCESS_NAMES
+        if proc.returncode != 0:
+            return None
+    except Exception:
+        return None
+    listed = proc.stdout.lower()
+    # A substring test, so a name that merely contains one of these counts as a
+    # build. That errs toward waiting, which is the safe direction.
+    return any(name in listed for name in names)
+
+
+def _clear_stale_build_lock() -> None:
+    lock_path = os.path.join(_BUILD_DIR, "lock")
+    try:
+        # getmtime, NOT getctime, and not Windows' CreationTime either. NTFS
+        # file tunneling hands a file recreated in the same directory shortly
+        # after a delete the *deleted* file's creation time -- measured here at
+        # 12 minutes stale on a lock that was seconds old. Age off that and this
+        # function would delete live locks. mtime is set when the baton creates
+        # the file and is not tunnelled.
+        age = time.time() - os.path.getmtime(lock_path)
+    except OSError:
+        return  # no lock, or it vanished under us -- either way nothing to do
+
+    building = _a_build_is_running()
+    if building is True:
+        return
+    if age < (_STALE_LOCK_SECONDS if building is False else _STALE_LOCK_SECONDS_BLIND):
+        return
+
+    # A third signal, free and exact, on Windows only: FileBaton keeps the fd
+    # open for as long as it holds the lock (`release()` is close-then-remove),
+    # so deleting a lock whose owner is alive fails with PermissionError and
+    # deleting an orphaned one succeeds. Trying is therefore safe even if both
+    # checks above were somehow wrong. POSIX unlinks open files happily, so
+    # there the age and liveness gates are the whole of it.
+    try:
+        os.remove(lock_path)
+    except OSError:
+        return  # someone does own it after all -- leave it alone
+
+    # Only now, having taken the real lock, is ninja's safe to drop too.
+    try:
+        os.remove(os.path.join(_BUILD_DIR, ".ninja_lock"))
+    except OSError:
+        pass
+
+    # Never silent: deleting another process's lock is exactly the kind of thing
+    # that should show up in the log of the run that did it.
+    print(
+        f"[kernel_ext] removed a stale build lock ({age:.0f}s old, no compiler "
+        f"process running, not held open by anyone). A previous build was "
+        f"interrupted before releasing it; every load() would otherwise have "
+        f"waited on it forever.",
+        file=sys.stderr,
+    )
+
+
 def get_kernels(verbose: bool = False):
     """JIT-build (once) and return the extension module, or None if unavailable."""
     global _kernels, _load_attempted, _load_error, _tile_enabled
@@ -302,6 +408,8 @@ def get_kernels(verbose: bool = False):
         major, minor = torch.cuda.get_device_capability()
         arch = f"{major}{minor}"
         os.makedirs(_BUILD_DIR, exist_ok=True)
+        # Before anything can block on it -- see _clear_stale_build_lock.
+        _clear_stale_build_lock()
 
         base_cuda_flags = [
             "-O3",
