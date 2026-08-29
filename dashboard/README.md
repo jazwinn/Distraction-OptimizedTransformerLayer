@@ -59,8 +59,19 @@ shape and fills the table row by row; the summary then leads with the geometric
 mean instead of a single speedup.
 
 Everything else is shared either way: dtype, tolerances, iteration counts, and
-an Optimizations panel covering `--attn-backend`, `--attn-impl`, `--attn-fp16`,
-`--linear-gelu` and `--cuda-graph`.
+an Optimizations panel, which is split in two because its flags do two
+different kinds of thing:
+
+* **Kernel** — `--attn-impl`, `--attn-precision`, `--linear-gelu`, and every
+  environment switch under *Kernel switches*. These change what the CUDA
+  kernels compute, or which one runs.
+* **Execution** — `--cuda-graph`, which changes nothing inside a kernel and
+  removes launch overhead around them, and `--attn-backend`, now a single-value
+  dispatch flag kept so older command lines still parse.
+
+The split is presentation only: `optimized/cli.py` still declares one group, and
+a flag added there appears under *Kernel* unless it is named in the short list
+of execution-level ones.
 
 *(This replaces the old Sweep tab, which was this with the picker and no typed
 fields. The server still calls a multi-shape run a sweep, and history records it

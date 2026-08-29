@@ -121,16 +121,24 @@
 
           <section class="card">
             <div class="card-head"><h2>Optimizations</h2></div>
-            <div class="card-body"><div class="fields" id="run-optimization"></div></div>
+            <div class="card-body">
+              <div class="subhead">Kernel<span>what the CUDA kernels compute, and which one runs</span></div>
+              <div class="fields" id="run-optimization"></div>
+            </div>
             <details class="disclosure">
               <summary>Kernel switches <span class="tag is-info" id="run-env-count" hidden></span></summary>
               <div class="disclosure-body">
                 <p class="prose" style="margin-bottom:12px">Environment variables the
                   extension reads at startup. They go to the benchmark's child
-                  process, so they need no change to <code>csrc/</code>.</p>
+                  process, so they need no change to <code>csrc/</code>. Every one
+                  of them is kernel-level.</p>
                 <div class="fields" id="run-env"></div>
               </div>
             </details>
+            <div class="card-body is-split">
+              <div class="subhead">Execution<span>how that work is launched around them</span></div>
+              <div class="fields" id="run-optimization-exec"></div>
+            </div>
           </section>
 
         </div>
@@ -252,7 +260,14 @@
               <h2><span class="role is-a">A</span>Config A</h2>
               <button class="btn btn-sm" id="cmp-copy-ab">copy A &rarr; B</button>
             </div>
-            <div class="card-body"><div class="fields" id="cmp-a-optimization"></div></div>
+            <div class="card-body">
+              <div class="subhead">Kernel<span>what the CUDA kernels compute, and which one runs</span></div>
+              <div class="fields" id="cmp-a-optimization"></div>
+            </div>
+            <div class="card-body is-split">
+              <div class="subhead">Execution<span>how that work is launched around them</span></div>
+              <div class="fields" id="cmp-a-optimization-exec"></div>
+            </div>
             <details class="disclosure">
               <summary>Kernel switches</summary>
               <div class="disclosure-body"><div class="fields" id="cmp-a-env"></div></div>
@@ -262,7 +277,14 @@
 
           <section class="card">
             <div class="card-head"><h2><span class="role is-b">B</span>Config B</h2></div>
-            <div class="card-body"><div class="fields" id="cmp-b-optimization"></div></div>
+            <div class="card-body">
+              <div class="subhead">Kernel<span>what the CUDA kernels compute, and which one runs</span></div>
+              <div class="fields" id="cmp-b-optimization"></div>
+            </div>
+            <div class="card-body is-split">
+              <div class="subhead">Execution<span>how that work is launched around them</span></div>
+              <div class="fields" id="cmp-b-optimization-exec"></div>
+            </div>
             <details class="disclosure">
               <summary>Kernel switches</summary>
               <div class="disclosure-body"><div class="fields" id="cmp-b-env"></div></div>
@@ -352,7 +374,14 @@
               <h2>Configuration</h2>
               <span class="sub">what to profile</span>
             </div>
-            <div class="card-body"><div class="fields" id="prof-optimization"></div></div>
+            <div class="card-body">
+              <div class="subhead">Kernel<span>what the CUDA kernels compute, and which one runs</span></div>
+              <div class="fields" id="prof-optimization"></div>
+            </div>
+            <div class="card-body is-split">
+              <div class="subhead">Execution<span>how that work is launched around them</span></div>
+              <div class="fields" id="prof-optimization-exec"></div>
+            </div>
             <details class="disclosure">
               <summary>Kernel switches</summary>
               <div class="disclosure-body"><div class="fields" id="prof-env"></div></div>

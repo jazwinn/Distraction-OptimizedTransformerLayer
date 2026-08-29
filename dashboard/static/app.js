@@ -225,11 +225,21 @@ function makeField(spec, form, onChange) {
   return wrap;
 }
 
-function renderGroup(container, group, form, onChange) {
+/* Flags that do not change what a kernel computes. --cuda-graph is pure launch
+ * overhead: the same kernels run, they are just replayed from a captured graph.
+ * --attn-backend now has one value and exists so older command lines still
+ * parse. Everything else in the group is kernel-level, including anything added
+ * later, which is the way round that needs no maintenance. */
+const NON_KERNEL_FLAGS = new Set(['cuda_graph', 'attn_backend']);
+
+const isKernelFlag = (spec) => !NON_KERNEL_FLAGS.has(spec.dest);
+
+function renderGroup(container, group, form, onChange, filter) {
   if (!container) return;
   clear(container);
   state.spec.fields
     .filter((spec) => spec.group === group)
+    .filter((spec) => !filter || filter(spec))
     .forEach((spec) => container.appendChild(makeField(spec, form, onChange)));
 }
 
@@ -1395,8 +1405,13 @@ function setupRun() {
     $('run-command'), $('run-issues'), $('run-derived'), updateEnvBadge);
   const changed = () => preflight();
 
-  ['shape', 'optimization', 'timing', 'accuracy', 'data', 'torch', 'other']
+  ['shape', 'timing', 'accuracy', 'data', 'torch', 'other']
     .forEach((group) => renderGroup($('run-' + group), group, form, changed));
+  // One group in the spec, two panels here: the split is about reading
+  // them, not about what the server does with them.
+  renderGroup($('run-optimization'), 'optimization', form, changed, isKernelFlag);
+  renderGroup($('run-optimization-exec'), 'optimization', form, changed,
+    (spec) => !isKernelFlag(spec));
   renderEnv($('run-env'), form, changed);
 
   fillPresetSelect($('run-preset'), (preset) => applyPreset($('run-shape'), preset));
@@ -1534,17 +1549,24 @@ function setupCompare() {
 
   renderGroup($('cmp-shape'), 'shape', state.forms.cmpShape, both);
   renderGroup($('cmp-timing'), 'timing', state.forms.cmpShape, both);
-  renderGroup($('cmp-a-optimization'), 'optimization', a, both);
-  renderGroup($('cmp-b-optimization'), 'optimization', b, both);
+  renderGroup($('cmp-a-optimization'), 'optimization', a, both, isKernelFlag);
+  renderGroup($('cmp-b-optimization'), 'optimization', b, both, isKernelFlag);
+  renderGroup($('cmp-a-optimization-exec'), 'optimization', a, both,
+    (spec) => !isKernelFlag(spec));
+  renderGroup($('cmp-b-optimization-exec'), 'optimization', b, both,
+    (spec) => !isKernelFlag(spec));
   renderEnv($('cmp-a-env'), a, both);
   renderEnv($('cmp-b-env'), b, both);
 
   fillPresetSelect($('cmp-preset'), (preset) => applyPreset($('cmp-shape'), preset));
 
   $('cmp-copy-ab').addEventListener('click', () => {
-    state.spec.fields.filter((spec) => spec.group === 'optimization').forEach((spec) =>
-      setFieldValue($('cmp-b-optimization'), spec.dest,
-        a[spec.dest] === undefined ? '' : a[spec.dest]));
+    state.spec.fields.filter((spec) => spec.group === 'optimization').forEach((spec) => {
+      // The flags live in two panels now; the value could be in either.
+      const target = isKernelFlag(spec) ? 'cmp-b-optimization'
+        : 'cmp-b-optimization-exec';
+      setFieldValue($(target), spec.dest, a[spec.dest] === undefined ? '' : a[spec.dest]);
+    });
     state.spec.env_knobs.forEach((knob) => {
       const value = (a.env || {})[knob.name];
       setFieldValue($('cmp-b-env'), knob.name, value === undefined ? knob.default : value);
@@ -2154,7 +2176,9 @@ function setupProfile() {
 
   renderGroup($('prof-shape'), 'shape', form, preflight);
   renderGroup($('prof-timing'), 'timing', form, preflight);
-  renderGroup($('prof-optimization'), 'optimization', form, preflight);
+  renderGroup($('prof-optimization'), 'optimization', form, preflight, isKernelFlag);
+  renderGroup($('prof-optimization-exec'), 'optimization', form, preflight,
+    (spec) => !isKernelFlag(spec));
   renderEnv($('prof-env'), form, preflight);
   fillPresetSelect($('prof-preset'), (preset) => applyPreset($('prof-shape'), preset));
 
@@ -3188,7 +3212,7 @@ function showExtension(info) {
     dot.className = 'dot is-warning';
     text.textContent = 'loaded, no cuTile';
   }
-  chip.title = info.error || 'The tile-* attention modes need a cuTile-capable '
+  chip.title = info.error || 'The tile attention kernel needs a cuTile-capable '
     + 'build (CUDA 13.3+).';
 }
 
