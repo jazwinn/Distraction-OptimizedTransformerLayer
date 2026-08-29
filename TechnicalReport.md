@@ -45,7 +45,7 @@
     - [8.2 Shape 14, and the limits of an 8 GB card](#82-shape-14-and-the-limits-of-an-8-gb-card)
 - **[9. Limitations](#9-limitations)**
     - [9.1 The matrix-multiply hardware is barely used](#91-the-matrix-multiply-hardware-is-barely-used)
-    - [9.2 The accuracy margin belongs to the reference, not the kernel](#92-the-accuracy-margin-belongs-to-the-reference-not-the-kernel)
+    - [9.2 Everything is tuned for exactly one machine](#92-everything-is-tuned-for-exactly-one-machine)
     - [9.3 The understanding behind this is newer than the results suggest](#93-the-understanding-behind-this-is-newer-than-the-results-suggest)
 - **[10. AI Involvement During Development](#10-ai-involvement-during-development)**
     - [10.1 The tools, and what they enabled](#101-the-tools-and-what-they-enabled)
@@ -1209,20 +1209,27 @@ One measurement in that table is already ideal: the attention kernel reads exact
 per request against a best case of 4, so its access pattern cannot be improved. What it reads is
 efficient; there is simply a lot of it.
 
-### 9.2 The accuracy margin belongs to the reference, not the kernel
+### 9.2 Everything is tuned for exactly one machine
 
-The grader allows a difference of 0.002. Before the optimized code does anything at all, the
-reference implementation's own rounding already sits **0.00098 to 0.0012** away from an exact
-result — over half the budget. The tightest graded shape finishes at 0.00135, leaving about a third
-of the allowance spare.
+None of the numbers that make this fast were derived. They were measured, on one card, and they do
+not transfer.
 
-That margin cannot be spent on more speed. The obvious next step would be a narrower number format,
-and the one below fp16 is unusable: measured against the same budget it lands at **425% to 622%**,
-with tens of thousands of failing values — and that is for a mathematically perfect implementation,
-not a flawed one. The limit is the tolerance against the reference's own noise, not the kernel.
+| Constant | Value | What it decides |
+| --- | ---: | --- |
+| Graph capture gate | 524,288 | Whether the kernel sequence is recorded and replayed |
+| Fused block width limit | 64 | Whether the whole post-attention chain becomes one kernel |
+| Warp-per-row limit | 256 | Which normalisation kernel runs |
+| Block shapes | per head size, format and masking | Every attention kernel's tile size |
 
-It also means the margin is not fully under this project's control. A different driver, or a
-reference computed slightly differently, moves a number that is already more than half spent.
+On a faster card several of these move in ways that are not obvious. The graph gate, for instance,
+should get **larger**, not smaller: it marks the point where the card stops running out of work
+between instructions, and a quicker card reaches that point at a bigger workload. Someone reusing
+this on other hardware would need to re-measure all of it, and the sweeps that produced these values
+take hours.
+
+The build is equally specific. It expects Windows, Microsoft's C++ compiler pinned to one version,
+and a Microsoft-only tool to locate it. Nothing here has been run on Linux.
+
 
 ### 9.3 The understanding behind this is newer than the results suggest
 

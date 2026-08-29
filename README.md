@@ -90,7 +90,7 @@ Every number in this project comes from one machine:
 The graphics card is the part that matters. It sets which kernels can run at all, and it sets the
 speedups: the largest gains here come from keeping the card busy, so a faster card would starve at
 larger input sizes and a slower one at smaller ones. Every tuned constant in the project was chosen
-by measurement on this card, and would need re-measuring on a different one.
+by measurement on this card.
 
 ### Results
 
@@ -356,15 +356,18 @@ left, and it will not come from doing less arithmetic — the kernels are waitin
 gains have to come from moving less of it, or from keeping more work resident so the waiting
 overlaps with something useful.
 
-**The accuracy budget is mostly spent before this project does anything.** The allowance is a
-difference of 0.002. The reference implementation's own rounding already sits between 0.00098 and
-0.0012 away from a mathematically exact answer — over half the budget.
+**Everything is tuned for exactly one machine.** None of the numbers that make this fast were
+derived — they were measured, on one card, and they do not transfer. When the kernel sequence is
+recorded and replayed, when the whole post-attention chain collapses into a single kernel, which
+normalisation kernel runs, and every attention tile size: all of it is a constant picked by
+sweeping the options and keeping the fastest.
 
-That margin cannot be traded for speed. The obvious next step would be an even narrower number
-format, and the one below the current choice is unusable: measured against the same budget it lands
-at 425% to 622%, with tens of thousands of failing values, and that is for a mathematically perfect
-implementation. It also means the margin is not entirely under this project's control — a different
-driver moves a number that is already more than half spent.
+On a different card several of those move in ways that are not obvious. The recording threshold, for
+instance, should get **larger** on a faster card, not smaller — it marks the point where the card
+stops running out of work between instructions, and a quicker card reaches that point at a bigger
+workload. Anyone reusing this on other hardware would have to re-measure all of it, and the sweeps
+that produced these values take hours.
+
 
 **The design grew rather than being planned.** I had a solid foundation in the basics of GPU
 programming, but the specific ground this project stands on was learned over a few days while
