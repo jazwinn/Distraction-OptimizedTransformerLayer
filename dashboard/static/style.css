@@ -536,6 +536,15 @@ table.data th.left, table.data td.left { text-align: left; }
   background: var(--mark-track); overflow: hidden;
 }
 .share-fill { height: 100%; border-radius: 999px; background: var(--mark); }
+/* At 80% of peak NVIDIA's own rule calls a kernel near the roofline, so the bar
+ * stops being a magnitude and starts being a state. */
+.share-fill.is-hot { background: var(--warning); }
+
+/* One line per rule, the rest on the title -- same treatment as .note. */
+.rule-line {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  min-width: 0; cursor: help;
+}
 .share-value { min-width: 44px; text-align: right; color: var(--ink-2); }
 
 .tool-row { display: flex; align-items: center; gap: 10px; padding: 5px 0; }

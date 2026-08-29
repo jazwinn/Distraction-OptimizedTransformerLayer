@@ -656,3 +656,274 @@ def human_ns(value: Optional[float]) -> str:
         if abs(value) < scale * 1000 or unit == "s":
             return f"{value / scale:.2f} {unit}"
     return f"{value:.0f} ns"
+
+
+# --------------------------------------------------------------------------
+# Nsight Compute: per-kernel counters
+# --------------------------------------------------------------------------
+
+# nsys says which kernel owns the time. It cannot say why that kernel takes it.
+# These four sections answer that and stop: ncu replays every kernel it profiles
+# once per pass, so each extra section is paid for on every launch.
+NCU_SECTIONS = (
+    "SpeedOfLight",             # compute vs memory, as a share of peak
+    "LaunchStats",              # registers, shared memory, block and grid
+    "Occupancy",                # achieved vs theoretical, and what limits it
+    "ComputeWorkloadAnalysis",  # IPC, to separate "stalled" from "not issuing"
+)
+
+# The metrics read out of those sections, by the name ncu prints. The section is
+# part of the address, not decoration: several of these names appear in more
+# than one section with different units.
+_SOL_SECTION = "GPU Speed Of Light Throughput"
+_SOL_COMPUTE = "Compute (SM) Throughput"
+_SOL_MEMORY = "Memory Throughput"
+_SOL_DRAM = "DRAM Throughput"
+_SOL_DURATION = "Duration"
+
+# Occupancy is capped by whichever of these is smallest, and naming the binding
+# one is the difference between "occupancy is low" and something actionable.
+_BLOCK_LIMITS = {
+    "Block Limit Registers": "registers per thread",
+    "Block Limit Shared Mem": "shared memory per block",
+    "Block Limit Warps": "block size",
+    "Block Limit SM": "the SM's own block limit",
+}
+
+
+def ncu_argv(ncu: str, argv: List[str], kernels: Optional[List[str]] = None,
+             launch_count: int = 12) -> List[str]:
+    """Collect counters for our kernels only, a bounded number of times.
+
+    Both restrictions are load-bearing. ncu replays a kernel several times to
+    gather one section, so profiling every ATen and cuBLAS launch in a forward
+    would take a very long time to tell us about code we do not own; and without
+    a launch cap it would do that for every iteration of the benchmark.
+    """
+    command = [ncu, "--csv"]
+    for section in NCU_SECTIONS:
+        command += ["--section", section]
+
+    names = kernels if kernels is not None else _OWN_NAMES
+    if names:
+        # Matched against the demangled name, which is where our kernels' own
+        # names survive: "void <unnamed>::gemm_bias_gelu_kernel<...>".
+        command += ["--kernel-name", "regex:" + "|".join(names)]
+    if launch_count:
+        command += ["--launch-count", str(int(launch_count))]
+
+    return command + through_shim(argv)
+
+
+class NcuResult:
+    def __init__(self) -> None:
+        self.rows: List[Dict[str, str]] = []
+        self.error_lines: List[str] = []
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "kernels": analyse_ncu(self.rows),
+            "error_lines": self.error_lines[-20:],
+        }
+
+
+class NcuParser:
+    """ncu --csv on stdout -> rows, one line at a time.
+
+    Same feed()/result/finish() surface as the other parsers here, so jobs.py
+    streams it unchanged. ncu prefixes its CSV with ==PROF== and ==WARNING==
+    chatter, so the header line is found rather than assumed to be first.
+    """
+
+    def __init__(self) -> None:
+        self.result = NcuResult()
+        self._header: Optional[List[str]] = None
+        self._buffer: List[str] = []
+
+    def feed(self, line: str) -> None:
+        text = line.rstrip("\r\n")
+        if text.startswith("==ERROR==") or "ERR_NVGPUCTRPERM" in text:
+            self.result.error_lines.append(text)
+            return
+        if text.startswith("==") or not text.strip():
+            return
+        if self._header is None:
+            if text.startswith('"ID"'):
+                self._header = next(csv.reader([text]))
+            return
+        self._buffer.append(text)
+        # A metric value can carry a quoted comma ("1,491,586"), so rows are
+        # parsed rather than split -- but a row can also wrap, so only parse
+        # once the quotes balance.
+        if text.count('"') % 2 == 0:
+            self._flush()
+
+    def _flush(self) -> None:
+        if self._header is None or not self._buffer:
+            return
+        for record in csv.reader(io.StringIO("\n".join(self._buffer))):
+            if record:
+                self.result.rows.append(dict(zip(self._header, record)))
+        self._buffer = []
+
+    def finish(self, returncode: int) -> NcuResult:
+        self._flush()
+        if returncode != 0 and not self.result.rows:
+            self.result.error_lines.append(f"ncu exited {returncode}")
+        return self.result
+
+
+def _ncu_number(text: str) -> Optional[float]:
+    """'1,491,586' -> 1491586.0. ncu groups digits for people, not parsers."""
+    if text is None:
+        return None
+    cleaned = str(text).replace(",", "").strip()
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _verdict(compute: Optional[float], memory: Optional[float],
+             occupancy: Optional[float]) -> Tuple[str, str]:
+    """Compute-bound, memory-bound, or neither -- and why that follows.
+
+    The thresholds are NVIDIA's own: its Speed-of-Light rule calls a kernel
+    near the roofline at 80% of either, and flags all pipelines under-utilised
+    when both are low.
+    """
+    if compute is None or memory is None:
+        return "", ""
+    peak = max(compute, memory)
+    if peak >= 80.0:
+        if compute >= memory:
+            return "compute bound", (f"{compute:.0f}% of peak compute against "
+                                     f"{memory:.0f}% of peak memory, and close "
+                                     f"enough to the roofline that only less "
+                                     f"work will help")
+        return "memory bound", (f"{memory:.0f}% of peak memory against "
+                                f"{compute:.0f}% of peak compute -- it is "
+                                f"waiting on bandwidth, not arithmetic")
+    if peak < 40.0:
+        extra = (f" Achieved occupancy is {occupancy:.0f}%."
+                 if occupancy is not None else "")
+        return "latency bound", (f"neither pipe is busy: {compute:.0f}% compute, "
+                                 f"{memory:.0f}% memory. The kernel is waiting, "
+                                 f"not working." + extra)
+    if compute >= memory * 1.3:
+        return "leans compute", (f"{compute:.0f}% compute against "
+                                 f"{memory:.0f}% memory, with headroom in both")
+    if memory >= compute * 1.3:
+        return "leans memory", (f"{memory:.0f}% memory against "
+                                f"{compute:.0f}% compute, with headroom in both")
+    return "balanced", (f"{compute:.0f}% compute and {memory:.0f}% memory, "
+                        f"neither near peak")
+
+
+def analyse_ncu(rows: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    """One entry per profiled kernel launch, with a bottleneck verdict."""
+    launches: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+
+    for row in rows:
+        name = row.get("Kernel Name") or ""
+        if not name:
+            continue
+        key = (row.get("ID") or "") + "|" + name
+        if key not in launches:
+            order.append(key)
+            launches[key] = {
+                "id": row.get("ID"),
+                "name": name,
+                "block_size": row.get("Block Size"),
+                "grid_size": row.get("Grid Size"),
+                "metrics": {},
+                "rules": [],
+            }
+        entry = launches[key]
+        metric = row.get("Metric Name") or ""
+        if metric:
+            # Keyed by section too: "Memory Throughput" is a percentage of peak
+            # under Speed Of Light and Gbyte/s under Memory Workload Analysis,
+            # and collapsing them lets one silently become the other.
+            section = (row.get("Section Name") or "").strip()
+            entry["metrics"][(section, metric)] = {
+                "value": _ncu_number(row.get("Metric Value")),
+                "text": row.get("Metric Value"),
+                "unit": row.get("Metric Unit") or "",
+            }
+        # ncu ships its own guidance beside the numbers. It is better than
+        # anything this file would invent, so it is passed through rather than
+        # replaced -- OPT rules are the actionable ones.
+        rule = (row.get("Rule Description") or "").strip()
+        if rule and rule not in [r["text"] for r in entry["rules"]]:
+            entry["rules"].append({"type": row.get("Rule Type") or "",
+                                   "text": rule})
+
+    out = []
+    for key in order:
+        entry = launches[key]
+        metrics = entry["metrics"]
+
+        def value(name: str, section: Optional[str] = None) -> Optional[float]:
+            if section is not None:
+                found = metrics.get((section, name))
+                return found["value"] if found else None
+            for (_, metric_name), found in metrics.items():
+                if metric_name == name:
+                    return found["value"]
+            return None
+
+        compute = value(_SOL_COMPUTE, _SOL_SECTION)
+        memory = value(_SOL_MEMORY, _SOL_SECTION)
+        occupancy = value("Achieved Occupancy")
+        verdict, why = _verdict(compute, memory, occupancy)
+
+        # Whichever block limit is smallest is the one capping occupancy -- but
+        # only report it when occupancy is actually capped. One of the four is
+        # always the smallest, and at 100% theoretical none of them costs
+        # anything, so naming one there invents a problem.
+        theoretical = value("Theoretical Occupancy")
+        limiter, limit_value = "", None
+        if theoretical is not None and theoretical < 99.0:
+            for metric_name, human in _BLOCK_LIMITS.items():
+                found = value(metric_name)
+                if found is None:
+                    continue
+                if limit_value is None or found < limit_value:
+                    limiter, limit_value = human, found
+
+        out.append({
+            "name": entry["name"],
+            "block_size": entry["block_size"],
+            "grid_size": entry["grid_size"],
+            "duration_ns": _duration_ns(metrics.get((_SOL_SECTION, _SOL_DURATION))),
+            "compute_pct": compute,
+            "memory_pct": memory,
+            "dram_pct": value(_SOL_DRAM, _SOL_SECTION),
+            "occupancy_pct": occupancy,
+            "theoretical_occupancy_pct": theoretical,
+            "registers": value("Registers Per Thread"),
+            "static_smem": value("Static Shared Memory Per Block"),
+            "dynamic_smem": value("Dynamic Shared Memory Per Block"),
+            "ipc": value("Executed Ipc Active"),
+            "verdict": verdict,
+            "why": why,
+            "occupancy_limiter": limiter,
+            "occupancy_limit_blocks": limit_value,
+            # OPT first: those are the ones with something to do about them.
+            "rules": sorted(entry["rules"],
+                            key=lambda r: 0 if r["type"] == "OPT" else 1)[:4],
+        })
+    return out
+
+
+def _duration_ns(metric: Optional[Dict[str, Any]]) -> Optional[float]:
+    """ncu reports Duration in whatever unit reads best; normalise to ns."""
+    if not metric or metric.get("value") is None:
+        return None
+    scale = {"nsecond": 1.0, "ns": 1.0, "usecond": 1e3, "us": 1e3,
+             "msecond": 1e6, "ms": 1e6, "second": 1e9, "s": 1e9}
+    return metric["value"] * scale.get((metric.get("unit") or "").strip(), 1.0)

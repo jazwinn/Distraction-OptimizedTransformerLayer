@@ -415,10 +415,24 @@
                 to be spawned to find it.</p>
               <div class="issues" id="prof-issues" style="margin-top:12px"></div>
               <div class="btn-row" style="margin-top:14px">
-                <button class="btn btn-primary" id="prof-go">Profile</button>
+                <button class="btn btn-primary" id="prof-go">Profile timeline</button>
                 <button class="btn btn-danger" id="prof-stop" disabled>Stop</button>
                 <span class="status-line" id="prof-job-status">no job yet</span>
               </div>
+              <div class="btn-row" style="margin-top:10px">
+                <button class="btn" id="ncu-go">Kernel counters</button>
+                <button class="btn btn-danger" id="ncu-stop" disabled>Stop</button>
+                <label class="field" style="max-width:120px">
+                  <span class="field-label">launches</span>
+                  <input type="number" id="ncu-launches" value="12" min="1" max="200">
+                </label>
+                <span class="status-line" id="ncu-job-status">no job yet</span>
+              </div>
+              <p class="prose" style="margin-top:6px">Nsight Compute replays each
+                kernel several times to read its counters, so it profiles only
+                the kernels from <code>csrc/</code> and only this many launches.
+                It answers what the timeline cannot: whether a kernel is limited
+                by arithmetic, by bandwidth, or by neither.</p>
             </div>
           </section>
 
@@ -452,6 +466,18 @@
           </div>
           <div class="card-body scroll-x" style="padding:0"><div class="table-note" id="prof-memory-note" hidden></div>
           <table class="data" id="prof-memory"></table></div>
+        </section>
+
+        <section class="card" id="ncu-results-card" hidden>
+          <div class="card-head">
+            <h2>Kernel counters</h2>
+            <span class="sub" id="ncu-note"></span>
+            <button class="btn btn-sm" data-view="ncu-results" aria-haspopup="dialog" aria-expanded="false" title="Filter and sort this table">Filter &amp; sort</button>
+            <button class="btn btn-sm" data-csv="ncu-results">copy CSV</button>
+          </div>
+          <div class="card-body scroll-x" style="padding:0"><div class="table-note" id="ncu-results-note" hidden></div>
+          <table class="data" id="ncu-results"></table></div>
+          <div class="card-body" id="ncu-guidance"></div>
         </section>
 
         <section class="card" id="prof-report-card" hidden>

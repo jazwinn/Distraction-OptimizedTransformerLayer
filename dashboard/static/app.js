@@ -76,7 +76,8 @@ const state = {
   spec: null,
   forms: { run: {}, cmpShape: {}, cmpA: {}, cmpB: {}, sweep: {}, script: {},
            profile: {} },
-  jobs: { run: null, compare: null, sweep: null, script: null, profile: null },
+  jobs: { run: null, compare: null, sweep: null, script: null, profile: null,
+          ncu: null },
   polls: {},
   // Each view's Run/Stop pair, so the queue poll can put them back if a job's
   // own polling ever stops reporting. See reconcileControls().
@@ -2151,6 +2152,20 @@ function setupProfile() {
   });
   $('prof-stop').addEventListener('click', () => requestStop('profile', ui));
 
+  const ncuUi = {
+    log: $('prof-log'), status: $('ncu-job-status'), go: $('ncu-go'),
+    stop: $('ncu-stop'), follow: $('prof-follow'), issues: $('prof-issues'),
+    resultsCard: $('ncu-results-card'),
+    render: renderNcuResults,
+  };
+  state.uis['ncu'] = ncuUi;
+  $('ncu-go').addEventListener('click', () => {
+    form.devenv = $('prof-devenv').checked;
+    form.launch_count = parseInt($('ncu-launches').value, 10) || 12;
+    submit('ncu', { mode: 'ncu', form }, ncuUi);
+  });
+  $('ncu-stop').addEventListener('click', () => requestStop('ncu', ncuUi));
+
   $('prof-open').addEventListener('click', async () => {
     const { data } = await postJSON('/api/profile/open',
       { report: profileState.report });
@@ -2424,6 +2439,173 @@ async function renderProfileReport() {
   const { data } = await api('/api/profile/report?name=' + encodeURIComponent(name));
   $('prof-report-size').textContent = (data && data.exists)
     ? data.human + ' on disk' : 'not on disk';
+}
+
+
+/* --- Nsight Compute: why a kernel takes the time nsys says it takes -------- */
+
+const VERDICT_TONE = {
+  'compute bound': 'is-good',
+  'memory bound': 'is-warning',
+  'latency bound': 'is-critical',
+  'leans compute': 'is-info',
+  'leans memory': 'is-info',
+  'balanced': 'is-info',
+};
+
+const pct = (value) => (value === null || value === undefined)
+  ? '–' : value.toFixed(1) + '%';
+
+/* Up to the first sentence end that is not a decimal point or an abbreviation:
+ * these rules are full of "5.3 sectors" and "96.39% of", and cutting at every
+ * period would stop at the first number. */
+function firstSentence(text) {
+  const flat = String(text || '').replace(/\s+/g, ' ').trim();
+  const end = flat.search(/[.:](?=\s+[A-Z])/);
+  return end > 0 ? flat.slice(0, end + 1) : flat;
+}
+
+/* A percentage of peak, drawn against its peak. The bar is the point: 90% and
+ * 23% are the whole diagnosis, and two numbers side by side hide it. */
+function peakCell(cell, value) {
+  if (value === null || value === undefined) {
+    cell.textContent = '–'; cell.classList.add('is-muted'); return;
+  }
+  const wrap = el('div', 'share-cell');
+  const track = el('div', 'share-track');
+  const fill = el('div', 'share-fill' + (value >= 80 ? ' is-hot' : ''));
+  fill.style.width = Math.max(0, Math.min(100, value)).toFixed(1) + '%';
+  track.appendChild(fill);
+  wrap.appendChild(track);
+  wrap.appendChild(el('span', 'share-value', value.toFixed(1) + '%'));
+  cell.appendChild(wrap);
+}
+
+const NCU_COLUMNS = [
+  { key: 'name', title: 'kernel', left: true, type: 'text',
+    value: (row) => row.short,
+    render: (cell, row) => {
+      cell.textContent = row.short;
+      cell.title = row.name;
+    } },
+  { key: 'duration', title: 'duration', type: 'num',
+    value: (row) => row.duration_ns,
+    render: (cell, row) => { cell.textContent = ns(row.duration_ns); } },
+  { key: 'compute', title: 'compute', type: 'num',
+    value: (row) => row.compute_pct,
+    render: (cell, row) => peakCell(cell, row.compute_pct) },
+  { key: 'memory', title: 'memory', type: 'num',
+    value: (row) => row.memory_pct,
+    render: (cell, row) => peakCell(cell, row.memory_pct) },
+  { key: 'occupancy', title: 'occupancy', type: 'num',
+    value: (row) => row.occupancy_pct,
+    render: (cell, row) => {
+      if (row.occupancy_pct === null || row.occupancy_pct === undefined) {
+        cell.textContent = '–'; cell.classList.add('is-muted'); return;
+      }
+      cell.textContent = pct(row.occupancy_pct);
+      if (row.theoretical_occupancy_pct !== null
+          && row.theoretical_occupancy_pct !== undefined) {
+        cell.title = 'achieved ' + pct(row.occupancy_pct) + ' of a theoretical '
+          + pct(row.theoretical_occupancy_pct)
+          + (row.occupancy_limiter ? ', capped by ' + row.occupancy_limiter : '');
+      }
+      if (row.occupancy_limiter) cell.classList.add('is-warning');
+    } },
+  { key: 'registers', title: 'reg/thread', type: 'num',
+    value: (row) => row.registers,
+    render: (cell, row) => {
+      cell.textContent = row.registers === null || row.registers === undefined
+        ? '–' : String(row.registers);
+    } },
+  { key: 'verdict', title: 'limited by', type: 'text',
+    value: (row) => row.verdict,
+    render: (cell, row) => {
+      if (!row.verdict) { cell.textContent = '–'; cell.classList.add('is-muted'); return; }
+      const tag = el('span', 'tag ' + (VERDICT_TONE[row.verdict] || 'is-info'),
+        row.verdict);
+      cell.appendChild(tag);
+      cell.title = row.why || '';
+    } },
+];
+
+function renderNcuResults(rows, data) {
+  const step = (data.steps || []).find((s) => s.meta && s.meta.role === 'collect');
+  const result = (step && step.result) || null;
+  if (!result) return;
+
+  const blocked = (result.error_lines || [])
+    .some((line) => line.indexOf('ERR_NVGPUCTRPERM') !== -1);
+  const kernels = result.kernels || [];
+
+  $('ncu-results-card').hidden = false;
+  $('ncu-note').textContent = kernels.length
+    ? kernels.length + ' launch' + (kernels.length === 1 ? '' : 'es') + ' profiled'
+    : '';
+
+  renderTable($('ncu-results'), kernels.map((k) => Object.assign({}, k, {
+    short: shortKernel(k.name),
+    label: shortKernel(k.name),
+  })), null, NCU_COLUMNS);
+
+  const guide = $('ncu-guidance');
+  clear(guide);
+
+  if (blocked) {
+    const call = el('div', 'v-call');
+    const tag = el('span', 'tag is-critical');
+    tag.appendChild(el('span', null, '✖'));
+    tag.appendChild(document.createTextNode('counters refused'));
+    call.appendChild(tag);
+    call.appendChild(el('span', null,
+      'The driver returned ERR_NVGPUCTRPERM, so nothing was collected. Counters '
+      + 'are administrator-only until RmProfilingAdminOnly is 0 and the driver '
+      + 'has reloaded — that means a reboot — or until the dashboard itself is '
+      + 'started from an elevated terminal.'));
+    guide.appendChild(call);
+    return;
+  }
+
+  if (!kernels.length) {
+    const line = el('p', 'prose');
+    line.textContent = 'No kernel matched. Counters are collected only for '
+      + 'kernels defined in csrc/, so this means the run used the fallback path '
+      + '— the same thing the timeline reports as "no custom kernels ran".';
+    guide.appendChild(line);
+    return;
+  }
+
+  // NVIDIA's own analysis, passed through rather than paraphrased. It is more
+  // specific than anything this page could infer from the same numbers.
+  const withRules = kernels.filter((k) => (k.rules || []).length);
+  if (!withRules.length) return;
+  const heading = el('div', 'field-label');
+  heading.style.margin = '4px 0 10px';
+  heading.textContent = 'what Nsight Compute says';
+  guide.appendChild(heading);
+
+  withRules.forEach((kernel) => {
+    const block = el('div');
+    block.style.marginBottom = '12px';
+    const name = el('div');
+    name.style.font = '500 12px/1.5 var(--mono)';
+    name.textContent = shortKernel(kernel.name);
+    block.appendChild(name);
+    kernel.rules.slice(0, 3).forEach((rule) => {
+      const line = el('div', 'prose rule-line');
+      line.style.margin = '3px 0 0 12px';
+      const tag = el('span', 'tag ' + (rule.type === 'OPT' ? 'is-warning' : ''),
+        rule.type || 'INF');
+      tag.style.marginRight = '8px';
+      line.appendChild(tag);
+      // The first sentence is the finding; what follows is how it was derived,
+      // which is worth keeping but not worth a paragraph on screen.
+      line.appendChild(document.createTextNode(firstSentence(rule.text)));
+      line.title = rule.text;
+      block.appendChild(line);
+    });
+    guide.appendChild(block);
+  });
 }
 
 /* ---------------------------------------------------------- scripts view -- */

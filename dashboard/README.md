@@ -133,10 +133,33 @@ Reports accumulate in `runs/` as `<job-id>.nsys-rep` plus a `.sqlite` export,
 about a megabyte per run. The Report card shows the size, opens the trace in the
 Nsight Systems GUI, and deletes both files.
 
-**Nsight Compute** is detected but not driven. Collecting hardware counters
-returns `ERR_NVGPUCTRPERM` unless the process is elevated or
-`RmProfilingAdminOnly` is 0 under `HKLM\SYSTEM\CurrentControlSet\Services\nvlddmkm\Global\NVTweak`. The Profilers card states
-which applies rather than offering a button that cannot work.
+### Kernel counters
+
+*Kernel counters* runs the same shape under **Nsight Compute** and answers what
+the timeline cannot: whether a kernel is limited by arithmetic, by bandwidth, or
+by neither. It reports compute and memory as percentages of this card's peak,
+achieved against theoretical occupancy, registers per thread, and a verdict —
+plus Nsight Compute's own guidance, one line each with the reasoning on hover.
+
+ncu replays every kernel it profiles, once per section, so two limits keep it
+finite: it profiles **only kernels defined in `csrc/`** (the names are read from
+there) and only the first N launches, 12 by default. Even so it is far slower
+than the timeline run; that is the tool, not the wrapper.
+
+Read it as: above ~80% of either pipe the kernel is near the roofline and only
+less work will help; both under ~40% means it is waiting rather than working,
+and occupancy is the first thing to look at. Those thresholds are Nsight
+Compute's own.
+
+**Counter collection needs permission.** It returns `ERR_NVGPUCTRPERM` unless
+the process is elevated, or `RmProfilingAdminOnly` is 0 under
+`HKLM\SYSTEM\CurrentControlSet\Services\nvlddmkm\Global\NVTweak` **and the
+driver has reloaded** — setting the value alone changes nothing until a reboot.
+
+Neither of those can be read off and trusted, so the Profilers card does not
+try: *test counters* collects one for real and reports what happened, and until
+you press it the card says *not tested*. A run that is refused shows the refusal
+rather than an empty table.
 
 **Scripts** — every `scripts/*.py`, with a form built from its own argparse
 where it has one and a free-text box where it does not. Output is streamed raw;

@@ -620,6 +620,65 @@ def build_job(payload: Dict[str, Any]) -> Tuple[Optional[Job], List[Dict[str, st
         analyse.meta["report"] = os.path.join(RUNS_DIR, job.id + ".nsys-rep")
         return job, issues
 
+    if mode == "ncu":
+        form = form_of("form")
+        if form is None:
+            return None, bad_shape
+
+        tools = tools_cached()
+        if not tools["ncu_available"]:
+            return None, [{"level": "error",
+                           "message": "Nsight Compute was not found. Install it, "
+                                      "or point NCU_PATH at ncu.exe."}]
+
+        merged = dict(PROFILE_DEFAULTS)
+        merged.update({key: value for key, value in form.items()
+                       if value not in (None, "")})
+        issues = _blocking_issues(merged)
+        if any(issue["level"] == "error" for issue in issues):
+            return None, issues
+
+        try:
+            launches = int(form.get("launch_count") or 12)
+        except (TypeError, ValueError):
+            launches = 12
+        launches = max(1, min(launches, 200))
+
+        label = f"{_shape_label(merged)} | {_impl_label(merged)}"
+        spec = runspec.for_harness(merged, label)
+
+        prepare_argv = [sys.executable, "-u", "-c", _PROBE_SOURCE.format(repo=REPO)]
+        if form.get("devenv"):
+            prepare_argv = runspec.through_devenv(prepare_argv)
+        prepare = Step(
+            spec=runspec.RunSpec(argv=prepare_argv, cwd=REPO, label="prepare"),
+            label="prepare",
+            parse_output=False,
+        )
+        prepare.meta = {"role": "prepare"}
+
+        collect_argv = profiling.ncu_argv(tools["ncu"], spec.argv,
+                                          launch_count=launches)
+        if form.get("devenv"):
+            collect_argv = runspec.through_devenv(collect_argv)
+        collect = Step(
+            spec=runspec.RunSpec(
+                argv=collect_argv,
+                # NVTX costs nothing here and makes the ncu report readable in
+                # the GUI if it is opened there later.
+                env=profiling.capture_env(spec.env),
+                cwd=spec.cwd,
+                label="collect",
+            ),
+            label="collect",
+            parser_factory=profiling.NcuParser,
+        )
+        collect.meta = {"role": "collect", "shape": _shape_label(merged),
+                        "config": _impl_label(merged), "launches": launches}
+
+        return (Job("ncu", [prepare, collect],
+                    title=f"counters {label}"), issues)
+
     if mode == "sweep":
         form = form_of("form")
         if form is None:
