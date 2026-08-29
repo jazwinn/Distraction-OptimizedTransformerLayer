@@ -68,6 +68,24 @@ struct AttnArgs {
     double scale;
 };
 
+// The scalar family, tuned instantiations first and the generic catch-all
+// behind them. The two are one launcher rather than two entries in every
+// preference list because they are one kernel's worth of coverage: same file,
+// same algorithm, same accuracy -- the difference is only whether head_dim, the
+// per-row thread count and the key tile are template parameters or runtime
+// arguments. A caller choosing "the scalar kernel" is not choosing between
+// them, so it should not have to name both.
+//
+// dispatch_head_dim declining means one of two things, and the fallback is
+// right for both: no specialization exists for this head_dim, or one exists
+// whose key tiles do not fit in shared memory for this dtype (float64 past
+// head_dim 16 is what actually hits that). The generic kernel sizes its tile
+// from the budget instead of a table, so it covers head_dim 1 to 2048 in every
+// dtype and takes both cases.
+//
+// Keeping the fallback inside the AT_DISPATCH is not just tidiness: it happens
+// inside the same scalar_t instantiation, so the dtype is resolved once for
+// both attempts rather than twice.
 bool launch_scalar(const AttnArgs& a) {
     bool launched = false;
     AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -76,6 +94,11 @@ bool launch_scalar(const AttnArgs& a) {
             launched = dispatch_head_dim<scalar_t>(
                 a.q, a.k, a.v, a.mask_ptr, a.ms, a.qs, a.out,
                 a.B, a.H, a.S, a.head_dim, a.is_causal, a.scale);
+            if (!launched) {
+                launched = launch_generic_kernel<scalar_t>(
+                    a.q, a.k, a.v, a.mask_ptr, a.ms, a.qs, a.out,
+                    a.B, a.H, a.S, a.head_dim, a.is_causal, a.scale);
+            }
         });
     return launched;
 }
@@ -181,6 +204,12 @@ bool launch_tile(const AttnArgs& a, tile_attn::MathMode math) {
 // this", and what that fallback is gets decided there, not here.
 bool run_kernel(Impl impl, const AttnArgs& a) {
     switch (impl) {
+        // The scalar ALGORITHM, not one of its six tuned instantiations: an
+        // uncovered head_dim falls to the generic kernel inside launch_scalar
+        // rather than erroring. This file's own code either way, which is the
+        // distinction that matters -- the exemption this replaces used to hand
+        // `--attn-impl scalar` to ATen and put the result in REPORT.md under
+        // the scalar kernel's name.
         case Impl::Scalar:   return launch_scalar(a);
         case Impl::Wmma:     return launch_wmma(a);
         case Impl::Tile:     return launch_tile(a, tile_attn::MathMode::Fp32);
@@ -202,7 +231,10 @@ bool run_kernel(Impl impl, const AttnArgs& a) {
             // because it is faster than scalar everywhere the two overlap
             // (0.25x-0.30x at the two shapes in question). Declining here now
             // genuinely means no kernel covers the case, and the caller raises
-            // rather than substituting.
+            // rather than substituting -- and since launch_scalar ends in a
+            // kernel that takes any head_dim to 2048, declining is now rare
+            // enough to be a genuine statement about the shape rather than
+            // about this build's coverage.
             return launch_wmma(a) || launch_scalar(a);
     }
     return false;
@@ -386,13 +418,17 @@ torch::Tensor fused_attention_forward(torch::Tensor q,
                     ", head_dim=", head_dim, " on compute capability ",
                     at::cuda::getCurrentDeviceProperties()->major, ".",
                     at::cuda::getCurrentDeviceProperties()->minor,
-                    ". scalar needs head_dim in {8,16,32,64,128,256} and enough "
-                    "shared memory for its key tiles (float64 runs out past 16); "
-                    "wmma needs SM 8.0+ and head_dim in {8,16,32,64,128,256}; "
-                    "the tile kernels need float32 and the same head_dim set. "
-                    "There is deliberately no fallback: this build implements "
-                    "attention itself and will not silently hand a shape to a "
-                    "prebuilt one.");
+                    ". The generic scalar kernel is the catch-all and takes "
+                    "any head_dim from 1 to 2048 in any of these dtypes, so "
+                    "auto and scalar reach this line only past 2048 -- where a "
+                    "query row's threads would outgrow a warp, which needs a "
+                    "different reduction rather than a bigger constant. wmma "
+                    "needs SM 8.0+ and head_dim in {8,16,32,64,128,256}; the "
+                    "tile kernels need float32 and the same head_dim set, and "
+                    "a forced impl gets that kernel or nothing. There is "
+                    "deliberately no prebuilt fallback: this build implements "
+                    "attention itself and will not silently hand a shape to "
+                    "someone else's kernel.");
 
     }
 

@@ -1544,7 +1544,7 @@ attention:
 | Value | Behavior |
 | --- | --- |
 | `auto` | Tensor-core kernel where it applies, scalar kernel otherwise. |
-| `scalar` | Force the scalar kernel. No tensor cores, no TF32 rounding. `head_dim` in {8,16,32,64,128,256}; raises on anything else, so ATen cannot be timed under its name. |
+| `scalar` | Force the scalar kernel. No tensor cores, no TF32 rounding. Six tuned instantiations at `head_dim` in {8,16,32,64,128,256}; anything else drops to the generic scalar kernel in the same file, which takes `head_dim` 1 to 2048 in every dtype. Either way it is this project's own code, so ATen still cannot be timed under its name. |
 | `wmma` | Force the tensor-core kernel; raises on shapes it does not cover, so a silent substitution cannot be mistaken for a slow kernel. |
 | `tile` | Force the cuTile kernel — the same math written against the CUDA tile programming model instead of per-thread. float32, `head_dim` in {8,16,32,64,128,256}. Raises rather than falling back. |
 | `tile-tf32` | The same cuTile kernel with its two GEMMs narrowed to TF32, which is what puts them on the tensor cores. Same arithmetic `wmma` uses for fp32 inputs and the same ~1e-3 accuracy, so it clears the harness gate wherever `wmma` does. The tensor-core tile mode to reach for first. |
@@ -1558,6 +1558,21 @@ head_dim and being the right thing to run for it are different questions; see
 [head_dim 256](#head_dim-256-covered-by-everything-fastest-at-nothing) for the one place they
 come apart.
 
+A `d_model / num_heads` outside that set — 96, 100, 192, 512 — is not something the harness
+produces, but it is something a caller can ask for, and it used to raise. The scalar launcher
+now ends in a generic kernel (`csrc/attention_scalar.cuh`) that makes `head_dim`, the per-row
+thread count and the key tile runtime values instead of template parameters, so it takes
+anything from 1 to 2048 in any dtype. It sits behind the six tuned instantiations inside
+`launch_scalar` rather than as a third entry in `auto`'s list, because the two are one
+kernel's worth of coverage and a caller picking "the scalar kernel" is not choosing between
+them. It is a coverage floor rather than a preference: it runs only for a head_dim the tuned
+paths decline, and forcing it onto a head_dim they do cover returns bit-identical results
+1.0x–5.3x slower. Measured end to end against the baseline at shapes that previously
+raised: head_dim 100 **3.34x**, head_dim 192 **1.67x**, head_dim 96 **1.25x**, head_dim 512
+**0.85x** — the last one a genuine loss, since a 512-wide head is where cuBLAS's batched GEMM
+beats a CUDA-core kernel outright. `scripts/verify_generic_scalar.py` checks all of it, and
+`SCALAR_FORCE_GENERIC=1` is the A/B knob.
+
 Neither tile mode is ever chosen by `auto`: they are a separate programming model whose
 performance you should opt into deliberately. They need a build that found CUDA 13.3+;
 without one, `--attn-impl tile` raises instead of silently running something else. See
@@ -1569,6 +1584,7 @@ and the slowest kernel here.
 | Script | Purpose |
 | --- | --- |
 | `scripts/verify_kernel.py` | Every kernel against a float64 reference across 14 shapes. Fails fast and names the shape that broke. The `packed` column reruns each case through the non-contiguous views the model actually produces and demands a *bit-identical* result, not one within tolerance. It also exports `reference_attention_f64`, which the A/B scripts use as their yardstick — one expression evaluated the same way every time, rather than a library call that picks a backend per shape. |
+| `scripts/verify_generic_scalar.py` | The generic scalar catch-all across 14 uncovered head_dims (1 to 2048), four dtypes and six mask/shape combinations, against the same float64 reference. Run again with `SCALAR_FORCE_GENERIC=1` and it also serves the six head_dims the specializations own, which is how the generalization is checked to be the same arithmetic and not merely a close one. |
 | `scripts/verify_split_kv.py` | Checks the tile kernel's split-KV path against its own single-pass path, and asserts the split actually fired. |
 | `scripts/verify_graph.py` | Checks that graph replay is *bit-identical* to eager — tolerance exactly zero — and that the graph actually fired rather than silently declining. `--test-failure` also exercises the capture-failure path; `--include-tile` adds the cuTile impls. |
 | `scripts/bench_attention.py` | Times the attention op alone — scalar vs. tensor-core vs. the tile kernels — with accuracy alongside, so a speed win bought with precision is visible. |
