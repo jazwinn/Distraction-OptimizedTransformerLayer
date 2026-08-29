@@ -1317,11 +1317,34 @@ async function requestStop(key, ui) {
 }
 
 async function submit(key, payload, ui) {
-  const { ok, data } = await postJSON('/api/run', payload);
+  let ok = false;
+  let status = 0;
+  let data = null;
+  try {
+    ({ ok, status, data } = await postJSON('/api/run', payload));
+  } catch (err) {
+    // A rejected fetch used to leave submit's promise unhandled, so the click
+    // did nothing at all and said nothing about why.
+    renderIssues(ui.issues, [{ level: 'error',
+      message: 'could not reach the server: ' + err }]);
+    return;
+  }
+
   if (!ok || !data || data.error) {
-    renderIssues(ui.issues, (data && data.issues) || [
-      { level: 'error', message: (data && data.error) || 'the server rejected this run' },
-    ]);
+    // A rejection always carries either a list of reasons or a message. If it
+    // somehow carries neither, say what actually happened rather than "the
+    // server rejected this run", which was true but told nobody anything --
+    // an empty issues array rendered as no message at all.
+    const issues = (data && data.issues) || [];
+    if (issues.length) {
+      renderIssues(ui.issues, issues);
+    } else {
+      const detail = (data && data.error)
+        || (status ? 'the server answered ' + status + ' with no reason given'
+          : 'the server sent no usable reply');
+      renderIssues(ui.issues, [{ level: 'error',
+        message: detail + ' (mode ' + payload.mode + ')' }]);
+    }
     return;
   }
   if (data.issues && data.issues.length) renderIssues(ui.issues, data.issues);
