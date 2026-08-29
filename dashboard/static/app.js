@@ -363,6 +363,12 @@ function renderDerived(container, estimate) {
     add('baseline', 'skipped',
       'The baseline cannot hold its score matrix at this shape, so the harness '
       + 'times the optimized model alone: latencies but no speedup.');
+  } else if (plan.known && plan.baseline_chunk) {
+    add('baseline', 'chunked, ' + plan.baseline_chunk + ' queries',
+      'The baseline cannot hold its whole score matrix here, so the harness '
+      + 'scores it a block of queries at a time rather than skipping it. Same '
+      + 'arithmetic, so this shape does get an accuracy verdict and a speedup - '
+      + 'but the reference is slow, so expect minutes per forward.');
   }
 }
 
@@ -1366,17 +1372,29 @@ async function submit(key, payload, ui) {
 
 const QUICK = { warmup: 5, repeats: 20, benchmark_rounds: 1, accuracy_trials: 2 };
 
+/* Quick is what the form opens on. Most of what this dashboard is used for is
+ * "did that change do anything", which quick answers in seconds; the counts in
+ * the harness are for the run you quote, and are one click away on `full`.
+ * Nothing is hidden by the choice -- the previewed command shows the flags. */
+function applySpeed(quick) {
+  Object.keys(QUICK).forEach((dest) => {
+    const container = $('run-timing').querySelector('[data-dest="' + dest + '"]')
+      ? $('run-timing') : $('run-accuracy');
+    setFieldValue(container, dest, quick ? QUICK[dest] : '');
+  });
+  document.querySelectorAll('[data-speed]').forEach((button) => {
+    button.setAttribute('aria-pressed',
+      String(button.dataset.speed === (quick ? 'quick' : 'full')));
+  });
+}
+
 function wireSpeedButtons() {
   document.querySelectorAll('[data-speed]').forEach((button) => {
     button.addEventListener('click', () => {
-      const quick = button.dataset.speed === 'quick';
-      Object.keys(QUICK).forEach((dest) => {
-        const container = $('run-timing').querySelector('[data-dest="' + dest + '"]')
-          ? $('run-timing') : $('run-accuracy');
-        setFieldValue(container, dest, quick ? QUICK[dest] : '');
-      });
+      applySpeed(button.dataset.speed === 'quick');
     });
   });
+  applySpeed(true);
 }
 
 function mergedRunForm(form, shape) {
@@ -2011,6 +2029,13 @@ function makeShapePicker(list, count, allButton, noneButton, onChange) {
         const tag = el('span', 'tag is-warning', 'no baseline');
         tag.title = 'The baseline cannot hold its score matrix at this shape, so it '
           + 'is skipped. You get latencies but no speedup.';
+        tags.appendChild(tag);
+      } else if (preset.baseline_chunk) {
+        const tag = el('span', 'tag is-info', 'chunked baseline');
+        tag.title = 'The baseline cannot hold its whole score matrix here, so the '
+          + 'harness scores ' + preset.baseline_chunk + ' queries at a time instead '
+          + 'of skipping it. Same arithmetic, so there is a verdict and a speedup - '
+          + 'but this row takes minutes, not seconds.';
         tags.appendChild(tag);
       }
       if (preset.blocked) {

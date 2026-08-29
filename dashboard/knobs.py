@@ -261,7 +261,8 @@ def harness_constants() -> Dict[str, Any]:
 
 
 def stream_plan(batch: int, seq: int, d_model: int, heads: int, causal: bool,
-                dtype: str, total_bytes: Optional[int]) -> Dict[str, Any]:
+                dtype: str, total_bytes: Optional[int],
+                baseline_chunk: int = 0) -> Dict[str, Any]:
     """What the harness will do with this shape, predicted the way it decides.
 
     Mirrors auto_stream_rows() and baseline_can_run() in the harness:
@@ -270,6 +271,15 @@ def stream_plan(batch: int, seq: int, d_model: int, heads: int, causal: bool,
         per_row = seq * d_model * elsize * _PEAK_ACTIVATION_FACTOR
         rows    = batch if per_row * batch <= budget else budget // per_row
         baseline runs iff 2 * [rows,H,S,S] fp32 scores + [S,S] mask <= budget
+
+    The last line is what the harness decides for itself when the scores do not
+    fit: rather than skip the baseline it scores one query block at a time, so
+    what must fit becomes a [rows,H,block,S] slab plus that block's mask plus the
+    activation peak, and the [S,S] causal mask is never built at all. Same
+    arithmetic, so a shape that could only be timed can now be compared too. The
+    block is mirrored here the way the harness picks it -- the largest that fits,
+    rounded down to a power of two. `baseline_chunk` overrides it: positive
+    forces a block, -1 turns chunking off.
 
     Two consequences worth stating, because both used to be treated here as
     reasons a shape could not run at all:
@@ -292,7 +302,9 @@ def stream_plan(batch: int, seq: int, d_model: int, heads: int, causal: bool,
         # No device information: assume it runs whole, as the harness does.
         return {"rows": batch, "slices": 1, "per_row_bytes": per_row,
                 "peak_bytes": per_row * batch, "budget_bytes": None,
-                "baseline_runs": True, "one_row_fits": True, "known": False}
+                "baseline_runs": True, "one_row_fits": True, "known": False,
+                "baseline_chunk": max(0, baseline_chunk),
+                "baseline_chunk_auto": False, "largest_baseline_chunk": 0}
 
     budget = int(total_bytes * float(constants["_MEMORY_BUDGET_FRACTION"]))
     if per_row * batch <= budget:
@@ -301,16 +313,39 @@ def stream_plan(batch: int, seq: int, d_model: int, heads: int, causal: bool,
         rows = max(1, min(batch, budget // per_row))
     slices = (batch + rows - 1) // rows
 
-    scores = rows * heads * seq * seq * 4
-    mask = seq * seq if causal else 0
+    whole_scores = rows * heads * seq * seq * 4
+    whole_mask = seq * seq if causal else 0
+    fits_whole = (2 * whole_scores + whole_mask) <= budget
+
+    # The largest block that fits, the way largest_baseline_chunk() prices it.
+    spare = budget - per_row * rows
+    per_query = 2 * rows * heads * seq * 4 + seq
+    largest = min(seq, spare // per_query) if spare > 0 and per_query > 0 else 0
+
+    if baseline_chunk > 0:
+        block = min(baseline_chunk, seq)
+    elif baseline_chunk < 0 or fits_whole or largest < 1:
+        block = 0
+    else:
+        block = 1 << (int(largest).bit_length() - 1)
+
+    if block:
+        scores = rows * heads * block * seq * 4
+        baseline_runs = block <= largest
+    else:
+        scores = whole_scores
+        baseline_runs = fits_whole
     return {
         "rows": rows,
         "slices": slices,
         "per_row_bytes": per_row,
         "peak_bytes": per_row * rows,
         "budget_bytes": budget,
-        "baseline_runs": (2 * scores + mask) <= budget,
+        "baseline_runs": baseline_runs,
         "baseline_scores_bytes": scores,
+        "baseline_chunk": block,
+        "baseline_chunk_auto": bool(block) and baseline_chunk == 0,
+        "largest_baseline_chunk": largest,
         "one_row_fits": per_row <= budget,
         "known": True,
     }
@@ -478,7 +513,7 @@ def preflight(form: Dict[str, Any], tile_available: Optional[bool],
 
     # --- memory, as the harness itself decides it ------------------------
     plan = stream_plan(batch, seq, d_model, heads, causal, dtype,
-                       device_total_bytes)
+                       device_total_bytes, integer("baseline_chunk", 0))
     if plan["known"] and not plan["one_row_fits"]:
         error(f"a single row of this shape needs about "
               f"{human_bytes(plan['per_row_bytes'])} against a "
@@ -491,12 +526,31 @@ def preflight(form: Dict[str, Any], tile_available: Optional[bool],
              f"{plan['rows']} row(s). Batch rows do not interact, so this is "
              f"the same computation -- but the reported median is per slice.")
     if plan["known"] and not plan["baseline_runs"]:
+        queries = plan["baseline_chunk"] or seq
+        if plan["baseline_chunk"]:
+            tail = (f"A --baseline-chunk under {plan['largest_baseline_chunk']} "
+                    f"is the lever here.")
+        elif plan["largest_baseline_chunk"] >= 1:
+            tail = (f"Chunking is off; left alone the harness would score "
+                    f"{plan['largest_baseline_chunk']} queries at a time here "
+                    f"and would have a reference.")
+        else:
+            tail = ("Chunking cannot help either -- the activation peak this "
+                    "shape needs already uses the whole budget.")
         warn(f"the baseline cannot run this shape -- its [{plan['rows']},"
-             f"{heads},{seq},{seq}] scores are "
+             f"{heads},{queries},{seq}] scores are "
              f"{human_bytes(plan['baseline_scores_bytes'])} even one row at a "
              f"time, and it needs a second copy for the fp32 softmax. The "
              f"harness will skip it and time the optimized model alone, so "
-             f"this run reports latency with no speedup and no accuracy check.")
+             f"this run reports latency with no speedup and no accuracy check. "
+             f"{tail}")
+    elif plan["known"] and plan["baseline_chunk_auto"]:
+        warn(f"the baseline's [{plan['rows']},{heads},{seq},{seq}] scores do not "
+             f"fit, so the harness will score {plan['baseline_chunk']} queries "
+             f"at a time instead of skipping the baseline. Same arithmetic, so "
+             f"this shape does get an accuracy verdict and a speedup -- but the "
+             f"reference is far slower than a fitting one, so expect minutes per "
+             f"forward. --baseline-chunk -1 skips the baseline as before.")
 
     return issues
 
@@ -518,7 +572,7 @@ def estimate_summary(form: Dict[str, Any],
     dtype = form.get("dtype") or "float32"
 
     plan = stream_plan(batch, seq, d_model, heads, causal, dtype,
-                       device_total_bytes)
+                       device_total_bytes, integer("baseline_chunk", 0))
     element = DTYPE_BYTES.get(dtype, 4)
     return {
         "head_dim": (d_model // heads

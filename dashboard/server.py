@@ -311,6 +311,7 @@ def describe_presets() -> List[Dict[str, Any]]:
             "memory_bytes": plan["peak_bytes"],
             "slices": plan["slices"],
             "baseline_runs": plan["baseline_runs"],
+            "baseline_chunk": plan["baseline_chunk"],
             "blocked": bool(blockers),
             "blocked_reason": blockers[0] if blockers else "",
             "notes": [i["message"] for i in issues if i["level"] == "warning"],

@@ -994,7 +994,15 @@ table.
 ### 7.1 What it is
 
 A page served locally in a browser, built from Python's standard library and one hand-written HTML
-file. No new dependencies, no build step.
+file. No new dependencies, no build step. It is started from the project directory:
+
+```bash
+python -m dashboard
+```
+
+That opens a browser tab automatically. `--port` moves it if the default is taken, and
+`--no-browser` leaves the tab alone. The server is reachable only from this machine, deliberately:
+it exists to run programs on request, so there is no option to expose it to the network.
 
 | Tab | What it does |
 | --- | --- |

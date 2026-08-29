@@ -133,11 +133,100 @@ class BaselineSelfAttention(nn.Module):
         return output
 
 
+# Query-block size the baseline scores at a time; 0 means the whole sequence at
+# once, which is the stock BaselineSelfAttention. resolve_baseline_chunk() sets
+# it in main() from the shape, and it is read at call time, so nothing has to be
+# threaded through the model constructors.
+_BASELINE_CHUNK = 0
+# Whether that value was picked from the shape rather than asked for, which is
+# the only difference the printed messages make.
+_BASELINE_CHUNK_AUTO = False
+
+
+class ChunkedBaselineSelfAttention(BaselineSelfAttention):
+    """BaselineSelfAttention with the score matrix built one query block at a
+    time, so that a shape whose [B,H,S,S] scores cannot be allocated still has a
+    reference to compare against.
+
+    This is the same computation, not an approximation of it. The softmax is
+    per-row and query rows never interact, so a block of queries scored against
+    the keys gives exactly the rows the full matrix would have given. Only two
+    things differ from the parent, and neither changes a value:
+
+      * Under causal masking every key at or after the end of the block is -inf
+        for every query in it, and exp(-inf) is 0, so those columns are dropped
+        rather than masked. That halves both the arithmetic and the memory
+        traffic, and is why the [S,S] causal mask is never built.
+      * The scale and the two masks are applied in place, on a tensor the matmul
+        just produced, to keep the peak at one block rather than three.
+
+    Expect agreement to a few ulp rather than bit-identity: slicing the keys
+    changes the GEMM's N dimension, and cuBLAS is free to reduce in a different
+    order for a different shape. With TF32 on, that gap is TF32-sized.
+    """
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_token_mask: Optional[torch.Tensor] = None,
+        causal: bool = False,
+    ) -> torch.Tensor:
+        batch, seq_len, _ = x.shape
+
+        q = self._split_heads(self.q_proj(x))
+        k = self._split_heads(self.k_proj(x))
+        v = self._split_heads(self.v_proj(x))
+
+        block = max(1, _BASELINE_CHUNK)
+        context = torch.empty_like(q)
+
+        for lo in range(0, seq_len, block):
+            hi = min(lo + block, seq_len)
+            # Causal rows in this block never attend past hi, so the keys end
+            # there too. Without causal masking every key is in play.
+            kmax = hi if causal else seq_len
+
+            scores = torch.matmul(
+                q[:, :, lo:hi], k[:, :, :kmax].transpose(-2, -1)
+            )
+            scores *= self.scale
+
+            if causal:
+                q_pos = torch.arange(lo, hi, device=x.device)[:, None]
+                k_pos = torch.arange(kmax, device=x.device)[None, :]
+                scores.masked_fill_(k_pos > q_pos, float("-inf"))
+
+            if valid_token_mask is not None:
+                invalid_keys = ~valid_token_mask[:, None, None, :kmax]
+                scores.masked_fill_(invalid_keys, float("-inf"))
+
+            # Same fp32 softmax as the parent. Both casts are free at fp32 and
+            # are the whole point of the reference at fp16/bf16.
+            probs = torch.softmax(scores.float(), dim=-1).to(dtype=x.dtype)
+            del scores
+            context[:, :, lo:hi] = torch.matmul(probs, v[:, :, :kmax])
+            del probs
+
+        context = (
+            context.transpose(1, 2)
+            .contiguous()
+            .view(batch, seq_len, self.d_model)
+        )
+        output = self.out_proj(context)
+
+        if valid_token_mask is not None:
+            output = output.masked_fill(~valid_token_mask[..., None], 0)
+        return output
+
+
 class BaselineTransformerBlock(nn.Module):
     def __init__(self, d_model: int, num_heads: int, ffn_dim: int) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
-        self.attention = BaselineSelfAttention(d_model, num_heads)
+        attention_cls = (
+            ChunkedBaselineSelfAttention if _BASELINE_CHUNK else BaselineSelfAttention
+        )
+        self.attention = attention_cls(d_model, num_heads)
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn_in = nn.Linear(d_model, ffn_dim)
         self.ffn_out = nn.Linear(ffn_dim, d_model)
@@ -322,13 +411,90 @@ def baseline_can_run(
     """Whether the baseline's [rows,H,S,S] scores, its fp32 softmax copy and the
     causal mask fit. Checked, not discovered by OOM: on Windows an oversubscribed
     allocation does not raise, it spills to system RAM and crawls.
+
+    Under --baseline-chunk the reference scores one query block at a time, so
+    what has to fit is a [rows,H,block,S] slab and the block's own mask, on top
+    of the activation peak auto_stream_rows already sized `rows` for. The [S,S]
+    causal mask is not in the sum because ChunkedBaselineSelfAttention never
+    builds it.
     """
+    if _device_budget_bytes(device) is None:
+        return True
+    if _BASELINE_CHUNK:
+        return min(_BASELINE_CHUNK, config.seq_len) <= largest_baseline_chunk(
+            config, device, dtype, rows
+        )
+    return unchunked_baseline_fits(config, device, dtype, rows)
+
+
+def unchunked_baseline_fits(
+    config: TransformerConfig, device: torch.device, dtype: torch.dtype, rows: int
+) -> bool:
+    """Whether the stock BaselineSelfAttention fits: its [rows,H,S,S] scores, the
+    fp32 softmax copy of them, and the [S,S] causal mask."""
     budget = _device_budget_bytes(device)
     if budget is None:
         return True
     scores = rows * config.num_heads * config.seq_len * config.seq_len * 4
     mask = config.seq_len * config.seq_len if config.causal else 0
     return (2 * scores + mask) <= budget
+
+
+def largest_baseline_chunk(
+    config: TransformerConfig, device: torch.device, dtype: torch.dtype, rows: int
+) -> int:
+    """Biggest --baseline-chunk that fits, 0 if even one query row does not.
+
+    A block costs a [rows,H,block,S] fp32 slab, the fp32 softmax copy of it and
+    a [block,S] bool mask -- heads are batched, which is the easy factor to
+    forget. The rest of the budget is the activation peak this shape needs
+    anyway, priced the way auto_stream_rows prices it.
+    """
+    budget = _device_budget_bytes(device)
+    if budget is None:
+        return config.seq_len
+    element = torch.empty((), dtype=dtype).element_size()
+    activations = (
+        rows * config.seq_len * config.d_model * element * _PEAK_ACTIVATION_FACTOR
+    )
+    per_query = 2 * rows * config.num_heads * config.seq_len * 4 + config.seq_len
+    spare = budget - activations
+    if spare <= 0 or per_query <= 0:
+        return 0
+    return min(config.seq_len, spare // per_query)
+
+
+def resolve_baseline_chunk(
+    config: TransformerConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+    rows: int,
+    requested: int,
+) -> int:
+    """The query block the baseline scores at a time, decided from the shape.
+
+    Automatic in the same sense as auto_stream_rows: a shape whose scores fit
+    whole is left alone and runs the stock BaselineSelfAttention exactly as it
+    did before, and only a shape that would otherwise have had no reference at
+    all -- and so no accuracy verdict and no speedup -- is chunked. There is
+    nothing to pass for the common case.
+
+    `requested` is --baseline-chunk: a positive value forces that block, and -1
+    turns chunking off and restores the plain skip.
+    """
+    if requested > 0:
+        return requested
+    if requested < 0:
+        return 0
+    if unchunked_baseline_fits(config, device, dtype, rows):
+        return 0
+    fits = largest_baseline_chunk(config, device, dtype, rows)
+    if fits < 1:
+        return 0
+    # Round down to a power of two. `fits` prices the activation peak from the
+    # average factor measured across the appendix shapes, not from this shape's
+    # true peak, so the last bit of the budget is not ours to spend.
+    return 1 << (int(fits).bit_length() - 1)
 
 
 def generate_random_case(
@@ -476,21 +642,62 @@ def run_accuracy_tests(
 
     rows = auto_stream_rows(config, device, dtype)
     if not baseline_can_run(config, device, dtype, rows):
+        queries = (
+            min(_BASELINE_CHUNK, config.seq_len) if _BASELINE_CHUNK else config.seq_len
+        )
         scores_gib = (
-            rows * config.num_heads * config.seq_len * config.seq_len * 4 / 1024 ** 3
+            rows * config.num_heads * queries * config.seq_len * 4 / 1024 ** 3
         )
         print(
             f"skipped: the baseline cannot run this shape. Its scores tensor is "
-            f"[{rows},{config.num_heads},{config.seq_len},{config.seq_len}] = "
-            f"{scores_gib:,.0f} GiB even one row at a time, and it needs a second "
+            f"[{rows},{config.num_heads},{queries},{config.seq_len}] = "
+            f"{scores_gib:,.1f} GiB even one row at a time, and it needs a second "
             f"copy for the fp32 softmax."
         )
-        print(
-            "         Not a device limit: at ~3.3e14 MACs per layer it would also "
-            "need ~200 s per forward. There is no reference to compare against, so "
-            "only the optimized model is benchmarked below."
-        )
+        if _BASELINE_CHUNK:
+            fits = largest_baseline_chunk(config, device, dtype, rows)
+            advice = (
+                f"--baseline-chunk {fits} would fit"
+                if fits
+                else "no block size fits: the activation peak alone uses the budget"
+            )
+            print(
+                f"         --baseline-chunk {_BASELINE_CHUNK} is already in "
+                f"effect and is too big -- heads are batched, so a block costs "
+                f"[{rows},{config.num_heads},{_BASELINE_CHUNK},{config.seq_len}]. "
+                f"{advice}."
+            )
+        else:
+            print(
+                "         Not a device limit: at ~3.3e14 MACs per layer it would also "
+                "need ~200 s per forward. There is no reference to compare against, so "
+                "only the optimized model is benchmarked below."
+            )
+            fits = largest_baseline_chunk(config, device, dtype, rows)
+            if fits >= 1:
+                print(
+                    f"         Chunking is off (--baseline-chunk -1). Left to "
+                    f"itself the harness would score {fits} queries at a time "
+                    f"here, which is the same arithmetic and does fit."
+                )
+            else:
+                print(
+                    "         Chunking cannot help either: the activation peak "
+                    "this shape needs already uses the whole budget."
+                )
         return True
+
+    if _BASELINE_CHUNK:
+        why = (
+            "chosen from the shape, because its scores do not fit whole"
+            if _BASELINE_CHUNK_AUTO
+            else "asked for with --baseline-chunk"
+        )
+        print(
+            f"baseline: chunked reference, {_BASELINE_CHUNK} queries at a time "
+            f"({why}). Same arithmetic as BaselineSelfAttention -- expect "
+            f"agreement to a few ulp, not bit-identity."
+        )
 
     if rows != config.batch_size:
         n = (config.batch_size + rows - 1) // rows
@@ -704,6 +911,16 @@ def benchmark_models(
         )
     if not with_baseline:
         print("baseline: cannot run this shape (see above), so no speedup is reported")
+    elif _BASELINE_CHUNK:
+        print(
+            f"baseline: chunked reference, {_BASELINE_CHUNK} queries at a time. "
+            f"Turn it off with --baseline-chunk -1 to time the optimized model alone. "
+            f"Under causal masking it skips the upper triangle the stock baseline "
+            f"computes and then masks, so where the stock baseline cannot run at "
+            f"all this speedup is a floor. Where it can run, its number is the "
+            f"one to quote: chunking costs launch overhead that shows up as a "
+            f"slower baseline on short sequences."
+        )
 
     x, valid_mask = generate_random_case(
         config=config,
@@ -844,6 +1061,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--padding-ratio", type=float, default=0.0)
     parser.add_argument("--input-scale", type=float, default=1.0)
 
+    parser.add_argument(
+        "--baseline-chunk",
+        type=int,
+        default=0,
+        metavar="QUERIES",
+        help="override the query block the baseline scores at a time. 0, the "
+             "default, decides from the shape: a shape whose [B,H,S,S] scores "
+             "fit runs the stock baseline untouched, and one whose scores do "
+             "not is chunked so that it still has a reference instead of being "
+             "skipped -- same arithmetic, much less memory, a much longer run. "
+             "A positive value forces that block; -1 turns chunking off",
+    )
     parser.add_argument("--accuracy-trials", type=int, default=5)
     parser.add_argument("--rtol", type=float, default=0.02)
     parser.add_argument("--atol", type=float, default=0.002)
@@ -884,6 +1113,11 @@ def validate_args(args: argparse.Namespace, device: torch.device, dtype: torch.d
         raise ValueError("input_scale must be positive")
     if args.accuracy_trials <= 0:
         raise ValueError("accuracy_trials must be positive")
+    if args.baseline_chunk < -1:
+        raise ValueError(
+            "baseline_chunk must be -1 (off), 0 (decide from the shape) or a "
+            "positive query-block size"
+        )
     if args.rtol < 0 or args.atol < 0:
         raise ValueError("rtol and atol must be non-negative")
     if args.warmup < 0:
@@ -896,6 +1130,8 @@ def validate_args(args: argparse.Namespace, device: torch.device, dtype: torch.d
 
 
 def main() -> int:
+    global _BASELINE_CHUNK, _BASELINE_CHUNK_AUTO
+
     args = parse_args()
     optimized_cli.apply_overrides(args)
 
@@ -914,12 +1150,33 @@ def main() -> int:
     config.validate()
     validate_args(args, device, dtype)
 
+    # Before the models are built: BaselineTransformerBlock reads this to decide
+    # which attention to construct.
+    _BASELINE_CHUNK = resolve_baseline_chunk(
+        config, device, dtype,
+        auto_stream_rows(config, device, dtype),
+        args.baseline_chunk,
+    )
+    _BASELINE_CHUNK_AUTO = _BASELINE_CHUNK != 0 and args.baseline_chunk == 0
+
     torch.manual_seed(args.seed)
     torch.set_float32_matmul_precision(args.matmul_precision)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
         torch.backends.cuda.matmul.allow_tf32 = args.allow_tf32
         torch.backends.cudnn.allow_tf32 = args.allow_tf32
+        if _BASELINE_CHUNK:
+            # A chunked-baseline run is long and peaks near the budget it was
+            # planned against. Cap the process at the same fraction so an
+            # over-budget allocation raises, instead of doing what Windows does
+            # by default -- spill into system RAM and take the machine with it.
+            # Scoped to this flag, so no run that works today changes.
+            # An index is required here, and resolve_device("auto") returns a
+            # bare "cuda".
+            torch.cuda.set_per_process_memory_fraction(
+                _MEMORY_BUDGET_FRACTION,
+                torch.cuda.current_device() if device.index is None else device.index,
+            )
 
     baseline = BaselineTransformer(config)
     optimized = UserOptimizedTransformer(config)

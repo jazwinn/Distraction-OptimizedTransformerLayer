@@ -1,445 +1,328 @@
-# Distraction
+# Distraction - *A faster attention layer for Transformers*
 
-*A faster attention layer for Transformers*
 
-An optimized Transformer layer for **TikTok TechJam 2026, Problem Statement 3** — accelerate a
-standard Transformer layer with custom GPU kernels while staying inside a strict
-per-element accuracy budget.
 
-The work lives in the [`optimized/`](optimized/) package, which
-[`torch_transformer_benchmark.py`](torch_transformer_benchmark.py) mixes into
-`UserOptimizedTransformer` — the harness file itself stays close to the one that was issued,
-so the diff against it is readable. `optimized/model.py` holds the forward pass,
-`optimized/layers.py` its submodules, `optimized/kernels.py` the dispatch into CUDA,
-`optimized/graphs.py` the CUDA-graph machinery, and `optimized/config.py` every runtime knob.
+A submission to **TikTok TechJam 2026, Problem Statement 3: "Implement a GPU Kernel for a
+Transformer Layer."** It runs the same Transformer layer as the reference implementation, produces
+the same answers, and runs faster.
 
-Attention runs on hand-written fused CUDA kernels in [`csrc/`](csrc/) --
-[`attention_wmma.cuh`](csrc/attention_wmma.cuh) and
-[`attention_scalar.cuh`](csrc/attention_scalar.cuh), picked between by
-[`attention_dispatch.cuh`](csrc/attention_dispatch.cuh). There is no prebuilt
-attention anywhere in the forward pass: this project implements the operation,
-so a shape no kernel covers raises rather than being handed to
-`torch.nn.functional.scaled_dot_product_attention`.
-
-The default kernel runs both of attention's
-matrix multiplies — `Q @ K^T` and `P @ V` — on the GPU's tensor cores through
-`nvcuda::wmma`, with the softmax fused between them and the `[B, H, S, S]` score matrix
-never leaving shared memory. A second, scalar kernel covers what tensor cores cannot take
-and stays selectable for comparison. A third kernel in
-[`csrc/tile_attention.cu`](csrc/tile_attention.cu) expresses the same maths against the CUDA
-tile programming model, as a portability-versus-speed comparison rather than as the default.
-
-Around the kernels, the forward pass fuses its elementwise work into the surrounding
-operations and — on shapes where launch overhead is what dominates — is captured into a CUDA
-graph and replayed, which is bit-identical to running it eagerly.
+- [Project overview](#project-overview)
+- [Setup and installation](#setup-and-installation)
+- [Reproducing the results](#reproducing-the-results)
+- [Limitations, and what I would improve](#limitations-and-what-i-would-improve)
+- [Team](#team)
+- [Further reading](#further-reading)
 
 ---
 
-## Contents
+## Project overview
 
-- [Setup](#setup) — install, build, verify, and tune the graph gate for your machine
-- [How it works](#how-it-works) — what the accuracy gate forces, and every optimization applied
-- [Repository layout](#repository-layout)
-- **[REPORT.md](REPORT.md)** — results, how to run the harness and the helper scripts, accuracy
-  analysis, known limits, and the engineering record of what broke and what fixed it
+### The task
 
-Numbers do not live in this file. Every measurement is in [REPORT.md](REPORT.md), with the
-machine it was taken on and the methodology beside it.
+A **Transformer** is the design behind most modern AI systems — chatbots, translation, speech,
+recommendations. A **kernel** is a small program that runs on the graphics card (GPU) rather than on
+the main processor. The task was to write faster kernels for one Transformer layer.
 
----
+The catch is accuracy. The fast version's output is compared against the reference version's
+output, number by number, and every single number must be either **within 0.002** of the reference
+or **within 2%** of it. The benchmark runs that check before it times anything, and skips the
+timing entirely if it fails — so a speedup number always belongs to a correct result.
 
-## Setup
+> Make it faster without meaningfully changing the answers.
 
-### Requirements
+That constraint shapes almost every decision here, because the obvious ways to gain speed — using
+less precise numbers, taking mathematical shortcuts — are exactly the ways to fail the check.
 
-| | |
+### Why the original is slow
+
+The heart of a Transformer is **self-attention**. To work out what "it" refers to in a sentence,
+every word compares itself against every other word and scores how relevant each one is. Those
+scores form a grid: one number for every pair of words.
+
+That grid is the problem. Double the length of the text and the grid *quadruples*, because it grows
+in both directions at once. At 2048 words it is 128 MiB for a single layer — and the reference
+implementation sends it out to the card's main memory and reads it back five separate times, once
+each to create it, rescale it, mask it, convert the scores to weights, and finally use it.
+
+Measuring the reference showed that real arithmetic falls from 70% of the time at short inputs to
+**under a third** at long ones. Everything else is data being moved around.
+
+At the other extreme, very small inputs are slow for the opposite reason: the card finishes each
+small piece of work before the next one arrives and spends most of the pass waiting to be given
+something to do.
+
+### What was built
+
+Attention was rewritten so that the grid of scores is built, masked, scored and used **in small
+pieces that never leave the chip's fast on-chip memory**. Three complete versions of it exist:
+
+| Version | What it is |
 | --- | --- |
-| GPU | NVIDIA. Compute capability 8.0+ for the tensor-core kernel; anything CUDA-capable runs the scalar one |
-| CUDA Toolkit | 13.0+. 13.3+ additionally enables the cuTile kernel (`--attn-impl tile`), which needs `<cuda_tile.h>`; it is picked up automatically when installed alongside an older toolkit |
-| PyTorch | 2.12.0+cu132 |
-| Python | 3.10+ |
+| **Tensor-core kernel** | The default. Runs both of attention's multiplications on the card's dedicated matrix-multiply hardware. |
+| **Simple kernel** | One thread per word, on the general-purpose units. Covers older cards and unusual sizes, and acts as the reference the faster ones are checked against. |
+| **Tile kernel** | The same maths written in a newer, higher-level style NVIDIA offers. Kept as a comparison between ease of writing and speed. |
+
+**There is no prebuilt attention anywhere in this project.** Most libraries would hand an awkward
+input size to an existing implementation; this one does not, because implementing attention *is* the
+task. A size nothing covers is reported as an error rather than quietly served by somebody else's
+code.
+
+Around that sit nineteen further changes — combining neighbouring steps into single kernels, doing
+three small multiplications as one large one, reading data where it already sits instead of copying
+it, skipping regions of the grid that would only be thrown away, and recording the whole sequence of
+GPU commands once so it can be replayed as a single instruction. Each one is listed with its
+measured effect in [TechnicalReport.md](TechnicalReport.md), section 5.
+
+### The machine everything was measured on
+
+Every number in this project comes from one machine:
+
+| Part | Detail |
+| --- | --- |
+| **Graphics card** | **NVIDIA GeForce RTX 3070, 8 GB** — Ampere generation, driver 610.47 |
+| Processor | AMD Ryzen 7 5800X |
+| Memory | 32 GB DDR4 |
+| Operating system | Windows 11 |
+| GPU toolkit | NVIDIA CUDA 13.3 |
+| C++ compiler | Microsoft Visual C++ 14.44 |
+| Framework | PyTorch 2.12, Python 3.10 |
+
+The graphics card is the part that matters. It sets which kernels can run at all, and it sets the
+speedups: the largest gains here come from keeping the card busy, so a faster card would starve at
+larger input sizes and a slower one at smaller ones. Every tuned constant in the project was chosen
+by measurement on this card, and would need re-measuring on a different one.
+
+### Results
+
+### What is in the repository
+
+| Location | What is in it |
+| --- | --- |
+| `csrc/` | The GPU code — every kernel, about 5,700 lines |
+| `optimized/` | The Python side: the rewritten layer, and which kernel runs when |
+| `scripts/` | Correctness checks and measurement scripts |
+| `dashboard/` | A local web page for running benchmarks and reading the results |
+| `torch_transformer_benchmark.py` | The organizers' benchmark, with this project wired into it |
+
+---
+
+## Setup and installation
+
+### What you need
+
+| Requirement | Detail |
+| --- | --- |
+| CUDA Toolkit | 13.3 or newer |
+| PyTorch | 2.12 with CUDA support |
+| Python | 3.10 or newer |
 | Compiler | MSVC — Visual Studio with the "Desktop development with C++" workload |
 | Build tool | `ninja` |
 
-The build targets whatever card is present: [`kernel_ext.py`](kernel_ext.py) reads the
-compute capability from `torch.cuda.get_device_capability()` and passes it to `nvcc`, with
-PTX for the same virtual arch alongside so the cached build still loads on a different card
-of the same family. It also finds MSVC itself (via `vswhere` + `vcvarsall.bat`) and, when a
-CUDA 13.3+ toolkit is installed, builds the tile kernel against it — several toolkits can
-sit side by side and the tile-capable one is found by looking for the header rather than by
-trusting `PATH`. Set `CUDA_TILE_HOME` to override that search.
+The GPU code is compiled on your own machine on first use, so a C++ compiler is genuinely required.
+There is no PyTorch-only shortcut: the kernels *are* the project, and a build that fails stops the
+benchmark rather than quietly measuring something else.
 
-**MSVC and `nvcc` are required.** The kernels are the project, so there is no
-PyTorch-only path that runs the benchmark without building them; a build that does not load
-raises rather than quietly measuring something else.
-
-### 1. Install Python dependencies
+### 1. Install the Python packages
 
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu132
+pip install -r requirements.txt
 ```
 
-```bash
-pip install ninja
-```
+That installs PyTorch and `ninja`, and nothing else — everything else this project uses comes with
+Python itself.
 
-Match the wheel's CUDA build to your toolkit. This project was developed against
-`torch 2.12.0+cu132`; a mismatch between the two is the usual cause of extension build
-failures.
+The version of PyTorch has to match your CUDA Toolkit, so `requirements.txt` points pip at NVIDIA's
+build of it rather than the default one. If your toolkit is not 13.x, change the `cu132` in that
+file to match. A mismatch between the two is the usual cause of build failures, and plain
+`pip install torch` on Windows gives a version with no GPU support at all.
 
-### 2. Build the CUDA extension (optional)
-
-The extension is compiled by `torch.utils.cpp_extension` and cached in `build/`.
-Compiling needs `cl.exe` on `PATH`, which a plain shell does not have — MSVC is not on the
-global `PATH` even when Visual Studio is fully installed, only inside a developer command
-prompt. So the build goes through `scripts/devenv.bat`, which sets that up:
+### 2. Build the GPU code
 
 ```bash
 cmd.exe /c scripts\build_ext.bat
 ```
 
-Expected output:
+It should finish with:
 
 ```
 [build_ext] OK -> ...\build\transformer_kernels.pyd
 ```
 
-Rebuilds after the first are near-instant (`ninja: no work to do` when nothing changed),
-and editing anything in `csrc/` makes the next run recompile automatically — there is no
-separate build step to remember. A first build takes roughly 70 s, nearly all of it the
-tensor-core kernel's template instantiations.
+The first build takes about 70 seconds. After that it is near-instant, and editing any GPU source
+file triggers a rebuild automatically — there is no separate build step to remember.
 
-`scripts/devenv.bat` remains for cases that need `cl.exe` on `PATH` before Python starts.
-It locates Visual Studio with `vswhere`, so there is no path to edit if yours is installed
-somewhere unexpected. See [Toolset selection](#toolset-selection) if the build fails on the
-compiler version.
+Visual Studio's compiler is not available in an ordinary terminal, only in its own developer
+prompt. `scripts\build_ext.bat` finds it and sets that up for you, which is why the command goes
+through the script rather than calling Python directly.
 
-If the tile kernel fails to build, the loader retries without it rather than losing the
-other two; `kernel_ext.tile_enabled()` reports whether it made it in.
-
-### 3. Verify
+### 3. Check it works
 
 ```bash
 cmd.exe /c scripts\devenv.bat python scripts\verify_kernel.py
 ```
 
-This checks every kernel against the baseline's exact arithmetic across 12 shapes and prints
-per-shape timings. It should end with `every kernel matches the reference on every case`.
+This runs every kernel against a reference on fifteen different input sizes and compares the results
+number by number. It should end with:
 
-Two more correctness harnesses are worth running after a build, both described in
-[REPORT.md](REPORT.md):
+```
+every kernel matches the reference on every case
+```
+
+Two more checks are worth running after a build:
 
 ```bash
-cmd.exe /c scripts\devenv.bat python scripts\verify_split_kv.py
-cmd.exe /c scripts\devenv.bat python scripts\verify_graph.py
+cmd.exe /c scripts\devenv.bat python scripts\verify_attn_axes.py   # every kernel and format combination
+cmd.exe /c scripts\devenv.bat python scripts\verify_graph.py       # the recorded version matches the normal one exactly
 ```
 
-### 4. Find the CUDA-graph gate value for your machine
+### If something goes wrong
 
-CUDA graph capture is **on by default**, and how widely it applies is decided by one
-constant in [`optimized/config.py`](optimized/config.py):
-
-```python
-_GRAPH_MAX_ACTIVATION = 1 << 19    # 524288
-```
-
-`auto` captures a shape when `batch * seq_len * d_model` is at or under that value. The
-number is where graph replay stopped beating eager execution **on the machine this was
-developed on**, and it does not transfer: the crossover is really the point where the GPU
-stops starving between kernel launches, which depends on the card's throughput relative to
-how fast the host can issue work. A faster GPU starves at larger shapes and wants a *larger*
-value here.
-
-To measure it on your own machine:
-
-```bash
-cmd.exe /c scripts\devenv.bat python scripts\ab_graph.py --recommend
-```
-
-The script sweeps activation volume in powers of two, times eager against replay
-interleaved in one process, and prints the value to set:
-
-```
-activation              shapes      worst       best    control
-----------------------------------------------------------------
-     16384        b1s32d512 +1     4.279x     5.520x     1.001x
-     65536       b1s128d512 +1     2.484x     3.260x     1.010x
-    262144       b4s128d512 +1     1.044x     1.356x     1.009x
-    524288       b8s128d512 +1     1.033x     1.035x     1.009x
-   1048576       b4s512d512 +1     1.009x     1.018x     1.008x
-   2097152       b8s512d512 +1     1.001x     1.004x     1.001x
-
-noise floor from the control rows: +/-1.5%
-a gain counts as real above 1.015x
-
-  set _GRAPH_MAX_ACTIVATION = 524288    # 1 << 19
-```
-
-Three things make that output trustworthy rather than just a number:
-
-- The **`control` column is eager timed against eager** — identical code on both sides, so its
-  true value is exactly `1.000x` and whatever it actually reads is your machine's noise. A
-  gain only counts if it clears that.
-- It **refuses to answer** when the control rows are wider than the effects being measured,
-  and tells you to close whatever is loading the machine, instead of returning a threshold
-  derived from noise. A game running in the background was enough to trigger this during
-  development.
-- It samples **two shapes at each activation volume and keeps the worse one**, so it errs
-  toward capturing less.
-
-**This step is optional.** Getting the constant wrong is cheap in both directions — too low
-leaves some latency unclaimed, too high pins some GPU memory for no gain — and neither can
-produce a wrong answer, because replay executes the identical kernels in the identical order.
-If you skip it, the harness still prints which path each run took and why:
-
-```
-[info] CUDA graph captured: shape=(8, 128, 512) float32 mask=off ... replay matches eager exactly
-[info] CUDA graph declined for shape (4, 512, 512): batch*seq*d_model is 1048576, over the
-       524288 above which replay measured no gain on this hardware.
-```
-
-`--cuda-graph {off,auto,always}` overrides the whole mechanism for one run.
-
-### Troubleshooting
-
-**`the CUDA extension failed to load, and there is no fallback`** — this usually means
-`cl.exe` was not on `PATH`, so the extension could not be built. It is a hard error on
-purpose: substituting a prebuilt attention would make the benchmark measure something other
-than this project.
-
-`cl.exe` is not on `PATH` in a normal shell even with Visual Studio fully installed — only
-inside a developer command prompt. Prefix the command with `devenv.bat`:
+**"the CUDA extension failed to load, and there is no fallback."** The compiler was not found. Run
+the command through `scripts\devenv.bat`, which puts it on the path first:
 
 ```bash
 cmd.exe /c scripts\devenv.bat python torch_transformer_benchmark.py
 ```
 
-Every run needs the prefix, because `torch.utils.cpp_extension.load()` probes for the host
-compiler before it will even check whether a rebuild is needed.
-
-**`'vswhere.exe' is not recognized`** — harmless, printed by `vcvarsall.bat` itself. The
-build succeeds regardless.
-
-**Extension builds but the harness is slower than expected** — confirm which kernel
-actually ran, with `--attn-impl`. `auto` picks the first kernel that covers the shape, and a
-forced impl raises rather than quietly serving the case from another one.
-
-**A run prints a passing verdict and then exits non-zero** — this was a cuTile teardown
-fault (`0xC0000005` *after* `main()` returned) and it is fixed: importing `kernel_ext`
-before `torch` preloads the display driver's GPU compiler, which is what the fault was in.
-If you see it again, check that whatever you ran imports `kernel_ext` above `import torch`
-— `kernel_ext.tile_compiler_status()` says whether the preload landed in time. The
-diagnosis is in `preload_tile_compiler()`'s docstring and in [REPORT.md](REPORT.md).
-
-### Toolset selection
-
-`nvcc` accepts only a window of MSVC versions, and Visual Studio defaults to the newest
-toolset it has. With CUDA 13.0 and a 14.5x toolset that shows up either as
-`unsupported Microsoft Visual Studio version` or — worse, because it looks like a compiler
-bug rather than a configuration problem — as `cudafe++ died with status 0xC0000005`.
-
-[`scripts/devenv.bat`](scripts/devenv.bat) therefore locates Visual Studio with `vswhere`
-(rather than hard-coding a path) and pins the toolset with `-vcvars_ver`. The default is
-`14.44`; override it if your CUDA version wants a different one:
+**"unsupported Microsoft Visual Studio version", or a crash inside `cudafe++`.** NVIDIA's compiler
+only accepts a range of Visual Studio versions, and Visual Studio defaults to the newest one it has.
+The build script pins version 14.44; change it if your CUDA version wants a different one:
 
 ```bash
 set VCVARS_VER=14.43
 cmd.exe /c scripts\build_ext.bat
 ```
 
-If the pinned toolset is not installed, the script lists the ones that are.
+If that version is not installed, the script lists the ones that are.
+
+**"'vswhere.exe' is not recognized."** Harmless. The build succeeds anyway.
+
+**It runs, but is slower than expected.** Check which kernel actually ran by passing `--attn-impl`.
 
 ---
 
-## How it works
+## Reproducing the results
 
-### What must be preserved
+### The easiest way
 
-The harness compares against `BaselineTransformer` element by element:
-
-```
-abs(user - ref) <= atol   OR   abs(user - ref) <= rtol * abs(ref)
+```bash
+python -m dashboard
 ```
 
-with `atol=0.002`, `rtol=0.02` by default. Every element must satisfy one of the two. That
-makes several baseline details load-bearing rather than incidental:
+This opens a local web page. To run the full set of official test cases:
 
-- **Pre-norm residuals** — `x = x + Attn(norm1(x))`, then `x = x + FFN(norm2(x))`. The
-  residual adds the *un-normalized* `x`.
-- **Exact GELU** (`approximate="none"`). The tanh approximation alone drifts far enough to
-  fail `atol`.
-- **Softmax accumulated in fp32**, then cast back.
-- **Bias on all four attention projections and both FFN layers.**
-- **Padding masks invalid *key* positions**, and the final output is zero-filled at padded
-  rows after `final_norm`.
+1. Go to the **Run** tab.
+2. In the **Shape** card, switch the toggle from *One shape* to **Many shapes**.
+3. Leave every preset selected — those are the fourteen official test cases, ticked by default.
+   Anything the current settings cannot run is greyed out and skipped.
+4. In the **Optimizations** card, leave everything on **auto**. That is the configuration the
+   results were measured with, and the one the benchmark uses by default.
+5. Press **Run benchmark**.
 
-How tight that budget actually is, and why being *more* accurate than the baseline does not
-help, is in [REPORT.md](REPORT.md).
+The cases run one at a time and fill in a row each: whether it passed the accuracy check, its worst
+error, how many numbers failed, the two timings, and the speedup. Above the table, the summary
+gives the geometric mean across them.
 
-### Optimizations applied
+The page does not change how anything is measured. Every number in it is printed by the benchmark
+itself, and the exact command is shown before it runs, so any row can be traced back to something
+you could type into a terminal yourself. The server never touches the graphics card; each run is a
+separate process that exits and gives its memory back when it finishes.
 
-**Fused attention.** Both backends collapse `matmul → mask → softmax → matmul` into one
-operation and never write the `[B, H, S, S]` score matrix to global memory. The custom
-kernel does this FlashAttention-style: K/V are streamed through shared memory a tile at a
-time, with a running max and running sum so the softmax is computed incrementally.
+The **Compare** tab does the same for two configurations side by side, and **Profile** shows where
+the time inside a single pass actually goes.
 
-**Both matmuls on tensor cores.** The default custom kernel runs `Q @ K^T` and `P @ V`
-through `nvcuda::wmma` fragments rather than scalar FMA. A block owns 64 query rows split
-across 4 warps, one 16-row stripe each — 16 being the `M` of a wmma tile — and walks the
-keys in tiles of 32. Per tile a warp computes its `16×32` score block, softmaxes it, and
-multiplies straight into its `16×head_dim` output block. fp32 inputs use TF32 fragments with
-fp32 accumulate, which is the same arithmetic cuBLAS gives the baseline when
-`torch.backends.cuda.matmul.allow_tf32` is on (the harness default); half and bfloat16 use
-native `16×16×16` fragments.
+### From the command line
 
-Three details are what make it a win rather than a wash — each was worth measuring on its
-own, and the first two were regressions until fixed:
+One configuration at a time:
 
-- **Padded shared-memory leading dimensions.** A fragment load walks a *column* of a tile,
-  so a row stride of 16, 32 or 64 floats puts every row of the fragment in one shared-memory
-  bank and serialises the load. Padding each tile's leading dimension by the smallest amount
-  wmma permits (4 floats, or 8 halves) rotates successive rows off each other.
+```bash
+cmd.exe /c scripts\devenv.bat python torch_transformer_benchmark.py --batch-size 64 --seq-len 128 --d-model 128 --heads 4 --ffn-dim 128 --layers 4 --causal
+```
 
-- **Q and O held in registers.** Q is read into fragments once per block and never re-read.
-  O accumulates in accumulator fragments for the whole key loop instead of being written
-  back to shared memory each tile. That second one needs the per-row softmax rescale to be
-  applied to fragment *elements*, and the element-to-row mapping is architecture-defined —
-  CUDA deliberately does not document it. Rather than hard-code a layout, the kernel probes
-  it: it stores one fragment whose elements are tagged with `(lane, slot)`, reads back where
-  each tag landed, and inverts the mapping. One 16×16 tile per warp, once per block, exact
-  by construction on any device the kernel compiles for.
+That is the first of the official test cases. All fourteen are listed in
+`dashboard/presets.json` with a note on what each one varies. The benchmark checks accuracy first
+and skips the timing entirely if it fails, so a speedup number always belongs to a correct result.
 
-- **One softmax lane per query row, not per key column.** The obvious mapping — lane ==
-  key column — needs a 5-step butterfly per row, 16 rows deep, and that cost does not
-  shrink with `head_dim`, so at `head_dim=16` it swamped both GEMMs. Giving each lane a
-  whole row segment leaves one shuffle: between the two lanes that share a row.
+The largest case — 32 sequences of 100,000 words — needs no special flags. The benchmark works out
+that it will not fit in memory, splits the batch into pieces, and skips the reference implementation
+because that cannot run at all.
 
-**Causal tile skipping.** Under causal masking, no query in a block looks past that block's
-last query row, so whole key tiles beyond it are never loaded or computed — not computed
-and discarded.
+To measure one change on its own, four switches turn the main optimizations on and off:
 
-**A scalar kernel for what tensor cores cannot take.** One thread per query row, plain
-fp32 FMA, no tensor cores and so no TF32 rounding at all. It covers what wmma cannot
-(pre-Ampere cards) and
-stays selectable through `--attn-impl scalar` so the tensor-core win can be measured rather
-than assumed.
+| Switch | What it changes |
+| --- | --- |
+| `--attn-impl` | Which attention kernel runs: `auto`, `scalar`, `wmma` (tensor cores) or `tile` |
+| `--attn-precision` | How precisely it calculates: `auto`, `fp32` (full precision), or `tf32`, `fp16` and `bf16` (progressively less, and progressively faster) |
+| `--linear-gelu` | Whether two steps of the feed-forward part are fused into one kernel |
+| `--cuda-graph` | Whether the GPU command sequence is recorded and replayed |
 
-Past head_dim 64 it is *half* a row per thread. A thread keeps q and the output accumulator
-for its row in registers — that is what makes the key loop a register FMA rather than a
-reload — and at head_dim 128 those two arrays want 256 registers against a hardware ceiling
-of 255. So two adjacent lanes share the row: 64 dims of each array apiece, one
-`__shfl_xor_sync` per key to add their partial dot products together, and the softmax
-bookkeeping repeated identically on both halves rather than communicated. Nothing else
-crosses between them, the two threads read disjoint halves of the key row so shared-memory
-traffic is unchanged, and the doubled block lifts occupancy from two warps per SM to twelve.
-Both partners share a row index, so they take every branch together — the `i < S` guard, the
-causal break, the mask skip — which is what makes a two-lane shuffle mask safe.
+Forcing a kernel onto a size it does not cover reports an error rather than silently using a
+different one, so a measurement can never be attributed to the wrong kernel.
 
-**Fused residual add + LayerNorm.** Every LayerNorm in the model consumes the output of a
-residual add, so the two are one kernel: the sum is held on chip rather than written to
-global memory and read straight back. The kernel returns both results, because the caller
-needs the un-normalised sum for its own skip connection. The only norm that cannot fuse is
-the very first, which has no add before it.
+### Rules that keep the numbers honest
 
-**One GEMM for Q, K and V.** Three separate `[B*S, d] × [d, d]` projections leave the GPU
-with too few output tiles to fill it, so cuBLAS splits the contraction and launches a second
-kernel to add the partial sums back together. One `[d, 3d]` GEMM fills the card in a single
-pass instead. The weights are concatenated lazily and cached, so the fused copy is built
-once rather than per forward pass.
+Three rules sit behind every figure quoted here, and the dashboard enforces all three:
 
-**Cached causal mask.** The mask depends only on `seq_len`, which is fixed for a model
-instance, so it is built once and reused instead of being rebuilt on every layer of every
-forward pass.
-
-**Hoisted mask-triviality check.** The default `--padding-ratio 0` still passes an all-ones
-mask. Detecting that once per forward pass (rather than once per layer) lets attention take
-the faster no-mask path, and removes the redundant GPU→CPU syncs from the hot path. The
-answer is memoized on a weak reference to the mask tensor, so the steady state has no sync
-at all — which is also what makes graph capture possible, since a device-to-host read inside
-a capture region is illegal.
-
-**CUDA graph capture and replay.** Kernel launches are asynchronous, so the CPU runs ahead
-queueing the next kernel while the GPU works on the current one. When the average kernel
-outlasts the time it takes to issue one, launch cost is invisible; when it does not, the GPU
-starves between launches. On the launch-bound shapes it does: the forward pass issues ~79
-kernels, and at small batch and sequence length most of the wall clock is the GPU waiting to
-be fed.
-
-Capture records that launch sequence once and replays it as a single submission. The
-arithmetic is untouched — the same kernels, in the same order, on the same addresses — so
-replay is **bit-identical** to eager execution, which the capture routine verifies before
-installing a graph rather than assuming. `_forward_eager` is the captured region, and
-`forward` keeps the one device-to-host sync on the outside of it. Static input buffers are
-allocated as normal (non-inference) tensors so they can be refilled from any mode, real
-inputs are copied in per call, and a graph is cached per
-`(shape, dtype, device, mask mode, backend, impl)`.
-
-**Custom modules that keep baseline parameter names.** `MyLinear`, `MyLayerNorm`,
-`MySelfAttention` and `MyTransformerBlock` in [`optimized/layers.py`](optimized/layers.py)
-reuse the baseline's attribute names and parameter shapes, so `state_dict` keys line up and
-strict weight loading works untouched — full freedom over `forward`, no custom
-weight-mapping code. `UserOptimizedTransformer` inherits from both `OptimizedTransformer` and
-`BaselineTransformer`, which is what keeps the two `isinstance`-compatible for the harness.
-
-### Why the score matrix is the bottleneck
-
-Attention computes one score per (query, key) pair — `S × S` numbers, not `S`. Double the
-sequence length and that table quadruples. The baseline writes it to memory and reads it
-back for each of masking, softmax, and the `×V` matmul. Those round trips, not the
-arithmetic, are what cost the time: at `B=8, H=8, S=2048` in fp32 the score tensor alone is
-about 1 GB *per layer*.
-
-That is also why the end-to-end speedup is much smaller than the attention-op speedup at
-short sequences, and much larger at long ones. [REPORT.md](REPORT.md) works through where
-the time actually goes.
+1. **Never compare timings from separate runs.** Graphics cards slow themselves down as they heat
+   up, so two versions have to be timed alternately within one session to face the same conditions.
+   One block size appeared to win by 1.58× measured separately, and placed fourth of five when timed
+   properly.
+2. **Always run a control.** Run the same version against itself. The true answer is exactly 1.00×,
+   so whatever it actually reports is how much the machine is varying at that moment — and any real
+   difference has to beat that to mean anything.
+3. **Timing and profiling are different jobs.** Profiling tools inflate the numbers they collect, so
+   the Profile tab reports proportions and never a speedup.
 
 ---
 
-## Repository layout
+## Limitations, and what I would improve
 
-```
-torch_transformer_benchmark.py            the harness as issued, plus three hooks into optimized/
-kernel_ext.py                             JIT loader; returns None instead of raising if unavailable
-requirements.txt                          pinned Python dependencies
+**The matrix-multiply hardware is barely used.** The kernels do reach the card's dedicated
+matrix-multiply units, but the counters show they spend only 13% of their time actually running
+them, and occupy 22% of what the card could be doing at once. Every kernel in the model turns out to
+be limited by memory speed rather than by arithmetic. Two things follow: there is real headroom
+left, and it will not come from doing less arithmetic — the kernels are waiting on data. Further
+gains have to come from moving less of it, or from keeping more work resident so the waiting
+overlaps with something useful.
 
-optimized/__init__.py                     package exports
-optimized/config.py                       the runtime knobs: backend, kernel, CUDA graphs
-optimized/cli.py                          --attn-backend / --attn-impl / --cuda-graph
-optimized/model.py                        OptimizedTransformer: the whole forward pass
-optimized/layers.py                       its submodules, named to match the baseline's
-optimized/kernels.py                      dispatch into csrc/; no fallback by design
-optimized/graphs.py                       CUDA graph capture, replay and teardown
-optimized/util.py                         small shared helpers
+**The accuracy budget is mostly spent before this project does anything.** The allowance is a
+difference of 0.002. The reference implementation's own rounding already sits between 0.00098 and
+0.0012 away from a mathematically exact answer — over half the budget.
 
-csrc/fused_attention.cu                   the extension bindings, and a map of the tree below.
-                                          The only translation unit that builds the .cuh slices
-csrc/kernel_common.cuh                    the few pieces more than one kernel needs
-csrc/attention_scalar.cuh                 attention, one thread per query row
-csrc/attention_wmma.cuh                   attention on tensor cores via nvcuda::wmma
-csrc/attention_dispatch.cuh               which attention kernel runs, and the entry point
-csrc/add_layernorm.cuh                    fused residual add + LayerNorm
-csrc/linear_gelu.cuh                      GEMM with a fused bias + GELU epilogue
-csrc/tile_attention.cu                    the same attention on the CUDA tile programming model
-csrc/tile_attention.h                     plain-pointer boundary between the two translation units
-csrc/TUNING.md                            the measurements behind every block shape and threshold
+That margin cannot be traded for speed. The obvious next step would be an even narrower number
+format, and the one below the current choice is unusable: measured against the same budget it lands
+at 425% to 622%, with tens of thousands of failing values, and that is for a mathematically perfect
+implementation. It also means the margin is not entirely under this project's control — a different
+driver moves a number that is already more than half spent.
 
-scripts/devenv.bat                        runs a command with MSVC on PATH
-scripts/build_ext.bat                     one-shot build + load check
+**The design grew rather than being planned.** I had a solid foundation in the basics of GPU
+programming, but the specific ground this project stands on was learned over a few days while
+building against it. Several of the rules that decide which kernel runs exist because of a
+measurement rather than because the structure needed them. The results are measured and they hold,
+but a second attempt would be simpler and — given that the kernels are nowhere near the card's
+limits — faster.
 
-scripts/verify_kernel.py                  correctness: every kernel, 12 shapes
-scripts/verify_split_kv.py                correctness: the tile kernel's split-KV path
-scripts/verify_graph.py                   correctness: graph replay is bit-identical to eager
+**Given more time, that is where it would go**, before it went on new features.
 
-scripts/bench_attention.py                timings: the attention op alone
-scripts/compare_backends.py               timings: the full harness, once per backend
-scripts/ab_split_kv.py                    timings: split-KV against single-pass, interleaved
-scripts/ab_layout.py                      timings: strided q/k/v against contiguous, interleaved
-scripts/ab_graph.py                       timings: replay against eager, interleaved;
-                                          --recommend tunes _GRAPH_MAX_ACTIVATION
-scripts/tune_block_shapes.py             block-shape sweep for every attention backend
-scripts/sass_mix.py                       SASS instruction mix and occupancy, head_dim 64
+---
 
-REPORT.md                                 results, running instructions, and the engineering record
-```
+## Team
 
-`build/` is generated and git-ignored.
+**Solo project.** Everything here — the GPU code, the Python layer, the measurement scripts and the
+dashboard — was designed, written, measured and debugged by **Ng Jaz Winn**, the sole entrant.
+`torch_transformer_benchmark.py` is the organizers' file, changed only by the few lines that connect
+this project to it.
+
+
+
+---
+
+## Further reading
+
+| Document | What it covers |
+| --- | -
+| **[TechnicalReport.md](TechnicalReport.md)** | The full write-up: the problem, the tools used, why the original is slow, all twenty optimizations and what each was worth, results, limitations, and the AI-use disclosure. **Start here.** |
+| [attention_dispatch_graph.md](attention_dispatch_graph.md) | Which kernel runs for which input, as a diagram |
+| [dashboard/README.md](dashboard/README.md) | What each tab of the dashboard does |
+| [Record.md](Record.md) | The engineering record: every measurement in the order it was taken, including the ones that came back negative |
+| [csrc/TUNING.md](csrc/TUNING.md) | The measurements behind every tuned constant in the kernels |
