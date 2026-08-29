@@ -52,14 +52,24 @@ both report numbers that mean nothing.
 
 ## The tabs
 
-**Run** — one configuration. Shape, dtype, tolerances, iteration counts, and an
-Optimizations panel covering `--attn-backend`, `--attn-impl`, `--attn-fp16`,
+**Run** — one configuration, on one shape or many. The toggle in the Shape card
+picks between *One shape*, which is the typed fields, and *Many shapes*, the
+same tickable preset list Compare uses. Many shapes queues one child process per
+shape and fills the table row by row; the summary then leads with the geometric
+mean instead of a single speedup.
+
+Everything else is shared either way: dtype, tolerances, iteration counts, and
+an Optimizations panel covering `--attn-backend`, `--attn-impl`, `--attn-fp16`,
 `--linear-gelu` and `--cuda-graph`.
+
+*(This replaces the old Sweep tab, which was this with the picker and no typed
+fields. The server still calls a multi-shape run a sweep, and history records it
+under that name.)*
 
 **Compare** — two configurations against the same shape or shapes, run one after
 the other. The toggle in the Shape card picks between *One shape*, which is the
 typed shape fields, and *Many shapes*, which is the same tickable preset list
-Sweep uses. Results pivot: a row is a shape, and each config gets its own column
+Run uses. Results pivot: a row is a shape, and each config gets its own column
 group — median, speedup and accuracy for A beside the same three for B, then the
 A-vs-B ratio and the verdict.
 
@@ -81,9 +91,6 @@ pair being compared is timed within seconds of itself. If a shape is impossible
 for either side — an `--attn-impl` that does not cover its head_dim, say — the
 whole shape is skipped with the reason shown, and the rest of the selection still
 runs. Half a pair is not a comparison.
-
-**Sweep** — one configuration across many shapes, one child process per shape,
-rows filling in as each finishes.
 
 **Profile** — one traced run under Nsight Systems, and where its GPU time
 actually goes. Three steps: *prepare* builds the extension, *capture* runs the
@@ -358,9 +365,10 @@ made in a text editor while the page was open.
 
 ## Running many shapes at once
 
-The **Sweep** tab takes one configuration and runs it across every shape you
-tick. Everything runnable starts ticked, so pressing Run sweeps the whole
-grading set without a prior edit.
+**Run** on *Many shapes* takes one configuration and runs it across every shape
+you tick. Everything runnable starts ticked, so pressing Run sweeps the whole
+grading set without a prior edit. Compare's *Many shapes* works the same way,
+with two configurations instead of one.
 
 They run **one at a time**, not concurrently, and that is deliberate: two
 benchmarks sharing the card contend for SMs and bandwidth, and both then report

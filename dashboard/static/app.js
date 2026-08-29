@@ -63,9 +63,8 @@ function shortSource(source) {
 }
 
 const VIEW_TITLES = {
-  run: ['Run', 'One configuration on one shape'],
+  run: ['Run', 'One configuration, on one shape or many'],
   compare: ['Compare', 'Two configurations, timed back to back against a control'],
-  sweep: ['Sweep', 'One configuration across many shapes'],
   profile: ['Profile', 'One traced run, and where its GPU time actually goes'],
   scripts: ['Scripts', "The repository's own A/B and verification scripts"],
   presets: ['Presets', 'The saved shapes, written to presets.json'],
@@ -74,10 +73,8 @@ const VIEW_TITLES = {
 
 const state = {
   spec: null,
-  forms: { run: {}, cmpShape: {}, cmpA: {}, cmpB: {}, sweep: {}, script: {},
-           profile: {} },
-  jobs: { run: null, compare: null, sweep: null, script: null, profile: null,
-          ncu: null },
+  forms: { run: {}, cmpShape: {}, cmpA: {}, cmpB: {}, script: {}, profile: {} },
+  jobs: { run: null, compare: null, script: null, profile: null, ncu: null },
   polls: {},
   // Each view's Run/Stop pair, so the queue poll can put them back if a job's
   // own polling ever stops reporting. See reconcileControls().
@@ -1349,6 +1346,15 @@ function wireSpeedButtons() {
   });
 }
 
+function mergedRunForm(form, shape) {
+  if (!shape) return form;
+  const merged = Object.assign({}, form);
+  state.spec.shape_keys.forEach((key) => {
+    if (shape[key] !== undefined) merged[key] = shape[key];
+  });
+  return merged;
+}
+
 function setupRun() {
   const form = state.forms.run;
 
@@ -1358,8 +1364,12 @@ function setupRun() {
     badge.textContent = count + ' set';
     badge.hidden = !count;
   };
-  const preflight = makePreflight(() => form, $('run-command'), $('run-issues'),
-    $('run-derived'), updateEnvBadge);
+  // Declared before the toggle sets it, and read lazily, so the preview follows
+  // whichever shape mode is active.
+  let shapeForPreview = () => null;
+  const preflight = makePreflight(
+    () => mergedRunForm(form, shapeForPreview()),
+    $('run-command'), $('run-issues'), $('run-derived'), updateEnvBadge);
   const changed = () => preflight();
 
   ['shape', 'optimization', 'timing', 'accuracy', 'data', 'torch', 'other']
@@ -1368,6 +1378,48 @@ function setupRun() {
 
   fillPresetSelect($('run-preset'), (preset) => applyPreset($('run-shape'), preset));
   wireSpeedButtons();
+
+  let mode = 'single';
+  let picker = null;
+
+  /* In many-shape mode each shape has its own command line, so the preview
+   * shows the first ticked one rather than the typed fields it is not using. */
+  const previewShape = () => (mode === 'many' && picker ? picker.selected()[0] : null);
+  shapeForPreview = previewShape;
+
+  const restate = () => {
+    const chosen = (mode === 'many' && picker) ? picker.selected().length : 1;
+    const note = $('run-shape-note');
+    if (!note) return;
+    note.textContent = mode === 'many'
+      ? (chosen ? chosen + ' shape' + (chosen === 1 ? '' : 's') + ', one run each'
+        : 'nothing ticked')
+      : '';
+  };
+
+  picker = makeShapePicker($('run-shapes'), $('run-count'), $('run-all'),
+    $('run-none'), () => { restate(); changed(); });
+  $('run-presets-path').textContent = presetsFileName();
+
+  const panes = $('panel-run').querySelectorAll('[data-run-pane]');
+  const setMode = (next) => {
+    mode = next;
+    panes.forEach((pane) => { pane.hidden = pane.dataset.runPane !== next; });
+    $('run-shape-mode').querySelectorAll('button').forEach((button) => {
+      button.setAttribute('aria-pressed', String(button.dataset.shapeMode === next));
+    });
+    try { localStorage.setItem('run-shape-mode', next); } catch (err) { /* no store */ }
+    restate();
+    changed();
+  };
+  $('run-shape-mode').addEventListener('click', (event) => {
+    const button = event.target.closest('[data-shape-mode]');
+    if (button) setMode(button.dataset.shapeMode);
+  });
+
+  let saved = null;
+  try { saved = localStorage.getItem('run-shape-mode'); } catch (err) { saved = null; }
+  setMode(saved === 'many' ? 'many' : 'single');
 
   $('run-copy-cmd').addEventListener('click', () => {
     navigator.clipboard.writeText($('run-command').textContent);
@@ -1380,7 +1432,21 @@ function setupRun() {
   };
 
   state.uis['run'] = ui;
-  $('run-go').addEventListener('click', () => submit('run', { mode: 'single', form }, ui));
+  restate();
+  $('run-go').addEventListener('click', () => {
+    if (mode !== 'many') {
+      submit('run', { mode: 'single', form }, ui);
+      return;
+    }
+    const shapes = picker.selected();
+    if (!shapes.length) {
+      renderIssues($('run-issues'), [{ level: 'error', message: 'no shapes ticked' }]);
+      return;
+    }
+    // The server already knows how to queue this: one child per shape, run one
+    // at a time. It is still a sweep, and the history it writes still says so.
+    submit('run', { mode: 'sweep', form, shapes }, ui);
+  });
   $('run-stop').addEventListener('click', () => requestStop('run', ui));
   preflight();
 }
@@ -1848,9 +1914,7 @@ function renderCompareMany(summary, pivot) {
 }
 
 
-/* ------------------------------------------------------------ sweep view -- */
-
-/* The tickable shape list, shared by Sweep and Compare.
+/* The tickable shape list, shared by Run and Compare.
  *
  * `onChange` fires whenever the selection moves, so a caller can restate what
  * is about to be queued -- which matters more in Compare, where every ticked
@@ -1946,38 +2010,6 @@ function makeShapePicker(list, count, allButton, noneButton, onChange) {
   shapeLists.push(() => { build(); settle(); });
 
   return { selected, rebuild: () => { build(); settle(); } };
-}
-
-function setupSweep() {
-  const form = state.forms.sweep;
-  const preflight = makePreflight(() => form, null, $('sweep-issues'), null);
-
-  renderGroup($('sweep-optimization'), 'optimization', form, preflight);
-  renderGroup($('sweep-timing'), 'timing', form, preflight);
-  renderEnv($('sweep-env'), form, preflight);
-
-  $('sweep-presets-path').textContent = presetsFileName();
-  const picker = makeShapePicker($('sweep-shapes'), $('sweep-count'),
-    $('sweep-all'), $('sweep-none'));
-
-  const ui = {
-    log: $('sweep-log'), status: $('sweep-job-status'), go: $('sweep-go'),
-    stop: $('sweep-stop'), follow: $('sweep-follow'), issues: $('sweep-issues'),
-    resultsCard: $('sweep-results-card'),
-    render: (rows) => { renderSummary($('sweep-summary'), rows); renderTable($('sweep-results'), rows); },
-  };
-
-  state.uis['sweep'] = ui;
-  $('sweep-go').addEventListener('click', () => {
-    const shapes = picker.selected();
-    if (!shapes.length) {
-      renderIssues($('sweep-issues'), [{ level: 'error', message: 'no shapes ticked' }]);
-      return;
-    }
-    submit('sweep', { mode: 'sweep', form, shapes }, ui);
-  });
-  $('sweep-stop').addEventListener('click', () => requestStop('sweep', ui));
-  preflight();
 }
 
 /* ---------------------------------------------------------- profile view -- */
@@ -3187,8 +3219,7 @@ function setupChrome() {
   });
 
   // Alt+1..6 moves between views without leaving the keyboard.
-  const order = ['run', 'compare', 'sweep', 'profile', 'scripts', 'presets',
-                 'history'];
+  const order = ['run', 'compare', 'profile', 'scripts', 'presets', 'history'];
   window.addEventListener('keydown', (event) => {
     if (!event.altKey || event.ctrlKey || event.metaKey) return;
     const index = Number(event.key) - 1;
@@ -3214,7 +3245,6 @@ async function boot() {
   setupTableMenu();
   setupRun();
   setupCompare();
-  setupSweep();
   setupProfile();
   setupScripts();
   setupPresets();
