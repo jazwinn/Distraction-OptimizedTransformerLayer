@@ -394,6 +394,128 @@ against a forced wmma, two process pairs: **1.361x / 1.345x** against
 **1.306x / 1.310x**. Accuracy improves alongside — `max_abs` 1.21e-3 against
 1.35e-3.
 
+## O straight to global: 1.13x on the op, and a fourth resident block
+
+The epilogue used to put O in shared memory before writing it out: one
+`wmma::store_matrix_sync` per 16-wide fragment into a block-sized fp32 tile, a
+`__syncwarp`, then sixteen rows read back and written to global a lane at a
+time. FlashAttention does not stage it, and neither does this kernel any more --
+`store_matrix_sync` takes a generic pointer, and both output layouts step one
+row by a constant (`head_dim` for `[B,H,S,D]`, `H*head_dim` for the `[B,S,H*D]`
+view `out_proj` wants), which is exactly the `(pointer, ldm, row_major)` the
+fragment store asks for.
+
+`scripts/ab_direct_o.py`, `scripts/verify_direct_o.py`. Knob: `WMMA_DIRECT_O` /
+`wmma_set_direct_o()`.
+
+### Two wins, and the flag has to cover both
+
+  the epilogue     one fragment store per tile instead of a shared write, a
+                   barrier, and sixteen shared reads plus sixteen global writes
+                   per lane
+  the block tile   which then only holds the fallback cases -- one fragment per
+                   warp instead of BLOCK_M x PDIM
+
+The second is the larger one, and it is why the flag picks the shared-memory
+layout and the launch size as well as the code path. Measuring the code path
+alone would have missed most of the effect and concluded the change was not
+worth making.
+
+Both O layouts sit at offset 0 on top of the Q staging, which is dead from the
+fragment hoist onward, so the saving is only what O costs **above** Q: nothing
+below head_dim 32, where PDIM 16 makes the block tile one fragment wide already.
+
+| head_dim | block | smem, staged | smem, direct | blocks/SM |
+|---:|:--|--:|--:|:--|
+| 8, 16 | 64x32 | 24320 | 24320 | 4 -> 4 |
+| 32 | 64x32 | 30464 | 26368 | 3 -> 3 |
+| 64 | 64x16 | 32000 | 23808 | **3 -> 4** |
+| 128 | 32x16 | 30592 | 22400 | **3 -> 4** |
+| 256 | 32x16 | 55168 | 38784 | **1 -> 2** |
+
+### Measured before writing anything
+
+Two questions, both answerable in advance, and the answers set the scope.
+
+**Is there an epilogue to win?** Hold the block count at 512, vary only the key
+tiles, fit `t = a + b*n_kt`. The fixed part is 34-87 ns per block: 42% of a
+block at S 128, 4-11% at S 1024. That is a CEILING, not an estimate -- it also
+contains the Q staging and the accumulator probe.
+
+**Would freeing shared memory buy a block?** Modelled resident blocks from
+registers, threads and smem, then checked the model against
+`cudaOccupancyMaxActiveBlocksPerMultiprocessor` on the real kernel: it
+reproduces the driver exactly at head_dim 8, 16, 32, 64 and 128. Every one of
+those is **shared-memory bound**, not register bound, which is what made the
+saving convertible into occupancy. Worth doing before the work, not after.
+
+### Results, op level, graph-timed, interleaved, symmetric sampling
+
+| group | ratio | why |
+|:--|--:|:--|
+| head_dim 256 | **1.740x** | 1 -> 2 blocks |
+| head_dim 128 | 1.250x | 3 -> 4 blocks |
+| head_dim 64 | 1.134x | 3 -> 4 blocks |
+| head_dim 16 | 1.028x | no smem change |
+| head_dim 8 | 1.037x | tiled fallback only, never direct |
+| **head_dim 32** | **1.008x** | **no smem change -- the control** |
+
+Geometric mean **1.131x** over 20 shapes, best **1.912x** (b4 h8 s512 d256),
+worst 1.002x -- nothing regresses. Self-control reads **0.999x, 0.986x-1.010x**.
+
+**The win is the occupancy, not the epilogue**, and head_dim 32 is what proves
+it: its O tile is already no bigger than the Q staging it sits on, so its shared
+memory does not move, it stays at 3 blocks, and it reads 1.008x. Every head_dim
+that gains a block gains real time; the one that does not, does not.
+
+**head_dim 8 is not a control**, which a first pass assumed on the grounds that
+it can never store direct -- the fragment is 16 wide and the row is 8. It does
+not take the staged path either. It takes the tiled fallback, and that alone is
+faster there, because the old row loop ran sixteen times with eight of
+thirty-two lanes live while the tiled one packs 16x8 across the full warp.
+
+End to end the geomean is 1.007x, and the reason is worth stating rather than
+burying: the benchmark's default shapes are d_model 256 over 8 heads, which is
+**head_dim 32** -- the one head_dim this change does nothing for. It is shape
+coverage, not a measurement problem.
+
+### Bit-identical, and that is the right bar
+
+The same fragments reach the same addresses; nothing is added, removed or
+reordered. `verify_direct_o.py` checks **exact equality** over 184 cases x 2
+split settings: ragged `S` (the last row block falls back), head_dim 8 where
+`DIM != PDIM`, both output layouts, and `H` in {1,3,8} across both -- the packed
+layout makes `ldm = H*head_dim` rather than `head_dim`, and swapping those is
+the likeliest mistake here. A forced split count covers `part_o`, which is fp32
+and packed `[B,H,splits,S,D]`, a different destination with its own stride. All
+368 bit-identical.
+
+### Registers, and one thing left on the floor
+
+| head_dim | before | after |
+|---:|--:|--:|
+| 32 | 76 | 72 |
+| 64 | 128 | 127 |
+| 128 | 164 | 168 |
+| 256 | 252 | 255 |
+
+`LOCAL:0` throughout, and the occupancy above is what the driver reports with
+these counts, so nothing was lost. But `STACK` went 0 -> 16 at head_dim 64 and
+0 -> 8 at 128, which was 0 before: the generic lambda holding the tiled fallback
+is not being fully inlined. It is the cold path and the measurements are what
+they are, but a 16-byte frame that did not exist before is worth removing.
+
+### Left on the table: head_dim 32 misses a fourth block by 768 bytes
+
+Its 26368 bytes need to be 25600. The components are Q/O 5120, K+V 5120, scores
+10240, P 5120, rows 768 -- and `s_s` and `p_s` share one leading dimension,
+`S_LD = BLOCK_N + PAD`, where `PAD` is 8 because `p_s` is loaded as a half
+`matrix_a` and wmma wants `ldm % 8`. `s_s` is never loaded as a fragment and
+only needs float alignment. Giving it `BLOCK_N + 4` makes it 9216 bytes, puts
+the block at 25344, and buys head_dim 32 the fourth block too -- which is the
+head_dim the benchmark actually runs. Separate change, with its own
+bank-conflict question.
+
 ## The uncovered-shape fallback is SDPA, not the baseline's own matmul
 
 The path taken when no kernel covers a case used to mirror

@@ -272,32 +272,57 @@ struct WmmaCfg {
 
     static constexpr int KV_LD = PDIM + PAD;       // k_s, v_s, and Q staging
     static constexpr int O_LD  = PDIM + 4;         // o_s is always fp32
+    static constexpr int O_TILE_LD = 16 + 4;       // ... and one fragment wide
     static constexpr int S_LD  = BLOCK_N + PAD;    // s_s and p_s
 
     static constexpr size_t Q_BYTES   = sizeof(scalar_t) * BLOCK_M * KV_LD;
-    static constexpr size_t O_BYTES   = sizeof(float) * BLOCK_M * O_LD;
-    static constexpr size_t QO_BYTES  = (Q_BYTES > O_BYTES) ? Q_BYTES : O_BYTES;
+    // Two O layouts, chosen per launch by direct_o_flag().
+    //
+    // FULL is the original: the whole BLOCK_M x PDIM block tile, staged in
+    // fp32, which every warp fills and then reads back a row at a time.
+    //
+    // TILE is what the direct-to-global epilogue needs instead. There
+    // wmma::store_matrix_sync writes the accumulator straight to `out`, and
+    // shared memory is only a fallback for the tiles that cannot -- a ragged
+    // last row block, head_dim 8's padded columns, an `out` narrower than the
+    // fp32 accumulator. Those go through one 16x16 fragment at a time, so the
+    // buffer shrinks from the block tile to one fragment per warp.
+    //
+    // Both sit at offset 0, on top of the Q staging, which is dead from the
+    // fragment hoist onward. So the saving is only what O costs ABOVE Q, which
+    // is nothing below head_dim 32 (where PDIM == 16 makes the block tile one
+    // fragment wide already) and 8-16 KB above it.
+    static constexpr size_t O_FULL_BYTES = sizeof(float) * BLOCK_M * O_LD;
+    static constexpr size_t O_TILE_BYTES = sizeof(float) * WARPS * 16 * O_TILE_LD;
+    static constexpr size_t QO_FULL =
+        (Q_BYTES > O_FULL_BYTES) ? Q_BYTES : O_FULL_BYTES;
+    static constexpr size_t QO_TILE =
+        (Q_BYTES > O_TILE_BYTES) ? Q_BYTES : O_TILE_BYTES;
     static constexpr size_t KV_BYTES  = sizeof(scalar_t) * BLOCK_N * KV_LD;
     static constexpr size_t S_BYTES   = sizeof(float) * BLOCK_M * S_LD;
     static constexpr size_t P_BYTES   = P_ALIASES_S ? 0 : sizeof(scalar_t) * BLOCK_M * S_LD;
     static constexpr size_t ROW_BYTES = sizeof(float) * BLOCK_M;
 
+    // Everything after O is packed against it, so the two O sizes give two
+    // whole layouts. The kernel picks one per launch from a single flag and
+    // derives the offsets in a few instructions before the key loop; the loop
+    // itself indexes off pointers that were already runtime values, so nothing
+    // in it changes. That is what makes the two layouts A/B-able inside one
+    // process rather than across two builds -- see csrc/TUNING.md on the
+    // cross-process ablation that reported the impossible.
     static constexpr size_t O_OFF = 0;
-    static constexpr size_t K_OFF = O_OFF + QO_BYTES;
-    static constexpr size_t V_OFF = K_OFF + KV_BYTES;
-    static constexpr size_t S_OFF = V_OFF + KV_BYTES;
-    static constexpr size_t P_OFF = S_OFF + S_BYTES;
-    static constexpr size_t M_OFF = P_OFF + P_BYTES;
-    static constexpr size_t L_OFF = M_OFF + ROW_BYTES;
-    static constexpr size_t C_OFF = L_OFF + ROW_BYTES;
-    static constexpr size_t SMEM  = C_OFF + ROW_BYTES;
+    static constexpr size_t TAIL_BYTES =
+        2 * KV_BYTES + S_BYTES + P_BYTES + 3 * ROW_BYTES;
+    static constexpr size_t SMEM      = QO_FULL + TAIL_BYTES;
+    static constexpr size_t SMEM_TILE = QO_TILE + TAIL_BYTES;
 
     // The accumulator probe below needs 512 floats of scratch per warp. It runs
     // after Q has been hoisted into registers and before the first K/V tile is
     // staged, so the whole O/K/V/S span is dead and can host it -- but that
     // span has to actually be big enough.
     static constexpr size_t PROBE_BYTES = sizeof(float) * WARPS * 512;
-    static constexpr size_t SCRATCH_BYTES = QO_BYTES + 2 * KV_BYTES + S_BYTES;
+    // Sized on the SMALLER O layout, so the probe fits whichever one is live.
+    static constexpr size_t SCRATCH_BYTES = QO_TILE + 2 * KV_BYTES + S_BYTES;
 
     // Whether causal blocks are worth dispatching longest-first. Per head_dim
     // for the same reason WmmaShape is: head_dim 128 runs a 32x16 block of two
@@ -305,7 +330,8 @@ struct WmmaCfg {
     // that little in flight the kernel is bound by K/V locality rather than by
     // makespan, and reordering the dispatch costs more L2 reuse than it saves
     // tail -- measured 0.889x-0.966x over five shapes, against 1.02x-1.09x at
-    // head_dim 16 through 64. scripts/ab_causal_reverse.py has the table.
+    // head_dim 16 through 64. TUNING.md, "wmma kernel: causal block-index
+    // reversal", has the table; the A/B script that produced it is gone.
     static constexpr bool REVERSE_CAUSAL = (HEAD_DIM <= 64);
 
     // 48 KB is what a block gets without opting in, and two of them then fit on
@@ -394,6 +420,36 @@ int& softmax_mode_flag() {
 // Both paths have to exist regardless: that is what the optimization IS. The
 // flag only forces the slow one, so an A/B costs nothing that the shipped
 // kernel does not already carry. Same knob contract as causal_reverse_flag().
+// Whether the epilogue hands O straight to global memory.
+//
+// O leaves the key loop in accumulator registers, and the original epilogue
+// put it in shared memory first: one wmma::store_matrix_sync per 16-wide
+// fragment into a block-sized fp32 tile, a __syncwarp, then sixteen rows read
+// back and written out a lane at a time. FlashAttention does not stage it --
+// wmma::store_matrix_sync takes a generic pointer, and both output layouts
+// keep head_dim as the fastest axis with a constant row stride, which is
+// exactly the (pointer, ldm, row_major) the fragment store wants.
+//
+// Storing direct buys two separate things:
+//
+//   the epilogue      one fragment store per tile instead of a shared write,
+//                     a barrier, sixteen shared reads and sixteen global
+//                     writes per lane
+//   the block tile    which then only has to hold the fallback cases, one
+//                     fragment per warp instead of BLOCK_M x PDIM, freeing
+//                     8 KB at head_dim 64 and 128 and 16 KB at 256
+//
+// The second is why the flag also picks the shared-memory layout and the
+// launch size, rather than only the code path: measuring one without the other
+// would miss most of it. Same knob contract as causal_reverse_flag().
+bool& direct_o_flag() {
+    static bool on = [] {
+        const char* e = std::getenv("WMMA_DIRECT_O");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    return on;
+}
+
 bool& mask_classify_flag() {
     static bool on = [] {
         const char* e = std::getenv("WMMA_MASK_CLASSIFY");
@@ -527,7 +583,7 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
                                  int B, int H, int S,
                                  bool is_causal, float scale,
                                  bool out_bshd, bool reverse_m, int splits,
-                                 bool classify) {
+                                 bool classify, bool direct_o) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using Cfg = WmmaCfg<compute_t, HEAD_DIM>;
     using frag_elem = typename FragTraits<compute_t>::elem;
@@ -566,18 +622,30 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
     const float s_mul = USE_EXP2 ? (scale * kLog2e) : scale;
 
     extern __shared__ __align__(16) char smem_raw[];
+    // The O region leads the block and everything else is packed against it,
+    // so its size sets every other offset. direct_o shrinks it from the whole
+    // block tile to one fragment per warp; see direct_o_flag(). Computed once,
+    // outside every loop, into the same pointers the loop already used.
+    const size_t qo_bytes = direct_o ? Cfg::QO_TILE : Cfg::QO_FULL;
+    const size_t k_off = Cfg::O_OFF + qo_bytes;
+    const size_t v_off = k_off + Cfg::KV_BYTES;
+    const size_t s_off = v_off + Cfg::KV_BYTES;
+    const size_t p_off = s_off + Cfg::S_BYTES;
+    const size_t m_off = p_off + Cfg::P_BYTES;
+    const size_t l_off = m_off + Cfg::ROW_BYTES;
+    const size_t c_off = l_off + Cfg::ROW_BYTES;
     float*    o_s = reinterpret_cast<float*>(smem_raw + Cfg::O_OFF);
-    compute_t* k_s = reinterpret_cast<compute_t*>(smem_raw + Cfg::K_OFF);
-    compute_t* v_s = reinterpret_cast<compute_t*>(smem_raw + Cfg::V_OFF);
-    float*    s_s = reinterpret_cast<float*>(smem_raw + Cfg::S_OFF);
-    float*    m_s = reinterpret_cast<float*>(smem_raw + Cfg::M_OFF);
-    float*    l_s = reinterpret_cast<float*>(smem_raw + Cfg::L_OFF);
-    float*    c_s = reinterpret_cast<float*>(smem_raw + Cfg::C_OFF);
+    compute_t* k_s = reinterpret_cast<compute_t*>(smem_raw + k_off);
+    compute_t* v_s = reinterpret_cast<compute_t*>(smem_raw + v_off);
+    float*    s_s = reinterpret_cast<float*>(smem_raw + s_off);
+    float*    m_s = reinterpret_cast<float*>(smem_raw + m_off);
+    float*    l_s = reinterpret_cast<float*>(smem_raw + l_off);
+    float*    c_s = reinterpret_cast<float*>(smem_raw + c_off);
     // P feeds the second GEMM as a matrix_a fragment, so it has to be in the
     // operand type. For fp32 that is the same type the scores were stored in,
     // so the softmax can overwrite the score tile in place.
     compute_t* p_s = Cfg::P_ALIASES_S ? reinterpret_cast<compute_t*>(s_s)
-                                      : reinterpret_cast<compute_t*>(smem_raw + Cfg::P_OFF);
+                                      : reinterpret_cast<compute_t*>(smem_raw + p_off);
 
     const int tid    = threadIdx.x;
     const int warp   = tid >> 5;
@@ -975,35 +1043,85 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
     }
 
     // --- write out ----------------------------------------------------------
+    //
+    // Can this warp hand its accumulator straight to global memory? The
+    // fragment store writes a whole 16x16 tile at a fixed row stride, so it
+    // needs all sixteen rows in range and no padded columns to drop. It also
+    // writes fp32, which is what the accumulator holds and what part_o is, but
+    // not necessarily what `out` is -- an fp16 or bf16 output needs a
+    // conversion the fragment store cannot do. Every clause is warp-uniform.
+    constexpr bool OUT_IS_FLOAT = std::is_same<scalar_t, float>::value;
+    const bool o_whole = direct_o && ((q_base + RPW) <= S) && (DIM == PDIM);
+
+    // The fallback, and the only thing shared memory is still needed for: one
+    // 16x16 fragment at a time through this warp's slot of the O region, then
+    // out a lane at a time. `dst` is the warp's first row and `ldm` its row
+    // stride, which is constant in every layout involved.
+    float* o_tile = o_s + warp * 16 * Cfg::O_TILE_LD;
+    auto emit_tiled = [&](auto* dst, int64_t ldm) {
+        #pragma unroll
+        for (int n = 0; n < N_TILES; ++n) {
+            const int c0 = n * 16;
+            const int w  = ((DIM - c0) < 16) ? (DIM - c0) : 16;   // 8 at head_dim 8
+            __syncwarp();
+            wm::store_matrix_sync(o_tile, o_frag[n], Cfg::O_TILE_LD,
+                                  wm::mem_row_major);
+            __syncwarp();
+            for (int idx = lane; idx < 16 * w; idx += 32) {
+                const int r = idx / w;
+                if ((q_base + r) >= S) continue;
+                const int c = idx - r * w;
+                dev_from_float(dst[static_cast<int64_t>(r) * ldm + c0 + c],
+                               o_tile[r * Cfg::O_TILE_LD + c]);
+            }
+        }
+    };
+
     if (splits > 1) {
         // Unnormalised on purpose: 1/l is only knowable once every split's l
         // has been rebased onto the max over all splits, which is the combine
         // pass's job. Storing a normalised partial here would be wrong, not
         // merely wasteful.
-        #pragma unroll
-        for (int n = 0; n < N_TILES; ++n) {
-            wm::store_matrix_sync(o_s + static_cast<size_t>(row_base) * O_LD + n * 16,
-                                  o_frag[n], O_LD, wm::mem_row_major);
-        }
-        __syncwarp();
-
         // [B, H, splits, S, DIM] for O and [B, H, splits, S] for the two row
         // statistics: the split axis sits between (b, h) and s, so one split's
-        // writes stay contiguous.
+        // writes stay contiguous -- which also makes DIM the row stride the
+        // fragment store needs.
         const int64_t part_bh =
             (static_cast<int64_t>(b) * H + h) * splits + split;
         const int64_t row0 = part_bh * S;
+        float* po0 = part_o + (row0 + q_base) * DIM;
+        if (o_whole) {
+            // part_o is fp32 whatever the tensors are, so OUT_IS_FLOAT does
+            // not gate this one.
+            #pragma unroll
+            for (int n = 0; n < N_TILES; ++n) {
+                wm::store_matrix_sync(po0 + n * 16, o_frag[n], DIM,
+                                      wm::mem_row_major);
+            }
+        } else if (direct_o) {
+            emit_tiled(po0, DIM);
+        } else {
+            #pragma unroll
+            for (int n = 0; n < N_TILES; ++n) {
+                wm::store_matrix_sync(o_s + static_cast<size_t>(row_base) * O_LD + n * 16,
+                                      o_frag[n], O_LD, wm::mem_row_major);
+            }
+            __syncwarp();
+            for (int rr = 0; rr < RPW; ++rr) {
+                const int i = q_base + rr;
+                if (i >= S) break;
+                float* po = part_o + (row0 + i) * DIM;
+                for (int c = lane; c < DIM; c += 32) {
+                    po[c] = o_s[(row_base + rr) * O_LD + c];
+                }
+            }
+        }
         for (int rr = 0; rr < RPW; ++rr) {
             const int i = q_base + rr;
             if (i >= S) break;
-            const int r = row_base + rr;
-            float* po = part_o + (row0 + i) * DIM;
-            for (int c = lane; c < DIM; c += 32) {
-                po[c] = o_s[r * O_LD + c];
-            }
             if (lane == 0) {
-                part_m[row0 + i] = m_s[r];
-                part_l[row0 + i] = l_s[r];
+                part_m[row0 + i] = m_s[row_base + rr];
+                part_l[row0 + i] = l_s[row_base + rr];
             }
         }
     } else {
@@ -1016,19 +1134,39 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
                 const float lr = l_s[row_base + acc_row[t]];
                 o_frag[n].x[t] *= (lr > 0.0f) ? (1.0f / lr) : 0.0f;
             }
-            wm::store_matrix_sync(o_s + static_cast<size_t>(row_base) * O_LD + n * 16,
-                                  o_frag[n], O_LD, wm::mem_row_major);
         }
-        __syncwarp();
 
-        for (int rr = 0; rr < RPW; ++rr) {
-            const int i = q_base + rr;
-            if (i >= S) break;
-            const int r = row_base + rr;
-            // Columns past DIM exist only to fill the fragment; dropped here.
-            scalar_t* out_row = out + out_base(out_bshd, b, h, i, H, S, DIM);
-            for (int c = lane; c < DIM; c += 32) {
-                dev_from_float(out_row[c], o_s[r * O_LD + c]);
+        // Both output layouts step one row by a constant: head_dim for
+        // [B,H,S,D], and H*head_dim for the [B,S,H*D] view out_proj wants. So
+        // either is a row stride the fragment store can take directly.
+        scalar_t* out0 = out + out_base(out_bshd, b, h, q_base, H, S, DIM);
+        const int64_t out_ld =
+            out_bshd ? (static_cast<int64_t>(H) * DIM) : static_cast<int64_t>(DIM);
+        if (o_whole && OUT_IS_FLOAT) {
+            float* dst = reinterpret_cast<float*>(out0);
+            #pragma unroll
+            for (int n = 0; n < N_TILES; ++n) {
+                wm::store_matrix_sync(dst + n * 16, o_frag[n],
+                                      static_cast<unsigned>(out_ld),
+                                      wm::mem_row_major);
+            }
+        } else if (direct_o) {
+            emit_tiled(out0, out_ld);
+        } else {
+            #pragma unroll
+            for (int n = 0; n < N_TILES; ++n) {
+                wm::store_matrix_sync(o_s + static_cast<size_t>(row_base) * O_LD + n * 16,
+                                      o_frag[n], O_LD, wm::mem_row_major);
+            }
+            __syncwarp();
+            for (int rr = 0; rr < RPW; ++rr) {
+                const int i = q_base + rr;
+                if (i >= S) break;
+                // Columns past DIM exist only to fill the fragment; dropped here.
+                scalar_t* out_row = out + out_base(out_bshd, b, h, i, H, S, DIM);
+                for (int c = lane; c < DIM; c += 32) {
+                    dev_from_float(out_row[c], o_s[(row_base + rr) * O_LD + c]);
+                }
             }
         }
     }
@@ -1103,21 +1241,27 @@ __global__ void wmma_split_combine_kernel(const float* __restrict__ part_o,
 // is a queue to reorder, and the split-KV gate, which only pays when there is
 // idle capacity to fill. They are opposite questions about the same number, so
 // it lives in one place.
+//
+// Asked per O layout, because that is the point of the layout: direct_o frees
+// 8 KB at head_dim 64 and 128 and 16 KB at 256, and whether that buys a block
+// is exactly this query. Both answers are cached, so a knob flip between timed
+// runs still costs one query each and not one per launch.
 template <typename scalar_t, typename compute_t, int HEAD_DIM, int MODE>
-int wmma_resident_blocks() {
+int wmma_resident_blocks(bool direct_o) {
     using Cfg = WmmaCfg<compute_t, HEAD_DIM>;
-    static const int resident = [] {
+    static const auto probe = [](size_t smem) {
         int per_sm = 0;
         if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                 &per_sm,
                 fused_attention_wmma_kernel<scalar_t, compute_t, HEAD_DIM, MODE>,
-                Cfg::NTHREADS, Cfg::SMEM) != cudaSuccess) {
+                Cfg::NTHREADS, smem) != cudaSuccess) {
             return 0;   // unknown -> every gate below reads "do not"
         }
         return per_sm * at::cuda::getCurrentDeviceProperties()
                             ->multiProcessorCount;
-    }();
-    return resident;
+    };
+    static const int resident[2] = { probe(Cfg::SMEM), probe(Cfg::SMEM_TILE) };
+    return resident[direct_o ? 1 : 0];
 }
 
 template <typename scalar_t, typename compute_t, int HEAD_DIM, int MODE>
@@ -1147,15 +1291,20 @@ void launch_wmma_kernel_as(const torch::Tensor& q, const torch::Tensor& k,
     }
 
     // Reversal only pays when there is a queue to reorder. Measured on 13
-    // causal shapes (scripts/ab_causal_reverse.py): below one wave every block
+    // causal shapes (table in TUNING.md): below one wave every block
     // is already resident, so dispatch order decides nothing and reversing only
     // scatters L2 locality -- b2 h2 s2048 d64, 128 blocks against 138 resident,
     // measured 0.933x. Above one wave the late blocks are the expensive ones
     // and LPT bites: b1 h8 s2048 d64 at 256 blocks measured 1.101x.
     //
     // The capacity comes from wmma_resident_blocks(); see the note there.
+    //
+    // Both gates below are about capacity, so they have to ask about the
+    // layout that will actually be launched -- direct_o is worth a block per
+    // SM at three head_dims, which is enough to change what either decides.
+    const bool direct_o = direct_o_flag();
     const int resident =
-        wmma_resident_blocks<scalar_t, compute_t, HEAD_DIM, MODE>();
+        wmma_resident_blocks<scalar_t, compute_t, HEAD_DIM, MODE>(direct_o);
     const int n_m = static_cast<int>(grid.x);
     const int blocks = n_m * H * B;
     const bool reverse_m = Cfg::REVERSE_CAUSAL && is_causal &&
@@ -1188,7 +1337,8 @@ void launch_wmma_kernel_as(const torch::Tensor& q, const torch::Tensor& k,
     const dim3 launch_grid(static_cast<unsigned>(n_m * splits), H, B);
 
     fused_attention_wmma_kernel<scalar_t, compute_t, HEAD_DIM, MODE>
-        <<<launch_grid, block, Cfg::SMEM, stream>>>(
+        <<<launch_grid, block,
+           direct_o ? Cfg::SMEM_TILE : Cfg::SMEM, stream>>>(
             reinterpret_cast<const scalar_t*>(q.const_data_ptr()),
             reinterpret_cast<const scalar_t*>(k.const_data_ptr()),
             reinterpret_cast<const scalar_t*>(v.const_data_ptr()),
@@ -1197,7 +1347,7 @@ void launch_wmma_kernel_as(const torch::Tensor& q, const torch::Tensor& k,
             reinterpret_cast<scalar_t*>(out.data_ptr()),
             part_o, part_m, part_l,
             B, H, S, is_causal, static_cast<float>(scale), out_bshd,
-            reverse_m, splits, mask_classify_flag());
+            reverse_m, splits, mask_classify_flag(), direct_o);
 
     if (splits > 1) {
         // The combine has to exponentiate in the domain the kernel stored its
@@ -1312,10 +1462,11 @@ std::vector<int64_t> wmma_grid_info_hd(int B, int H, int S) {
         return {0, 0, 0, 0};
     } else {
         int resident = 0;
+        const bool d = direct_o_flag();
         switch (softmax_mode_flag()) {
-            case 2:  resident = wmma_resident_blocks<float, __half, HEAD_DIM, 2>(); break;
-            case 1:  resident = wmma_resident_blocks<float, __half, HEAD_DIM, 1>(); break;
-            default: resident = wmma_resident_blocks<float, __half, HEAD_DIM, 0>(); break;
+            case 2:  resident = wmma_resident_blocks<float, __half, HEAD_DIM, 2>(d); break;
+            case 1:  resident = wmma_resident_blocks<float, __half, HEAD_DIM, 1>(d); break;
+            default: resident = wmma_resident_blocks<float, __half, HEAD_DIM, 0>(d); break;
         }
         const int64_t n_m = (S + Cfg::BLOCK_M - 1) / Cfg::BLOCK_M;
         return {n_m * H * B, resident, Cfg::BLOCK_M, Cfg::BLOCK_N};

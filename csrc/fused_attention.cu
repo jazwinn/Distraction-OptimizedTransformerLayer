@@ -228,6 +228,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("wmma_mask_classify_enabled",
           []() { return mask_classify_flag(); },
           "Whether per-tile mask classification is currently on");
+    m.def("wmma_set_direct_o",
+          [](bool on) { direct_o_flag() = on; },
+          "Have the wmma attention epilogue store O from the accumulator "
+          "fragments straight to global memory, which also shrinks the block's "
+          "shared O tile to one fragment per warp (true, the default), or "
+          "stage the whole block tile through shared memory the old way "
+          "(false). The flag picks the shared-memory layout and the launch "
+          "size as well as the code path, so an A/B of it covers both halves "
+          "of the change in one process.",
+          pybind11::arg("on"));
+    m.def("wmma_direct_o_enabled",
+          []() { return direct_o_flag(); },
+          "Whether the wmma epilogue is currently storing O direct to global");
     m.def("wmma_set_split_kv",
           [](bool on) { split_kv_flag() = on; },
           "Enable/disable the wmma kernel split-KV (Flash-Decoding) path. "

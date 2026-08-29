@@ -16,6 +16,7 @@ Each entry records where the variable is read, so the claim is checkable:
     WMMA_SOFTMAX_MODE       csrc/attention_wmma.cuh      softmax_mode_flag()
     WMMA_SPLIT_KV           csrc/attention_wmma.cuh      split_kv_flag()
     WMMA_MASK_CLASSIFY      csrc/attention_wmma.cuh      mask_classify_flag()
+    WMMA_DIRECT_O           csrc/attention_wmma.cuh      direct_o_flag()
     WMMA_SPLIT_COUNT        csrc/attention_wmma.cuh      split_count_override()
     WMMA_CAUSAL_REVERSE     csrc/attention_wmma.cuh      causal_reverse_flag()
     TILE_SPLIT_KV           csrc/tile_attention.cu       split_flag()
@@ -102,6 +103,19 @@ ENV_KNOBS: List[Dict[str, Any]] = [
                 "ones. Bit-identical either way, since it only skips tests "
                 "that would have passed. Worth 1.33x on the op and 1.05x end "
                 "to end.",
+    },
+    {
+        "name": "WMMA_DIRECT_O",
+        "label": "wmma O straight to global",
+        "kind": "bool",
+        "default": True,
+        "source": "csrc/attention_wmma.cuh",
+        "help": "Store O from the accumulator fragments straight to global "
+                "memory instead of staging the whole block tile through "
+                "shared. Also shrinks that tile to one fragment per warp, "
+                "which frees 8 KB at head_dim 64 and 128 and 16 KB at 256 and "
+                "buys a fourth resident block per SM at 64 and 128. Bit- "
+                "identical either way.",
     },
     {
         "name": "WMMA_SPLIT_KV",
