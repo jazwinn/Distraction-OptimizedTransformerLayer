@@ -420,6 +420,33 @@ int& softmax_mode_flag() {
 // Both paths have to exist regardless: that is what the optimization IS. The
 // flag only forces the slow one, so an A/B costs nothing that the shipped
 // kernel does not already carry. Same knob contract as causal_reverse_flag().
+// Whether the accumulator row mapping comes from a closed form instead of a
+// per-block probe.
+//
+// Keeping O in accumulator registers means applying the per-row softmax rescale
+// to fragment elements, which needs to know which row each element holds --
+// architecture-defined, and undocumented. The kernel discovered it by probing:
+// store a fragment tagged with (lane, slot), read back where each tag landed,
+// invert. Exact by construction on any device, and paid **once per block**, in
+// a store_matrix_sync, two __syncwarp barriers and sixteen shared accesses.
+//
+// Once per block is once too many: the mapping is a property of the
+// architecture and the fragment shape, not of the block. So it is computed
+// instead -- `(lane >> 2) + 8 * ((t >> 1) & 1)` -- and the probe now runs once
+// per process, on the host side, purely to confirm the formula reproduces it.
+// If it ever does not, acc_row_formula_ok() returns false and the kernel falls
+// back to probing per block, so a device this closed form does not describe
+// stays correct rather than silently wrong.
+//
+// Same knob contract as causal_reverse_flag().
+bool& acc_formula_flag() {
+    static bool on = [] {
+        const char* e = std::getenv("WMMA_ACC_FORMULA");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    return on;
+}
+
 // Whether the epilogue hands O straight to global memory.
 //
 // O leaves the key loop in accumulator registers, and the original epilogue
@@ -567,6 +594,70 @@ int wmma_split_count(int blocks, int resident, int n_kt, int head_dim) {
 // tile, which is what decides the block shape at head_dim 128.
 //
 // The output stays `scalar_t`: it feeds out_proj, which is a cuBLAS fp32 GEMM.
+// Which row of the 16x16 accumulator tile does element `t` of lane `lane` hold?
+//
+// The closed form the probe kept rediscovering. Elements come in pairs that
+// share a row, the pairs alternate between the tile's top and bottom halves,
+// and the lane's group of four picks the row inside a half. Verified against
+// the probe once per process by acc_row_formula_ok() below -- this is an
+// assertion about the hardware, not a definition of it.
+__device__ __host__ __forceinline__ int acc_row_of(int lane, int t) {
+    return (lane >> 2) + 8 * ((t >> 1) & 1);
+}
+
+// One warp, run once per process, to check that. Writes the probe's answer for
+// every (lane, slot) so the host can compare all 256 rather than a sample.
+template <int WK>
+__global__ void acc_row_probe_kernel(int* __restrict__ out) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    using acc_frag_t = wm::fragment<wm::accumulator, 16, 16, WK, float>;
+    __shared__ float probe_out[256];
+    __shared__ int tag_to_row[256];
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    acc_frag_t probe;
+    #pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        probe.x[t] = static_cast<float>(lane * 8 + t);
+    }
+    wm::store_matrix_sync(probe_out, probe, 16, wm::mem_row_major);
+    __syncwarp();
+    #pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        const int pos = lane * 8 + t;
+        tag_to_row[static_cast<int>(probe_out[pos])] = pos / 16;
+    }
+    __syncwarp();
+    #pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        out[lane * 8 + t] = tag_to_row[lane * 8 + t];
+    }
+#endif
+}
+
+// Does acc_row_of() describe this device's fragment layout? Asked once per
+// fragment K, cached. A false answer is not an error -- it sends the kernel
+// back to probing per block, which is what it did before and is always right.
+template <int WK>
+bool acc_row_formula_ok() {
+    static const bool ok = [] {
+        int* d = nullptr;
+        if (cudaMalloc(&d, 256 * sizeof(int)) != cudaSuccess) return false;
+        acc_row_probe_kernel<WK><<<1, 32>>>(d);
+        int host[256];
+        const cudaError_t copied =
+            cudaMemcpy(host, d, sizeof(host), cudaMemcpyDeviceToHost);
+        cudaFree(d);
+        if (copied != cudaSuccess) return false;
+        for (int lane = 0; lane < 32; ++lane) {
+            for (int t = 0; t < 8; ++t) {
+                if (host[lane * 8 + t] != acc_row_of(lane, t)) return false;
+            }
+        }
+        return true;
+    }();
+    return ok;
+}
+
 template <typename scalar_t, typename compute_t, int HEAD_DIM, int MODE>
 __global__ __launch_bounds__(WmmaCfg<compute_t, HEAD_DIM>::NTHREADS)
 void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
@@ -583,7 +674,8 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
                                  int B, int H, int S,
                                  bool is_causal, float scale,
                                  bool out_bshd, bool reverse_m, int splits,
-                                 bool classify, bool direct_o) {
+                                 bool classify, bool direct_o,
+                                 bool acc_formula) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using Cfg = WmmaCfg<compute_t, HEAD_DIM>;
     using frag_elem = typename FragTraits<compute_t>::elem;
@@ -746,7 +838,13 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
     static_assert(Cfg::SCRATCH_BYTES >= Cfg::PROBE_BYTES,
                   "shared scratch is too small to host the per-warp accumulator probe");
     int acc_row[ACC_ELEMS];
-    {
+    if (acc_formula) {
+        // The mapping is a property of the architecture, not of this block.
+        #pragma unroll
+        for (int t = 0; t < ACC_ELEMS; ++t) {
+            acc_row[t] = acc_row_of(lane, t);
+        }
+    } else {
         float* probe_base = reinterpret_cast<float*>(smem_raw + Cfg::O_OFF);
         float* probe_out = probe_base + warp * 512;
         int*   tag_to_row = reinterpret_cast<int*>(probe_base + warp * 512 + 256);
@@ -1347,7 +1445,8 @@ void launch_wmma_kernel_as(const torch::Tensor& q, const torch::Tensor& k,
             reinterpret_cast<scalar_t*>(out.data_ptr()),
             part_o, part_m, part_l,
             B, H, S, is_causal, static_cast<float>(scale), out_bshd,
-            reverse_m, splits, mask_classify_flag(), direct_o);
+            reverse_m, splits, mask_classify_flag(), direct_o,
+            acc_formula_flag() && acc_row_formula_ok<Cfg::WK>());
 
     if (splits > 1) {
         // The combine has to exponentiate in the domain the kernel stored its

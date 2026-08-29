@@ -238,6 +238,29 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("wmma_mask_classify_enabled",
           []() { return mask_classify_flag(); },
           "Whether per-tile mask classification is currently on");
+    m.def("wmma_set_acc_formula",
+          [](bool on) { acc_formula_flag() = on; },
+          "Get the accumulator row mapping from a closed form checked once per "
+          "process (true, the default), or re-probe it in shared memory once "
+          "per block the old way (false). Identical results either way; the "
+          "closed form is only used when the one-time check confirms it "
+          "reproduces the probe on this device.",
+          pybind11::arg("on"));
+    m.def("wmma_acc_formula_ok",
+          []() {
+              // Per fragment K: 16 is the fp16 path (16x16x16), 8 the tf32 one
+              // (16x16x8). False means the one-time probe disagreed with the
+              // closed form on this device, so the kernel keeps probing per
+              // block whatever the flag says -- which an A/B would otherwise
+              // read as "no gain" rather than "not enabled".
+              return std::vector<bool>{acc_row_formula_ok<16>(),
+                                       acc_row_formula_ok<8>()};
+          },
+          "Whether the closed-form accumulator map reproduced the probe, for "
+          "the fp16 and tf32 fragment shapes");
+    m.def("wmma_acc_formula_enabled",
+          []() { return acc_formula_flag(); },
+          "Whether the closed-form accumulator row mapping is currently on");
     m.def("wmma_set_direct_o",
           [](bool on) { direct_o_flag() = on; },
           "Have the wmma attention epilogue store O from the accumulator "

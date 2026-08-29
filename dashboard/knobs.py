@@ -17,6 +17,7 @@ Each entry records where the variable is read, so the claim is checkable:
     WMMA_SPLIT_KV           csrc/attention_wmma.cuh      split_kv_flag()
     WMMA_MASK_CLASSIFY      csrc/attention_wmma.cuh      mask_classify_flag()
     WMMA_DIRECT_O           csrc/attention_wmma.cuh      direct_o_flag()
+    WMMA_ACC_FORMULA        csrc/attention_wmma.cuh      acc_formula_flag()
     WMMA_SPLIT_COUNT        csrc/attention_wmma.cuh      split_count_override()
     WMMA_CAUSAL_REVERSE     csrc/attention_wmma.cuh      causal_reverse_flag()
     TILE_SPLIT_KV           csrc/tile_attention.cu       split_flag()
@@ -103,6 +104,18 @@ ENV_KNOBS: List[Dict[str, Any]] = [
                 "ones. Bit-identical either way, since it only skips tests "
                 "that would have passed. Worth 1.33x on the op and 1.05x end "
                 "to end.",
+    },
+    {
+        "name": "WMMA_ACC_FORMULA",
+        "label": "wmma accumulator map from a closed form",
+        "kind": "bool",
+        "default": True,
+        "source": "csrc/attention_wmma.cuh",
+        "help": "Compute which row each accumulator element holds, instead of "
+                "rediscovering it with a shared-memory probe once per block. "
+                "The probe still runs once per process to confirm the closed "
+                "form reproduces it, and the kernel falls back to probing per "
+                "block if it does not. Bit-identical either way.",
     },
     {
         "name": "WMMA_DIRECT_O",

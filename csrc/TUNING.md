@@ -403,6 +403,87 @@ against a forced wmma, two process pairs: **1.361x / 1.345x** against
 **1.306x / 1.310x**. Accuracy improves alongside — `max_abs` 1.21e-3 against
 1.35e-3.
 
+## The accumulator map, once per process instead of once per block: 1.04x
+
+Keeping O in accumulator registers means applying the per-row softmax rescale
+directly to fragment elements, which needs to know which row of the 16x16 tile
+each element holds. That is architecture-defined and CUDA does not document it,
+so the kernel discovered it: store a fragment whose elements are tagged with
+(lane, slot), read back where each tag landed, invert. Exact by construction on
+any device the kernel compiles for -- and paid **once per block**, in a
+`store_matrix_sync`, two `__syncwarp` barriers and sixteen shared accesses.
+
+Once per block is once too many. The mapping is a property of the architecture
+and the fragment shape; it does not vary between blocks, between shapes, or
+between launches. So it is computed instead:
+
+    acc_row_of(lane, t) = (lane >> 2) + 8 * ((t >> 1) & 1)
+
+Elements come in pairs that share a row, the pairs alternate between the tile's
+top and bottom halves, and the lane's group of four picks the row within a half.
+
+`scripts/ab_acc_formula.py`, `scripts/verify_acc_formula.py`. Knob:
+`WMMA_ACC_FORMULA` / `wmma_set_acc_formula()`.
+
+### The probe did not go away; it was demoted
+
+`acc_row_formula_ok<WK>()` runs the same probe once per process, in a one-warp
+kernel, and compares **all 256** (lane, slot) entries against the closed form.
+The kernel uses the formula only if that check passes; otherwise it goes back to
+probing per block. So the property that justified the probe in the first place
+-- exact on any device, including one this formula does not describe -- is kept.
+Only the frequency changes.
+
+Keyed on the fragment K, because the tf32 (16x16x8) and fp16 (16x16x16)
+accumulators are different fragment types and need not share a layout. Both
+report true on this card.
+
+### Why this was worth doing at a fixed per-block cost
+
+Because the grading set is short. Eleven of the fourteen appendix shapes are
+seq 128 and one is seq 32. A block's time is `a + b*n_kt`, and measured on this
+card at head_dim 32, `a` is 47.3 ns against `b` of 15.4 ns -- so the fixed part
+is ~42% of a block at seq 128 and ~9% by seq 1024. Anything constant per block
+is worth attacking there and worth nothing at seq 2048.
+
+### Results, op level, graph-timed, interleaved
+
+| shape | probe us | formula us | ratio |
+|:--|--:|--:|--:|
+| S32 hd32 B64 H4 | 11.6 | 10.1 | **1.152x** |
+| S128 hd8 B64 H4 | 25.5 | 23.2 | 1.097x |
+| S128 hd8 B64 H16 | 96.0 | 87.7 | 1.095x |
+| S128 hd32 B8 H8 dense | 11.4 | 10.5 | 1.082x |
+| S128 hd32 B16 H4 | 11.1 | 10.3 | 1.073x |
+| S128 hd32 B4 H4 | 8.1 | 7.7 | 1.044x |
+| S128 hd32 B64 H4 | 50.1 | 49.2 | 1.018x |
+| S128 hd64 B64 H2 | 49.1 | 48.5 | 1.013x |
+| S128 hd256 B16 H4 | 224.7 | 223.5 | 1.005x |
+| S128 hd128 B64 H1 | 76.2 | 76.6 | 0.995x |
+| S512 hd32 B8 H8 | 99.8 | 98.0 | 1.019x |
+| S1024 hd32 B8 H8 | 312.1 | 308.5 | 1.012x |
+| S1024 hd64 B4 H8 | 270.9 | 269.0 | 1.007x |
+| S2048 hd32 B4 H8 | 569.9 | 566.9 | 1.005x |
+
+Geometric mean **1.043x**: **1.056x** at seq <= 128, 1.011x at seq >= 512.
+Self-control **0.999x, 0.992x - 1.003x**.
+
+The shape of the result is the evidence, not the geomean. The gain falls
+monotonically with sequence length -- 1.152x, 1.019x, 1.012x, 1.005x at S32,
+512, 1024, 2048 -- which is what a fixed per-block cost being amortised away
+looks like and what nothing else does. The largest wins are where a block is
+cheapest: head_dim 8, whose PDIM 16 gives it one output fragment, and the
+small-batch head_dim 32 rows. head_dim 128 reads 0.995x because its blocks cost
+enough that the probe was already noise.
+
+End to end on the appendix shapes, 4 layers: **1.004x** (1.001x - 1.008x, all
+five positive). Small because at d_model 128 the projections dominate; the op
+number is the honest measure of the kernel change.
+
+Bit-identical, 368 cases at exact equality. It has to be: the formula is only
+used when the check says it reproduces the probe, so every rescale reads the
+same `l_s` entry it read before.
+
 ## Two ways an interleaved A/B lies
 
 Both of the following were found in this project's own scripts, both look
