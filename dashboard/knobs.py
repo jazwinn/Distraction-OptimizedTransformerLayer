@@ -13,6 +13,7 @@ to any file in csrc/.
 Each entry records where the variable is read, so the claim is checkable:
 
     WMMA_FP16               csrc/attention_wmma.cuh      wmma_fp16_flag()
+    WMMA_SOFTMAX_MODE       csrc/attention_wmma.cuh      softmax_mode_flag()
     WMMA_CAUSAL_REVERSE     csrc/attention_wmma.cuh      causal_reverse_flag()
     TILE_SPLIT_KV           csrc/tile_attention.cu       split_flag()
     LAYERNORM_FUSED_REDUCE  csrc/add_layernorm.cuh
@@ -72,6 +73,19 @@ ENV_KNOBS: List[Dict[str, Any]] = [
                 "10-bit mantissa, so the same accuracy, but faster tensor cores. "
                 "--attn-fp16 sets the same thing through config; prefer the flag "
                 "and leave this alone unless comparing the two paths.",
+    },
+    {
+        "name": "WMMA_SOFTMAX_MODE",
+        "label": "wmma softmax mode",
+        "kind": "int",
+        "default": 1,
+        "source": "csrc/attention_wmma.cuh",
+        "help": "0 = the original softmax (score * scale, then __expf, plus an "
+                "explicit -inf test). 1 = the base-2 domain: one fused score "
+                "multiply, a bare exp2f, and no -inf test, at identical "
+                "accuracy -- the default, worth 1.04x on the op. 2 also folds "
+                "scale*log2(e) into Q, which is a wash on speed and breaks the "
+                "2e-3 atol at head_dim 64; kept only so that can be re-checked.",
     },
     {
         "name": "LAYERNORM_FUSED_REDUCE",

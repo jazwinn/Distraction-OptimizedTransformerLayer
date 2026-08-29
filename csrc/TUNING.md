@@ -912,6 +912,168 @@ surface as CUDA 13.3's CCCL complaint about MSVC's traditional preprocessor,
 with the real error discarded by the `except Exception`. The fallback now
 re-raises the first failure.
 
+## The attention softmax in the base-2 domain: 1.040x on the op, 1.012x end to end
+
+`__expf(x)` is not one instruction. It is `ex2.approx(x * log2e)` -- an FMUL in
+front of every MUFU.EX2 -- so the original softmax paid two multiplies per score
+element: an explicit `s * scale` and that hidden one. FlashAttention-2 removes
+the second by working in base 2 throughout (`softmax.h` reads
+`exp2f(tensor(mi,ni) * scale - max_scaled)` with `M_LOG2E` premultiplied into
+`scale`). `scripts/ab_attention_exp2.py` measures the port, and the `-inf` test
+that goes with it: `ex2.approx.f32(-inf)` is *defined* to return `+0`, and
+`m_new` is finite in the branch that reaches the test, so the guard was
+computing something the exponential already gets right.
+
+### Why the softmax was worth attacking at all
+
+Static SASS on the key-tile loop body, `cuobjdump -sass build/fused_attention.cuda.o`,
+per thread per key tile, fp32 tensors contracted in fp16:
+
+| head_dim | loop body | of which HMMA |
+|---:|---:|---:|
+| 16 | 1070 | 8 |
+| 32 | 1089 | 16 |
+| 64 | 736 | 16 |
+
+**The tensor cores are 1.5% of the instruction stream.** On SM 8.6 an SM retires
+256 tensor MAC, 128 FP32 and 16 MUFU.EX2 per clock, so at head_dim 32 the two
+GEMMs are ~512 SM-clocks per block-key-tile against ~1500 of ALU and SFU. This
+kernel is not matmul-bound at the grading head_dims, which inverts the A100
+framing FA2 optimizes for (312 vs 19.5 TFLOPS, a 16x matmul advantage) and makes
+FA2's "minimize non-matmul FLOPs" advice apply *harder* here, not less.
+
+### Three modes, because the obvious version is not the safe one
+
+`softmax_mode_flag()`, `WMMA_SOFTMAX_MODE`, `wmma_set_softmax_mode()`. A
+template parameter on the kernel, not a runtime branch, so no mode carries
+another's code or registers.
+
+- **0** -- the original. `s * scale`, `__expf`, explicit `-inf` test.
+- **1** -- base-2. One `s * (scale * log2e)`, a bare `exp2f`, no `-inf` test.
+  **Q is untouched.**
+- **2** -- as 1, with `scale * log2e` also folded into Q at staging time, which
+  deletes the score-side multiply too: BLOCK_M*head_dim multiplies per block
+  instead of BLOCK_M*BLOCK_N per key tile.
+
+Mode 2 is the version the arithmetic argues for and it is **rejected on both
+counts**. It is the reason the knob is an int and not a bool.
+
+### Measured, op level, causal, graph-timed, interleaved in one process
+
+`python scripts/ab_attention_exp2.py`
+
+| shape | mode0 us | mode1 us | mode2 us | 1v0 | 2v0 | err0 | err1 | err2 |
+|:--|--:|--:|--:|--:|--:|--:|--:|--:|
+| B8 H4 S128 d8 | 10.5 | 9.7 | 9.9 | 1.080x | 1.059x | 1.12e-03 | 1.12e-03 | 1.17e-03 |
+| B8 H16 S128 d16 | 20.0 | 18.4 | 19.1 | 1.086x | 1.046x | 1.95e-03 | 1.95e-03 | 1.37e-03 |
+| B8 H8 S512 d16 | 87.8 | 78.7 | 82.8 | **1.115x** | 1.061x | 1.66e-03 | 1.66e-03 | 1.24e-03 |
+| B1 H8 S128 d32 | 9.3 | 8.9 | 9.3 | 1.044x | 1.002x | 9.75e-04 | 9.75e-04 | 9.75e-04 |
+| B16 H8 S128 d32 | 31.8 | 30.6 | 31.3 | 1.039x | 1.016x | 1.77e-03 | 1.77e-03 | 1.51e-03 |
+| B64 H8 S128 d32 | 103.5 | 100.4 | 100.9 | 1.031x | 1.026x | 1.77e-03 | 1.77e-03 | 1.73e-03 |
+| B8 H8 S1024 d32 | 408.1 | 380.6 | 397.9 | 1.072x | 1.026x | 1.07e-03 | 1.07e-03 | 1.60e-03 |
+| B8 H8 S128 d64 | 29.1 | 29.0 | 30.7 | 1.005x | 0.949x | 1.59e-03 | 1.59e-03 | **2.63e-03** |
+| B4 H8 S512 d64 | 132.8 | 131.9 | 142.1 | 1.006x | 0.934x | 1.29e-03 | 1.29e-03 | 1.71e-03 |
+| B1 H8 S2048 d64 | 428.9 | 423.3 | 458.7 | 1.013x | **0.935x** | 1.00e-03 | 1.00e-03 | 1.35e-03 |
+| B4 H8 S512 d128 | 476.0 | 477.6 | 475.2 | 0.997x | 1.002x | 1.14e-03 | 1.14e-03 | 1.45e-03 |
+| B2 H8 S1024 d128 | 843.0 | 847.9 | 834.8 | 0.994x | 1.010x | 1.14e-03 | 1.14e-03 | 1.15e-03 |
+
+Geometric mean: **mode 1 1.040x**, best 1.115x, worst 0.994x. **Mode 2 1.004x**,
+best 1.061x, worst 0.935x. Worst control this run +/-1.4%.
+
+The win lands exactly where the throughput table above says it should: 1.03x-1.12x
+at head_dim 8/16/32, a wash at 64, nothing at 128. The softmax is a first-order
+cost only while head_dim is small enough that the GEMMs are cheap.
+
+### Mode 2 fails accuracy, and mode 1 is free
+
+`err1 == err0` on all twelve shapes, to every digit printed. That is not a
+coincidence -- it is the point. Mode 1 changes only *where* fp32 constants are
+multiplied, so the fp16 narrowing sees exactly the same Q it always did.
+
+Mode 2 narrows `q * scale * log2e` instead of `q`, which puts both constants
+inside the 10-bit mantissa, and **B8 H8 S128 d64 goes 1.59e-03 -> 2.63e-03,
+over the harness's 2e-3 atol**. The error is not uniformly worse (d16 improves,
+1.95e-03 -> 1.37e-03) -- it is a different rounding draw with a worse tail, and
+the tail is what the grading gate reads. Rejected.
+
+Through the harness itself, `--accuracy-trials 5`, four shapes, mode 0 against
+mode 1: **every trial PASS with byte-identical max_abs** (0.00131567, 0.00116003,
+0.0011301, 0.00123608). `scripts/verify_kernel.py` reports "every kernel matches
+the reference on every case" under both. Fully-masked rows -- the branch the
+deleted guard sits beside -- emit exactly 0.0 and no NaN under both.
+
+### The noise floor, measured rather than inferred
+
+`python scripts/ab_attention_exp2.py --op-only --self-control` hands mode 1 to
+every column, so the "1v0" and "2v0" ratios compare identical code and their
+true value is exactly 1.000x. Run back to back with the real A/B, same session:
+
+| | self-control | real A/B |
+|:--|--:|--:|
+| geometric mean | **0.998x** | **1.038x** |
+| range | **0.991x - 1.003x** | 0.991x - 1.112x |
+
+So the floor is **+/-0.9%**, and against it:
+
+- head_dim 16/32 -- 1.037x, 1.041x, 1.042x, 1.064x, 1.112x. Four to eleven
+  points clear of the band. Unambiguous.
+- head_dim 64 -- 1.009x, 1.010x, 1.011x. Three shapes, tight, all just above
+  the 1.003x ceiling. A real ~1%, not the nothing an earlier reading called it.
+- head_dim 128 -- 0.991x, 0.992x, sitting on the bottom edge of the
+  self-control range. Indistinguishable from noise.
+
+Mode 2 reads 0.998x under self-control -- identical to mode 1, as it must when
+both slots run the same kernel -- against 0.937x-0.956x at head_dim 64 in the
+real run, so its regression is a property of the kernel and not of the harness.
+
+**So the honest summary of this change is "1.04x-1.11x at head_dim 16/32, ~1%
+at 64, nothing at 128", not the 1.040x geometric mean**, which averages real
+wins against near-zeros and flatters the shapes that gained nothing.
+
+Two traps this run reproduced:
+
+- **A control row under ~15 us is still meaningless.** The self-control's worst
+  reading was 2.5%, all of it on the ~10 us `B8 H4 S128 d8` row; every row over
+  15 us read <= 1.0%. Same rule `ab_wmma_split_kv.py` already encodes.
+- **Desktop GPU contention silently doubles everything.** The first
+  self-control attempt read 0.825x-1.067x with a 2.5% control and looked like
+  proof the whole result was noise. Absolute times were 2-2.5x the clean run
+  (`B8 H8 S1024 d32` 1032 us against 408) because Wallpaper Engine, Teams,
+  Spotify and a video player all hold GPU contexts on this machine. **Check the
+  absolute microseconds against a known-clean run before believing any ratio
+  table**; `nvidia-smi --query-compute-apps` names the culprits.
+### End to end, 6 layers, causal, ffn_dim == d_model
+
+Two model instances, mode set before each one's warmup: `self._graphs` is per
+instance, and flipping the flag after capture does nothing to a replay -- the
+same trap `tile_set_split_kv` documents.
+
+| shape | mode0 ms | mode1 ms | ratio | ctrl |
+|:--|--:|--:|--:|--:|
+| B8 S128 d32 h4 | 0.182 | 0.179 | 1.021x | 0.0% |
+| B8 S128 d256 h16 | 0.705 | 0.695 | 1.014x | 0.0% |
+| B1 S128 d256 h8 | 0.250 | 0.247 | 1.011x | 0.0% |
+| B16 S128 d256 h8 | 1.545 | 1.531 | 1.009x | 0.4% |
+| B64 S128 d256 h8 | 4.598 | 4.574 | 1.005x | 0.2% |
+| B8 S1024 d256 h8 | 6.402 | 6.223 | **1.029x** | 0.0% |
+| B8 S128 d512 h8 | 1.969 | 1.972 | 0.998x | 0.2% |
+
+Geometric mean **1.012x**. Amdahl check on the best row: attention is 42.0% of
+that forward and the op gained 1.072x, predicting 1.030x against 1.029x
+measured -- the chain is real, not a coincidence of noise.
+
+### The SASS predicted the wrong head_dim, which is why this was measured
+
+The instruction-count delta says mode 2 should win biggest at head_dim 64
+(736 -> 698, -5.2%) and barely at all at 16/32 (-1.0%, -0.6%, because the
+compiler hands the 49 removed FMUL back as 64 LOP3 and 16 P2R once BLOCK_N is
+32). The measurement is the exact inverse: head_dim 64 is where mode 2
+*regresses* 0.935x-0.949x, and 16/32 is where mode 1 wins 1.03x-1.12x.
+Registers are unchanged (REG:128 both at head_dim 64, LOCAL:0), so it is not
+occupancy. **Static instruction count did not predict the sign of the result at
+any head_dim here.** Treat it as a check that an edit landed, not as a
+prediction that it helped.
+
 ## fused_add_layernorm: two block reductions instead of three
 
 The block-per-row kernel reduced `sum(c)` and `sum(c*c)` separately, though both

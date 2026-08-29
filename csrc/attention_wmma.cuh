@@ -7,6 +7,13 @@
 //   2. online softmax on those 16 rows                          -> P in smem
 //   3. O = O * corr + P @ V  16xD  via wmma, straight into the O fragments
 //
+// Step 2 runs in the base-2 domain by default: `scale * log2(e)` goes into the
+// score's one multiply and the exponential is a bare exp2f, rather than
+// `s * scale` followed by __expf, which is itself `ex2.approx(x * log2e)` and
+// so hides a second multiply. Worth 1.04x on the op at identical accuracy --
+// the softmax is a first-order cost here, not a rounding error on the GEMMs.
+// See softmax_mode_flag() below and csrc/TUNING.md.
+//
 // Q and O both stay in registers for the whole key loop, so the only traffic
 // in the inner loop is the K/V tile, the score tile, and the fragment reads
 // that feed the MMA units.
@@ -90,6 +97,36 @@ __device__ __forceinline__ T dev_of_float(float s) {
     T d;
     dev_from_float(d, s);
     return d;
+}
+
+// log2(e). The softmax exponential is the one place the kernel touches the
+// SFU, and `__expf(x)` is not one instruction: it is `ex2.approx(x * log2e)`,
+// an FMUL in front of every MUFU.EX2. FlashAttention-2 removes that multiply by
+// working in the base-2 domain throughout -- the reference implementation's
+// softmax reads `exp2f(s * scale - max_scaled)` with M_LOG2E already folded
+// into `scale`.
+//
+// That is what MODE 1 does, and it is the default: one `s * (scale * log2e)`
+// where there used to be `s * scale` plus __expf's hidden one.
+//
+// Folding the constant one step further -- into Q at staging time, so the
+// score-side multiply goes too -- is MODE 2, and it was measured and rejected.
+// It is a wash on speed (1.004x) and it puts both constants inside the fp16
+// narrowing, which takes head_dim 64 from 1.59e-03 to 2.63e-03 against the
+// harness's 2e-3 atol. See csrc/TUNING.md, "The attention softmax in the
+// base-2 domain".
+static constexpr float kLog2e = 1.4426950408889634f;
+
+// Which exponential the softmax uses. exp2f is a bare MUFU.EX2; __expf is that
+// same instruction with an FMUL in front. The false branch is kept only so the
+// two can be A/B'd in one process.
+template <bool EXP2>
+__device__ __forceinline__ float attn_exp(float x) {
+    if constexpr (EXP2) {
+        return exp2f(x);
+    } else {
+        return __expf(x);
+    }
 }
 
 // Shared-memory plan. Q is staged into the same bytes that later hold the O
@@ -253,6 +290,31 @@ bool& causal_reverse_flag() {
     return on;
 }
 
+// Which softmax the attention kernel runs:
+//
+//   0  the original -- `s * scale`, then __expf, which is itself
+//      `ex2.approx(x * log2e)`, plus an explicit `s == -inf` test
+//   1  base-2 domain -- one `s * (scale * log2e)`, then a bare exp2f, and no
+//      -inf test, because ex2.approx(-inf) is defined to return +0. Q is
+//      untouched, so this is arithmetically as accurate as 0.
+//   2  as 1, and `scale * log2e` folded into Q at staging time, so the
+//      score-side multiply goes too. Cheapest, but it puts both constants
+//      inside the fp16 narrowing, which costs accuracy -- see csrc/TUNING.md.
+//
+// Same contract as causal_reverse_flag(): a benchmarking knob flipped between
+// timed runs from one thread, never while launches are in flight. It selects
+// among three kernel instantiations rather than branching inside one, so no
+// path pays for another's code or registers.
+int& softmax_mode_flag() {
+    static int mode = [] {
+        const char* e = std::getenv("WMMA_SOFTMAX_MODE");
+        if (e == nullptr) return 1;
+        int v = std::atoi(e);
+        return (v >= 0 && v <= 2) ? v : 1;
+    }();
+    return mode;
+}
+
 // `scalar_t` is what q/k/v/out are in GLOBAL memory; `compute_t` is what the
 // shared tiles hold and the fragments contract in. They were one type until
 // fp16 was measured against tf32: both carry a 10-bit mantissa, so an fp32
@@ -263,7 +325,7 @@ bool& causal_reverse_flag() {
 // tile, which is what decides the block shape at head_dim 128.
 //
 // The output stays `scalar_t`: it feeds out_proj, which is a cuBLAS fp32 GEMM.
-template <typename scalar_t, typename compute_t, int HEAD_DIM>
+template <typename scalar_t, typename compute_t, int HEAD_DIM, int MODE>
 __global__ __launch_bounds__(WmmaCfg<compute_t, HEAD_DIM>::NTHREADS)
 void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
                                  const scalar_t* __restrict__ k,
@@ -300,6 +362,18 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
     static_assert(RPW <= 32 && 32 % RPW == 0, "warp must split evenly over rows");
     static_assert(BLOCK_N % LANES_PER_ROW == 0, "key tile must split evenly over lanes");
     constexpr bool IS_TF32 = std::is_same<compute_t, float>::value;
+    // MODE 0 is the original. MODE 1 moves the softmax into the base-2
+    // domain, which deletes the FMUL hidden inside __expf and the -inf test
+    // that ex2.approx already handles, and touches nothing else. MODE 2 also
+    // folds `scale` into Q, which deletes the score-side multiply as well but
+    // puts both constants inside the fp16 narrowing -- the reason the two are
+    // separable knobs rather than one.
+    constexpr bool USE_EXP2 = (MODE >= 1);
+    constexpr bool FOLD_Q   = (MODE == 2);
+    // The score-side multiply. MODE 1 still pays it, once per score element,
+    // but folds log2(e) into the same FMUL so __expf's hidden one goes away.
+    // MODE 2 has already paid both into Q and leaves this dead.
+    const float s_mul = USE_EXP2 ? (scale * kLog2e) : scale;
 
     extern __shared__ __align__(16) char smem_raw[];
     float*    o_s = reinterpret_cast<float*>(smem_raw + Cfg::O_OFF);
@@ -346,15 +420,23 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
         // Walk the padded width so columns past DIM are explicitly zeroed:
         // they feed GEMM1's contraction, where a stale value would corrupt the
         // score rather than contribute nothing.
+        // Under EXP2 this is also where the softmax's two per-score-element
+        // multiplies get paid, once each, on BLOCK_M*head_dim elements instead
+        // of on BLOCK_M*BLOCK_N per key tile. Q is dead after the fragment
+        // hoist below, so nothing downstream sees the premultiplied copy.
+        const float q_pre = scale * kLog2e;
         for (int idx = tid; idx < BLOCK_M * PDIM; idx += Cfg::NTHREADS) {
             const int r = idx / PDIM;
             const int c = idx - r * PDIM;
             const int gr = m_tile * BLOCK_M + r;
-            q_s[r * KV_LD + c] =
+            // Still a predicated select rather than a branch -- see
+            // dev_of_float's comment; an if/else here cost 1.3x-2.1x once.
+            const float qv =
                 (gr < S && c < DIM)
-                    ? dev_of_float<compute_t>(dev_to_float(
-                          q[bh_off + static_cast<int64_t>(gr) * qs2 + c]))
-                    : zero_v;
+                    ? dev_to_float(q[bh_off + static_cast<int64_t>(gr) * qs2 + c])
+                    : 0.0f;
+            q_s[r * KV_LD + c] =
+                dev_of_float<compute_t>(FOLD_Q ? (qv * q_pre) : qv);
         }
         __syncthreads();
     }
@@ -511,7 +593,10 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
                           static_cast<int64_t>(gj) * ms3]) {
                     ok = false;
                 }
-                sv[t] = ok ? (s_row[col] * scale) : -INFINITY;
+                // EXP2 folded `scale * log2e` into Q, so the score already
+                // carries both and arrives in the base-2 domain.
+                sv[t] = ok ? (FOLD_Q ? s_row[col] : (s_row[col] * s_mul))
+                           : -INFINITY;
                 local_max = fmaxf(local_max, sv[t]);
             }
 
@@ -533,10 +618,21 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
                     dev_from_float(p_s[r * S_LD + c0 + t], 0.0f);
                 }
             } else {
-                corr = (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
+                corr = (m_old == -INFINITY) ? 0.0f : attn_exp<USE_EXP2>(m_old - m_new);
                 #pragma unroll
                 for (int t = 0; t < COLS_PER_LANE; ++t) {
-                    const float p = (sv[t] == -INFINITY) ? 0.0f : __expf(sv[t] - m_new);
+                    // m_new is finite in this branch, so a masked lane's
+                    // argument is exactly -inf -- and `ex2.approx.f32(-inf)` is
+                    // defined to return +0. The guard the original needed here
+                    // is the exponential's own behaviour, so EXP2 drops it: one
+                    // FSETP and one select per score element.
+                    float p;
+                    if constexpr (USE_EXP2) {
+                        p = attn_exp<true>(sv[t] - m_new);
+                    } else {
+                        p = (sv[t] == -INFINITY) ? 0.0f
+                                                 : attn_exp<false>(sv[t] - m_new);
+                    }
                     lsum += p;
                     dev_from_float(p_s[r * S_LD + c0 + t], p);
                 }
@@ -632,11 +728,11 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
 #endif
 }
 
-template <typename scalar_t, typename compute_t, int HEAD_DIM>
-void launch_wmma_kernel(const torch::Tensor& q, const torch::Tensor& k,
-                        const torch::Tensor& v, const bool* mask_ptr,
-                        const int64_t* ms, const int64_t* qs, torch::Tensor& out,
-                        int B, int H, int S, bool is_causal, double scale) {
+template <typename scalar_t, typename compute_t, int HEAD_DIM, int MODE>
+void launch_wmma_kernel_as(const torch::Tensor& q, const torch::Tensor& k,
+                           const torch::Tensor& v, const bool* mask_ptr,
+                           const int64_t* ms, const int64_t* qs, torch::Tensor& out,
+                           int B, int H, int S, bool is_causal, double scale) {
     using Cfg = WmmaCfg<compute_t, HEAD_DIM>;
     const dim3 block(Cfg::NTHREADS);
     const dim3 grid((S + Cfg::BLOCK_M - 1) / Cfg::BLOCK_M, H, B);
@@ -658,7 +754,8 @@ void launch_wmma_kernel(const torch::Tensor& q, const torch::Tensor& k,
     static const int resident = [] {
         int per_sm = 0;
         if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &per_sm, fused_attention_wmma_kernel<scalar_t, compute_t, HEAD_DIM>,
+                &per_sm,
+                fused_attention_wmma_kernel<scalar_t, compute_t, HEAD_DIM, MODE>,
                 Cfg::NTHREADS, Cfg::SMEM) != cudaSuccess) {
             return 0;   // unknown -> never reverse, i.e. keep today's mapping
         }
@@ -669,7 +766,7 @@ void launch_wmma_kernel(const torch::Tensor& q, const torch::Tensor& k,
     const bool reverse_m = Cfg::REVERSE_CAUSAL && is_causal &&
                            causal_reverse_flag() && blocks > resident;
 
-    fused_attention_wmma_kernel<scalar_t, compute_t, HEAD_DIM>
+    fused_attention_wmma_kernel<scalar_t, compute_t, HEAD_DIM, MODE>
         <<<grid, block, Cfg::SMEM, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const scalar_t*>(q.const_data_ptr()),
             reinterpret_cast<const scalar_t*>(k.const_data_ptr()),
@@ -679,6 +776,31 @@ void launch_wmma_kernel(const torch::Tensor& q, const torch::Tensor& k,
             reinterpret_cast<scalar_t*>(out.data_ptr()),
             B, H, S, is_causal, static_cast<float>(scale), out_bshd,
             reverse_m);
+}
+
+// Resolves the exp2 flag to one of the two instantiations. A runtime bool
+// inside the kernel would make every thread carry both paths' code and both
+// paths' registers; here the choice costs one host-side branch per launch and
+// the device code of each variant is exactly what that variant needs.
+template <typename scalar_t, typename compute_t, int HEAD_DIM>
+void launch_wmma_kernel(const torch::Tensor& q, const torch::Tensor& k,
+                        const torch::Tensor& v, const bool* mask_ptr,
+                        const int64_t* ms, const int64_t* qs, torch::Tensor& out,
+                        int B, int H, int S, bool is_causal, double scale) {
+    switch (softmax_mode_flag()) {
+        case 2:
+            launch_wmma_kernel_as<scalar_t, compute_t, HEAD_DIM, 2>(
+                q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
+            return;
+        case 1:
+            launch_wmma_kernel_as<scalar_t, compute_t, HEAD_DIM, 1>(
+                q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
+            return;
+        default:
+            launch_wmma_kernel_as<scalar_t, compute_t, HEAD_DIM, 0>(
+                q, k, v, mask_ptr, ms, qs, out, B, H, S, is_causal, scale);
+            return;
+    }
 }
 
 // Returns false when this (dtype, head_dim) pair has no tensor-core

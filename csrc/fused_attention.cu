@@ -200,6 +200,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("wmma_fp16",
           []() { return wmma_fp16_flag(); },
           "Whether fp32 tensors are currently contracted in fp16 fragments");
+    m.def("wmma_set_softmax_mode",
+          [](int mode) {
+              TORCH_CHECK(mode >= 0 && mode <= 2,
+                          "wmma_set_softmax_mode: mode must be 0, 1 or 2");
+              softmax_mode_flag() = mode;
+          },
+          "Which softmax the wmma attention kernel runs. 0 = the original "
+          "(score * scale, then __expf, plus an explicit -inf test). 1 = the "
+          "base-2 domain: one fused score multiply, a bare exp2f, and no -inf "
+          "test, at identical accuracy (the default). 2 = as 1 with "
+          "scale*log2(e) also folded into Q, which drops the score-side "
+          "multiply but narrows both constants to fp16. Selects among three "
+          "kernel instantiations; runtime-settable so all three can be timed "
+          "in one process.",
+          pybind11::arg("mode"));
+    m.def("wmma_softmax_mode",
+          []() { return softmax_mode_flag(); },
+          "Which softmax mode the wmma attention kernel is currently using");
     m.def("wmma_set_causal_reverse",
           [](bool enabled) { causal_reverse_flag() = enabled; },
           "Enable/disable the wmma kernel's causal block-index reversal "
