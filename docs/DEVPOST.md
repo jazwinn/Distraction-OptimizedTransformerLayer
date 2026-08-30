@@ -145,7 +145,7 @@ No web or third-party service APIs. The APIs in question are compute interfaces:
 | **PyTorch 2.12.0+cu132** | Tensors, the baseline implementation, and the benchmark harness |
 | **cuBLAS** (via PyTorch) | The projection and feed-forward matrix multiplications |
 | **PyTorch's cpp_extension** | Just-in-time compilation of the CUDA extension |
-| **Python standard library** | Everything else, including the whole dashboard — http.server for serving, subprocess and runpy for launching runs, threading and queue for the one-run-at-a-time job queue, json/csv/ast/re for parsing harness and profiler output, ctypes for preloading a DLL. No NumPy |
+| **Python standard library** | Everything else, including the whole dashboard — its web server, its job queue and all of its parsing are standard-library modules. No NumPy, no web framework |
 | **Hand-written HTML, CSS and JavaScript** | The dashboard's front end is one HTML file, one stylesheet and one script, with no framework, no build step and no CDN — nothing is fetched from a third party at page load |
 | **CUDA-Agent** *(ByteDance / Tsinghua)* | A published CUDA kernel development agent. Not usable as shipped — it targets a different sandbox and newer hardware — but its optimization ordering and verification checklists were adapted into a project-specific procedure |
 

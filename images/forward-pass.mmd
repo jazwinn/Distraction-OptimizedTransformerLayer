@@ -7,7 +7,7 @@ flowchart TD
     replay ==>|"one instruction"| qkv["combined Q/K/V multiply"]
     eager ==>|"per kernel"| qkv
     qkv --> attn["custom attention kernel"] --> outp["output multiply"] --> gate{"model width"}
-    gate -->|"64 or less"| fused["whole rest of the block,<br/>one kernel"]
+    gate -->|"64 or less"| fused["one fused kernel"]
     gate -->|"wider"| chain["four separate kernels"]
     fused --> out(["layer output"])
     chain --> out
