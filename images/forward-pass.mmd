@@ -1,14 +1,14 @@
-flowchart LR
-    entry(["forward"]) --> probe["check mask"]
-    probe --> cache{"shape seen<br/>before?"}
-    cache -->|"yes"| replay["replay recording"]
-    cache -->|"no"| eager["issue kernels"]
+flowchart TD
+    entry(["forward"]) --> probe["check the mask once"]
+    probe --> cache{"seen this shape<br/>before?"}
+    cache -->|"yes"| replay["replay the recording"]
+    cache -->|"no"| eager["issue kernels one by one"]
 
-    replay ==>|"one instruction"| qkv["Q/K/V multiply"]
+    replay ==>|"one instruction"| qkv["combined Q/K/V multiply"]
     eager ==>|"per kernel"| qkv
-    qkv --> attn["custom attention<br/>kernel"] --> outp["output multiply"] --> gate{"model<br/>width"}
-    gate -->|"64 or less"| fused["rest of block,<br/>one kernel"]
-    gate -->|"wider"| chain["four separate<br/>kernels"]
+    qkv --> attn["custom attention kernel"] --> outp["output multiply"] --> gate{"model width"}
+    gate -->|"64 or less"| fused["whole rest of the block,<br/>one kernel"]
+    gate -->|"wider"| chain["four separate kernels"]
     fused --> out(["layer output"])
     chain --> out
     out -.->|"next layer"| qkv

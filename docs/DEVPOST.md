@@ -113,8 +113,8 @@ number written down beside the run that produced it.
 | Tool | How it was used |
 | --- | --- |
 | **Claude Code (Claude Opus)** | Primary development environment for writing, debugging and documenting the kernels |
-| **NVIDIA CUDA Toolkit 13.3** | `nvcc` compiler, plus `cuobjdump` for inspecting the compiled GPU instructions |
-| **Microsoft Visual C++ (MSVC 14.44)** | Host compiler, located automatically via `vswhere` and `vcvarsall.bat` |
+| **NVIDIA CUDA Toolkit 13.3** | nvcc compiler, plus cuobjdump for inspecting the compiled GPU instructions |
+| **Microsoft Visual C++ (MSVC 14.44)** | Host compiler, located automatically via vswhere and vcvarsall.bat |
 | **ninja** | Build system, driven automatically by PyTorch's extension loader |
 | **NVIDIA Nsight Systems** | Timeline profiling — what share of each pass the GPU spends actually running kernels |
 | **NVIDIA Nsight Compute** | Per-kernel counters — whether a kernel is limited by arithmetic, memory bandwidth, or neither |
@@ -128,13 +128,13 @@ No web or third-party service APIs. The APIs in question are compute interfaces:
 | Interface | What it provides |
 | --- | --- |
 | **CUDA C++ / CUDA Runtime API** | The kernels themselves |
-| **`nvcuda::wmma`** | Fragment-level interface to the GPU's matrix-multiply hardware |
+| **nvcuda::wmma** | Fragment-level interface to the GPU's matrix-multiply hardware |
 | **CUDA tile programming model** | NVIDIA's newer block-level interface, used to build a third implementation as a comparison |
 | **CUDA Graphs** | Recording and replaying a kernel sequence to remove launch overhead |
 | **PyTorch C++ extension API** | Compiles the CUDA sources and exposes them to Python |
-| **Python `http.server`** | The dashboard's web server — `ThreadingHTTPServer` from the standard library, serving its own JSON endpoints. No web framework |
-| **Browser `fetch` and `localStorage`** | The dashboard's front end talks to that server with `fetch` and remembers the chosen settings in `localStorage`. No other browser API is used |
-| **Nsight command-line interfaces** | The dashboard drives profiling by invoking `ncu` and `nsys` directly and parsing their CSV output |
+| **Python http.server** | The dashboard's web server — ThreadingHTTPServer from the standard library, serving its own JSON endpoints. No web framework |
+| **Browser fetch and localStorage** | The dashboard's front end talks to that server with fetch and remembers the chosen settings in localStorage. No other browser API is used |
+| **Nsight command-line interfaces** | The dashboard drives profiling by invoking ncu and nsys directly and parsing their CSV output |
 | **Anthropic Claude (Opus)** | AI assistance — kernel development, measurement, documentation |
 | **Google Gemini Flash** | AI assistance — supporting questions and concept checks |
 
@@ -144,8 +144,8 @@ No web or third-party service APIs. The APIs in question are compute interfaces:
 | --- | --- |
 | **PyTorch 2.12.0+cu132** | Tensors, the baseline implementation, and the benchmark harness |
 | **cuBLAS** (via PyTorch) | The projection and feed-forward matrix multiplications |
-| **PyTorch's `cpp_extension`** | Just-in-time compilation of the CUDA extension |
-| **Python standard library** | Everything else, including the whole dashboard — `http.server` for serving, `subprocess` and `runpy` for launching runs, `threading` and `queue` for the one-run-at-a-time job queue, `json`/`csv`/`ast`/`re` for parsing harness and profiler output, `ctypes` for preloading a DLL. No NumPy |
+| **PyTorch's cpp_extension** | Just-in-time compilation of the CUDA extension |
+| **Python standard library** | Everything else, including the whole dashboard — http.server for serving, subprocess and runpy for launching runs, threading and queue for the one-run-at-a-time job queue, json/csv/ast/re for parsing harness and profiler output, ctypes for preloading a DLL. No NumPy |
 | **Hand-written HTML, CSS and JavaScript** | The dashboard's front end is one HTML file, one stylesheet and one script, with no framework, no build step and no CDN — nothing is fetched from a third party at page load |
 | **CUDA-Agent** *(ByteDance / Tsinghua)* | A published CUDA kernel development agent. Not usable as shipped — it targets a different sandbox and newer hardware — but its optimization ordering and verification checklists were adapted into a project-specific procedure |
 
