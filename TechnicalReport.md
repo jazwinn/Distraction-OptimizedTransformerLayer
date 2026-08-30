@@ -21,12 +21,13 @@
     - [3.3 The cost of longer sequences](#33-the-cost-of-longer-sequences)
     - [3.4 The problems](#34-the-problems)
     - [3.5 Goals for the project](#35-goals-for-the-project)
-- **[4. Approach and Implementation](#4-approach-and-implementation)**
-    - [4.1 Why C++/CUDA](#41-why-ccuda)
-    - [4.2 First attempt: one thread per row](#42-first-attempt-one-thread-per-row)
-    - [4.3 Moving to the tensor cores](#43-moving-to-the-tensor-cores)
-    - [4.4 Tile programming](#44-tile-programming)
-    - [4.5 Choosing between them](#45-choosing-between-them)
+- **[4. The Attention Implementation](#4-the-attention-implementation)**
+    - [4.1 The attention algorithm](#41-the-attention-algorithm)
+    - [4.2 Why C++/CUDA](#42-why-ccuda)
+    - [4.3 First attempt: one thread per row](#43-first-attempt-one-thread-per-row)
+    - [4.4 Moving to the tensor cores](#44-moving-to-the-tensor-cores)
+    - [4.5 Tile programming](#45-tile-programming)
+    - [4.6 All four, measured side by side](#46-all-four-measured-side-by-side)
 - **[5. The Optimizations Implemented](#5-the-optimizations-implemented)**
     - [5.1 Kernel-level optimizations](#51-kernel-level-optimizations)
     - [5.2 Execution-level optimizations](#52-execution-level-optimizations)
@@ -132,10 +133,10 @@ the input.
 
 ### 1.3 The goal, and the catch
 
-**The goal:** take a reference implementation of a Transformer layer and make it run faster using
+**The goal:** take a baseline implementation of a Transformer layer and make it run faster using
 custom GPU code.
 
-**The catch:** an automatic grader compares the fast version's output against the reference
+**The catch:** an automatic grader compares the fast version's output against the baseline
 version's output, number by number, and rejects it if the results drift too far apart.
 
 > **Make it faster without meaningfully changing the answers.**
@@ -153,8 +154,8 @@ the difference is small in absolute terms      OR      the difference is small r
 
 Every number must satisfy at least one of the two.
 
-**Being more accurate than the reference does not help.** The grader does not compare against a
-perfect answer. It compares against the reference implementation's own slightly-imperfect answer,
+**Being more accurate than the baseline does not help.** The grader does not compare against a
+perfect answer. It compares against the baseline implementation's own slightly-imperfect answer,
 so what is rewarded is closeness to *that*, not correctness in the abstract.
 
 ### 1.4 The approach, in brief
@@ -219,7 +220,7 @@ Number formats used, and where:
 
 | | |
 | --- | --- |
-| Machine-learning framework | **PyTorch 2.12** — tensors, the reference implementation, and the benchmark harness |
+| Machine-learning framework | **PyTorch 2.12** — tensors, the baseline implementation, and the benchmark harness |
 | Bridge to custom code | PyTorch's `cpp_extension`, which compiles the CUDA code and makes it callable from Python |
 | Matrix-multiply library | cuBLAS, via PyTorch |
 | Python | 3.10 |
@@ -228,7 +229,7 @@ Number formats used, and where:
 
 | | |
 | --- | --- |
-| Correctness checks | Scripts running every kernel against the reference and comparing results number by number |
+| Correctness checks | Scripts running every kernel against the baseline and comparing results number by number |
 | Speed measurements | Scripts timing versions alternately within one session, with a control comparison to measure background variation |
 | Profiling | NVIDIA Nsight |
 | Inspecting compiled output | `cuobjdump`, an NVIDIA tool showing what the GPU compiler produced |
@@ -517,9 +518,58 @@ per-kernel overhead that sets the floor at small sizes.
 
 ---
 
-## 4. Approach and Implementation
+## 4. The Attention Implementation
 
-### 4.1 Why C++/CUDA
+This section is about attention specifically: what the kernels compute, and how three different
+implementations of it were built and compared. Section 5 catalogues every optimization across the
+whole model, attention included, and what each one was worth.
+
+**The bar is PyTorch's own fused attention.** A custom kernel is only worth writing if it beats
+what the framework already provides. Beating the baseline is not the achievement — it materialises
+the whole score grid and is slow for reasons section 3 measured. Beating
+`scaled_dot_product_attention`, PyTorch's own fused version, is. Every implementation here is
+measured against it, not just against the others.
+
+### 4.1 The attention algorithm
+
+Goal A was to keep the score grid on the chip. Before that is an engineering problem, it is a
+mathematical one.
+
+**Softmax normally needs a whole row before it can produce anything.** For one word, its scores
+against every other word form a row, and softmax turns that row into weights adding up to 100%:
+
+```
+weight of score s  =  exp(s) / (sum of exp over every score in the row)
+```
+
+The divisor is a total over the entire row, so no weight can be finished until the last score
+arrives. That is what forces the grid into memory: if a whole row must be held before any of it can
+be used, it has to be stored, and at long sequences it does not fit on the chip.
+
+**The way round it is to keep a running total and correct it.** The row is processed a piece at a
+time, carrying the largest score seen so far and the running total measured against it. When a new
+piece contains a larger score, everything so far is on the wrong scale — so it is rescaled by one
+correction factor and the new piece added on. The partial output is rescaled by the same factor.
+
+Scores `1, 2, 5`, processed as `1, 2` then `5`:
+
+| Step | Largest so far | Running total |
+| --- | :---: | --- |
+| After the first piece | 2 | `exp(1-2) + exp(2-2)` = 1.3679 |
+| Second piece raises it to 5 | 5 | `1.3679 x exp(2-5)` = 0.0681, then `+ exp(5-5)` = **1.0681** |
+
+In one pass: `exp(1-5) + exp(2-5) + exp(5-5)` = **1.0681**. The same number.
+
+**The correction is exact, not an approximation** — a multiplication by a ratio of exponentials,
+ordinary algebra. That matters because the accuracy rule in section 1.3 leaves no room to trade
+correctness for memory.
+
+So a piece of the grid can be built, used and discarded before the next one is built, and the grid
+never exists in full. That is goal A, and the idea the FlashAttention papers introduced. All three
+implementations compute this same algorithm; they differ only in how the work is divided across the
+chip.
+
+### 4.2 Why C++/CUDA
 
 CUDA C++ is NVIDIA's own language for writing GPU programs: ordinary C++ with extensions for
 describing what runs on the card. Writing the kernels in it, rather than in a higher-level tool
@@ -553,7 +603,7 @@ change has to be checked against an accuracy limit.
 
 ---
 
-### 4.2 First attempt: one thread per row
+### 4.3 First attempt: one thread per row
 
 Graphics cards run the same short program across thousands of threads at once, each on different
 data. This is called **SIMT** — single instruction, multiple threads. The obvious mapping for
@@ -573,11 +623,11 @@ dimensions per head, against a hardware ceiling of 255. The fix was to split eac
 threads, with one direct thread-to-thread exchange per Key to combine their halves.
 
 The kernel is still in the project: it covers cards too old for the tensor-core path, and acts as a
-reference to check the faster kernel against.
+correctness check on the faster kernel.
 
 ---
 
-### 4.3 Moving to the tensor cores
+### 4.4 Moving to the tensor cores
 
 The matrix-multiply units only accept fixed-size blocks — 16 rows by 16 columns — so reaching them
 means restructuring the kernel around tiles rather than rows. The interface is called **wmma**, and
@@ -613,7 +663,7 @@ a whole row instead leaves one exchange. This was the largest single improvement
 
 ---
 
-### 4.4 Tile programming
+### 4.5 Tile programming
 
 NVIDIA now offers a higher-level style where work is described **per block rather than per
 thread**. A tile is a fixed-size array the whole block owns, one call multiplies two of them, and
@@ -657,42 +707,61 @@ so the other two kernels are unaffected.
 
 ---
 
-### 4.5 Choosing between them
+### 4.6 All four, measured side by side
 
-Two complete implementations of the same maths now existed: the hand-written one, which manages
-threads explicitly and calls the matrix-multiply hardware directly, and the tile one, which
-describes the work per block and leaves those details to the compiler. Only one could be the
+The section opened by saying the bar is PyTorch's own fused attention. This is that measurement:
+all three implementations and PyTorch's, on the attention step alone, timed alternately in one run.
+
+Milliseconds on the left, speedup over PyTorch on the right. Higher is better in the ratio columns;
+below 1.00× means PyTorch wins.
+
+| Case | SDPA | scalar | wmma | tile | scalar × | wmma × | tile × | control |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tiny | 0.028 | 0.015 | 0.017 | 0.018 | 1.89× | 1.70× | 1.53× | 0.986× |
+| tiny causal | 0.026 | 0.016 | 0.014 | 0.016 | 1.68× | 1.85× | 1.66× | *1.185×* |
+| tiny padded | 0.072 | 0.018 | 0.019 | 0.019 | 4.01× | 3.79× | 3.76× | *0.891×* |
+| tiny causal+pad | 0.072 | 0.018 | 0.019 | 0.019 | 3.98× | 3.81× | 3.77× | 1.011× |
+| default | 0.086 | 0.145 | 0.031 | 0.073 | 0.59× | **2.76×** | 1.17× | 0.987× |
+| default causal | 0.074 | 0.143 | 0.030 | 0.063 | 0.52× | **2.48×** | 1.18× | 1.027× |
+| default padded | 0.107 | 0.150 | 0.039 | 0.097 | 0.72× | **2.73×** | 1.11× | 0.979× |
+| default caus+pad | 0.107 | 0.147 | 0.038 | 0.096 | 0.73× | **2.79×** | 1.12× | 0.985× |
+| long seq | 1.611 | 2.766 | 0.461 | 0.865 | 0.58× | **3.49×** | 1.86× | 0.999× |
+| long seq causal | 0.988 | 2.153 | 0.297 | 0.494 | 0.46× | **3.32×** | 2.00× | 0.988× |
+| odd shape | 0.105 | 0.023 | 0.018 | 0.020 | 4.56× | **5.75×** | 5.21× | 0.980× |
+| wide head_dim | 0.032 | 0.060 | 0.023 | 0.026 | 0.54× | 1.38× | 1.21× | 1.000× |
+| wide caus+pad | 0.076 | 0.036 | 0.040 | 0.081 | 2.13× | 1.91× | 0.94× | 0.994× |
+| head_dim 256 | 0.035 | 0.179 | 0.034 | 0.132 | 0.19× | *1.03×* | 0.26× | *1.104×* |
+| head_dim 256 causal | 0.077 | 0.162 | 0.068 | 0.458 | 0.47× | 1.12× | 0.17× | *1.057×* |
+
+Run it with:
+
+```bash
+cmd.exe /c scripts\devenv.bat python scripts\bench_attention_vs_sdpa.py
+```
+
+**The tensor-core kernel wins every row.** It beats PyTorch's fused attention everywhere, by 1.7×
+to 5.8×, and beats both of the other implementations everywhere too. That settles which one is the
 default.
 
-The comparison is made against the tile kernel's *best* mode, fp16, since that is the fairest
-version of the question. Times are for the attention step alone, in milliseconds:
+**The simple kernel is not a serious competitor, and the pattern says why.** It beats PyTorch on
+small and awkward shapes — 4.0× on the tiny padded case, 4.6× on the odd shape — and loses badly on
+everything substantial, down to 0.46× on long causal sequences. It wins where the work is too small
+for anyone's tensor cores to matter and launch overhead decides, and loses as soon as real
+arithmetic does.
 
-| Case | Hand-written | Tile | Hand-written ahead by |
-| --- | ---: | ---: | ---: |
-| default | 0.035 | 0.071 | **2.03×** |
-| default, masked | 0.035 | 0.061 | **1.74×** |
-| long sequence | 0.607 | 0.871 | **1.43×** |
-| long sequence, masked | 0.422 | 0.494 | **1.17×** |
+**The tile kernel is consistently second.** It beats PyTorch on all but one row, but never beats
+the hand-written kernel — closest on long sequences (2.00× against 3.32×), furthest apart at
+head_dim 256, where it collapses to 0.17×.
 
-And across the whole model, as a speedup over the baseline:
+**One row does not support a claim.** At head_dim 256 the tensor-core kernel reads 1.03× against a
+control of 1.104×, meaning the run-to-run variation on that case is larger than the difference
+being measured. The honest reading is that it *ties* with PyTorch there, not that it wins. The
+causal version at 1.12× against a 1.057× control barely clears. Two other rows are marked for the
+same reason: `tiny causal` and `tiny padded` have controls of 1.185× and 0.891×, though their
+effects are large enough to survive it.
 
-| Shape | Hand-written | Tile (fp16) | Tile (TF32) |
-| --- | ---: | ---: | ---: |
-| 8 × 1024 words | **10.75×** | 9.66× | 7.91× |
-| 16 × 128 words | **3.45×** | 3.19× | 3.00× |
-
-**The hand-written kernel wins, so SIMT plus the tensor cores is the default.** The two
-implementations produce the same accuracy at these settings, so the decision rests on speed alone.
-
-**One case still goes the other way.** At 128 dimensions per head with long sequences, the tile
-kernel is faster — the crossover sits at about 512 words, below which the hand-written kernel wins
-and above which the tile kernel pulls ahead by up to 1.26×. It needs a long run of Keys before its
-scheduling pays for itself. The graded test shapes use 128-word sequences, which is the wrong side
-of that crossover, so this does not change the default.
-
-**What the tile kernel is kept for.** Its full-precision mode is the most accurate implementation
-in the project and serves as the reference that the faster kernels are checked against. It also
-answers the portability question with a measurement rather than an assumption.
+That head_dim 256 tie is the one place PyTorch is not beaten, and it is the same shape that gives
+the weakest end-to-end result in section 8 — shape 8, at 1.41×.
 
 ---
 
@@ -965,7 +1034,7 @@ each kernel offers whichever formats it has arithmetic for:
 | Tile | yes | yes | yes | yes |
 
 The tensor-core kernel has no full-precision mode because no tensor core performs a full-precision
-multiply. The simple kernel has only full precision, which is what makes it useful as a reference.
+multiply. The simple kernel has only full precision, which is what makes it useful for checking the others.
 The choice only arises for full-precision input — data already supplied in a 16-bit format is
 computed in that format, since narrowing further is pointless and widening cannot recover what was
 lost.
