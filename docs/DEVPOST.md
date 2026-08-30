@@ -34,7 +34,7 @@ Twenty optimizations in all address what the profiling exposed:
 
 | Optimization | What it does |
 | --- | --- |
-| **A custom attention kernel** | Attention runs on a kernel written for this project rather than PyTorch's own fused attention, `scaled_dot_product_attention`. Timed against it on the attention step alone, it wins **every** case measured, by **1.7× to 5.8×** — the score grid never leaves the chip, both matrix multiplications run on the card's dedicated matrix-multiply hardware in fp16 (same precision as the alternative, roughly twice the speed), and the tile shape is swept per head size rather than fixed once |
+| **A custom attention kernel** | Attention runs on a kernel written for this project rather than PyTorch's own fused attention, SDPA. Timed against it on the attention step alone, it wins **every** case measured, by **1.7× to 5.8×** — the score grid never leaves the chip, both matrix multiplications run on the card's dedicated matrix-multiply hardware in fp16 (same precision as the alternative, roughly twice the speed), and the tile shape is swept per head size rather than fixed once |
 | **Kernel fusion** | Neighbouring steps become single kernels, so intermediate results stay on chip. Below a model width of 64, the entire post-attention chain — normalise, expand, activate, shrink, normalise — is one kernel |
 | **Skipping discarded work** | Under causal masking over half the score grid would be computed and thrown away; those regions are never computed |
 | **One combined projection** | Query, Key and Value become a single wide multiplication instead of three narrow ones too small to fill the card |
@@ -144,7 +144,7 @@ No web or third-party service APIs. The APIs in question are compute interfaces:
 | --- | --- |
 | **PyTorch 2.12.0+cu132** | Tensors, the baseline implementation, and the benchmark harness |
 | **cuBLAS** (via PyTorch) | The projection and feed-forward matrix multiplications |
-| **`torch.utils.cpp_extension`** | Just-in-time compilation of the CUDA extension |
+| **PyTorch's `cpp_extension`** | Just-in-time compilation of the CUDA extension |
 | **Python standard library** | Everything else, including the whole dashboard — `http.server` for serving, `subprocess` and `runpy` for launching runs, `threading` and `queue` for the one-run-at-a-time job queue, `json`/`csv`/`ast`/`re` for parsing harness and profiler output, `ctypes` for preloading a DLL. No NumPy |
 | **Hand-written HTML, CSS and JavaScript** | The dashboard's front end is one HTML file, one stylesheet and one script, with no framework, no build step and no CDN — nothing is fetched from a third party at page load |
 | **CUDA-Agent** *(ByteDance / Tsinghua)* | A published CUDA kernel development agent. Not usable as shipped — it targets a different sandbox and newer hardware — but its optimization ordering and verification checklists were adapted into a project-specific procedure |
