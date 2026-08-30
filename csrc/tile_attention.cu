@@ -1137,7 +1137,7 @@ bool split_kv_enabled() { return false; }
 size_t workspace_bytes(int, int, int, int, bool, MathMode) { return 0; }
 
 bool launch(const float*, const float*, const float*,
-            const bool*, const long long*,
+            const bool*, const long long*, const long long*,
             float*, void*, size_t, int, int, int, int, bool, float,
             MathMode, cudaStream_t) {
     return false;
