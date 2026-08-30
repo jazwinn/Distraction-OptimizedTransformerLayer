@@ -230,7 +230,123 @@ FP16 is the default precision for FP32 inputs because TF32 and FP16 share an ide
 
 ---
 
-## 4. Inside WMMA: Split-KV (Flash-Decoding)
+## 4. Inside WMMA
+
+Sections 1-3 stop at the launch. These two go past it: 4.1 is the kernel body itself, 4.2 the host-side gate that decides how many blocks run it.
+
+### 4.1 Kernel Body
+
+One block owns `BLOCK_M` query rows split into 16-row warp stripes, and walks the key range in `BLOCK_N` tiles. Both extents come from `WmmaShape<HEAD_DIM>` in [`csrc/attention_wmma.cuh`](csrc/attention_wmma.cuh) and are **not** fixed at 64/32 — head_dim 128 and 256 run a 32x16 block.
+
+Colour marks where the data lives: green is registers, amber shared memory, blue global. The loop is amber except step 3, which is the whole design — Q and the O accumulator stay in registers across every key tile, so the only inner-loop traffic is the K/V tile, the score tile, and the fragment reads feeding the MMA units.
+
+```mermaid
+flowchart TD
+    entry(["one block: BLOCK_M query rows, WARPS warps of 16 rows each"])
+
+    subgraph prologue ["Prologue — once per block"]
+        direction TB
+        pq["stage Q tile to shared<br/>columns past head_dim zeroed<br/><i>MODE 2: fold scale·log2e into Q here</i>"]
+        pf["load Q into matrix_a fragments<br/><b>q_frag stays in registers for the whole loop</b>"]
+        pp["resolve accumulator row map<br/>acc_row_of() formula, or one-off probe"]
+        pz["o_frag = 0 · m_s = −inf · l_s = 0"]
+        pq --> pf --> pp --> pz
+    end
+
+    subgraph loop ["Key loop — kt = kt_begin .. kt_end step BLOCK_N"]
+        direction TB
+        stage["stage K and V tiles to shared<br/><i>classify: whole tile inside S ⇒ no per-element bounds test</i>"]
+        g1["<b>1 · S = Q @ Kᵀ</b> — wmma, fp32 accumulate<br/>k_s read as col_major ⇒ transpose is free<br/>store score tile to s_s"]
+        sm["<b>2 · online softmax</b> — one lane per row<br/>local max over COLS_PER_LANE · 1 shuffle<br/>m_new, corr = exp2(m_old−m_new), l = l·corr + Σp<br/>write P to p_s, corr to c_s"]
+        g2["<b>3 · O = O·corr + P @ V</b> — wmma<br/>rescale o_frag elements via acc_row<br/>accumulate straight into the O fragments"]
+        stage --> g1 --> sm --> g2
+    end
+
+    subgraph epi ["Epilogue"]
+        direction TB
+        sp{"splits &gt; 1?"}
+        part["store <b>unnormalised</b> partial<br/>part_o, part_m, part_l"]
+        comb["combine kernel<br/>rebase onto global max, then normalise"]
+        norm["normalise by 1/l"]
+        dir{"whole 16×16 tile<br/>in range?"}
+        d1["fragment store straight to global"]
+        d2["one fragment at a time via shared"]
+        sp -->|"yes"| part --> comb
+        sp -->|"no"| norm --> dir
+        dir -->|"yes"| d1
+        dir -->|"no"| d2
+    end
+
+    out(["output tile"])
+
+    entry --> pq
+    pz --> stage
+    g2 -.->|"next key tile"| stage
+    g2 --> sp
+    comb --> out
+    d1 --> out
+    d2 --> out
+
+    %% Styling
+    classDef ingress fill:#e0f2fe,stroke:#0284c7,stroke-width:2px,color:#0f172a;
+    classDef reg fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#0f172a;
+    classDef shm fill:#fef3c7,stroke:#d97706,stroke-width:1.5px,color:#0f172a;
+    classDef glb fill:#e0f2fe,stroke:#0284c7,stroke-width:1.5px,color:#0f172a;
+    classDef hostwork fill:#f1f5f9,stroke:#64748b,stroke-width:1.5px,color:#0f172a;
+    classDef box fill:transparent,stroke:#94a3b8;
+
+    class entry,out ingress;
+    class pf,pp,pz,g2 reg;
+    class pq,stage,g1,sm shm;
+    class part,comb,d1,d2,norm glb;
+    class sp,dir hostwork;
+    class prologue,loop,epi box;
+```
+
+Four details the diagram compresses:
+
+1. **The transpose is free.** `k_s` is `[BLOCK_N, head_dim]` row-major, which *is* Kᵀ column-major at `ldm = KV_LD`, so the `matrix_b` fragment loads it directly. No transpose pass exists.
+2. **Causal masking is two mechanisms, not one.** `key_limit` truncates the loop at the block's own last row; `tri_free` then exempts every remaining tile but the diagonal one from per-element tests — FlashAttention-2's "only one block per row needs the mask".
+3. **The accumulator row map is architecture-defined and undocumented.** `acc_row_of()` is the closed-form mapping; the `probe` path stores a tagged fragment, reads back where each tag landed and inverts it. The probe runs in the O/K/V/S span while it is dead, between the Q fragment hoist and the first K/V stage.
+4. **Split partials are stored unnormalised deliberately.** `1/l` is only knowable once every split's `l` has been rebased onto the max across splits, which is the combine pass's job. Normalising here would be wrong, not merely wasteful.
+
+**The softmax lane mapping.** Step 2 assigns one lane per query row rather than per key column. This was the single largest improvement in the kernel:
+
+```mermaid
+flowchart LR
+    subgraph old ["Lane = key column — the obvious mapping"]
+        direction TB
+        o1["each lane owns one COLUMN of the score tile"]
+        o2["softmax reduces along ROWS<br/>⇒ every row's max and sum cross all lanes"]
+        o3["<b>5-step butterfly</b> per reduction<br/>__shfl_xor at offsets 1,2,4,8,16"]
+        o4["cost does not shrink with head_dim<br/>⇒ at head_dim 16 it swamped both GEMMs"]
+        o1 --> o2 --> o3 --> o4
+    end
+
+    subgraph new ["Lane = query row — what the kernel does"]
+        direction TB
+        n1["32 lanes ÷ 16 rows = 2 lanes per row<br/>each owns COLS_PER_LANE key columns"]
+        n2["local max and local sum are<br/>entirely within one lane's registers"]
+        n3["<b>1 shuffle</b> — offset 16 only<br/>for (off = RPW; off &lt; 32; off &lt;&lt;= 1)"]
+        n4["only the two lanes sharing a row talk"]
+        n1 --> n2 --> n3 --> n4
+    end
+
+    old -.->|"measured 1.94×"| new
+
+    %% Styling
+    classDef bad fill:#fecdd3,stroke:#e11d48,stroke-width:1.5px,color:#9f1239;
+    classDef good fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#0f172a;
+    classDef box fill:transparent,stroke:#94a3b8;
+
+    class o1,o2,o3,o4 bad;
+    class n1,n2,n3,n4 good;
+    class old,new box;
+```
+
+The reduction loop starts at `off = RPW` rather than at 1, which is what collapses five steps into one. Because `RPW` is 16 and a warp is 32 lanes, exactly two lanes share each row.
+
+### 4.2 Split-KV (Flash-Decoding)
 
 Flash-Decoding splits key sequence length to maximize GPU utilization. The standard attention grid is `(ceil(S / BLOCK_M), H, B)`. For small batch sizes and short sequences, this grid leaves GPU multiprocessors idle; splitting the key range introduces a second combine kernel launch in exchange for increased CTA parallelism.
 

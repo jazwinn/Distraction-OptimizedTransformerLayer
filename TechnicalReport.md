@@ -35,8 +35,9 @@
 - **[6. Architecture and Dispatch](#6-architecture-and-dispatch)**
     - [6.1 The forward pass](#61-the-forward-pass)
     - [6.2 Choosing the attention kernel](#62-choosing-the-attention-kernel)
-    - [6.3 Precision is a separate choice](#63-precision-is-a-separate-choice)
-    - [6.4 The decisions and their thresholds](#64-the-decisions-and-their-thresholds)
+    - [6.3 Inside the attention kernel](#63-inside-the-attention-kernel)
+    - [6.4 Precision is a separate choice](#64-precision-is-a-separate-choice)
+    - [6.5 The decisions and their thresholds](#65-the-decisions-and-their-thresholds)
 - **[7. Dashboard and Profiling](#7-dashboard-and-profiling)**
     - [7.1 What it is](#71-what-it-is)
     - [7.2 The measurement rules it enforces](#72-the-measurement-rules-it-enforces)
@@ -179,7 +180,7 @@ so what is rewarded is closeness to *that*, not correctness in the abstract.
 
 ### 2.1 Hardware
 
-| | |
+| Part | Detail |
 | --- | --- |
 | Processor (CPU) | AMD Ryzen 7 5800X |
 | Memory (RAM) | 32 GB DDR4 |
@@ -189,7 +190,7 @@ so what is rewarded is closeness to *that*, not correctness in the abstract.
 
 ### 2.2 Operating system and build tools
 
-| | |
+| Component | Detail |
 | --- | --- |
 | Operating system | Windows 11 |
 | C++ compiler | Microsoft Visual C++ (MSVC) 14.44 |
@@ -200,7 +201,7 @@ so what is rewarded is closeness to *that*, not correctness in the abstract.
 
 ### 2.3 Languages and GPU programming interfaces
 
-| | |
+| Role | What is used |
 | --- | --- |
 | Language | CUDA C++ — NVIDIA's extension of C++ for writing GPU programs |
 | Main interface | `wmma`, which drives the GPU's matrix-multiply hardware directly |
@@ -218,7 +219,7 @@ Number formats used, and where:
 
 ### 2.4 Framework and libraries
 
-| | |
+| Component | What it is |
 | --- | --- |
 | Machine-learning framework | **PyTorch 2.12** — tensors, the baseline implementation, and the benchmark harness |
 | Bridge to custom code | PyTorch's `cpp_extension`, which compiles the CUDA code and makes it callable from Python |
@@ -227,7 +228,7 @@ Number formats used, and where:
 
 ### 2.5 Supporting tools
 
-| | |
+| Purpose | What is used |
 | --- | --- |
 | Correctness checks | Scripts running every kernel against the baseline and comparing results number by number |
 | Speed measurements | Scripts timing versions alternately within one session, with a control comparison to measure background variation |
@@ -240,7 +241,7 @@ Number formats used, and where:
 
 The attention kernel follows the FlashAttention line of work.
 
-| | |
+| Source | What it covers |
 | --- | --- |
 | [FlashAttention](https://arxiv.org/abs/2205.14135) | Dao et al., 2022. Exact attention computed without ever writing the full score grid to the card's main memory |
 | [FlashAttention-2](https://tridao.me/publications/flash2/flash2.pdf) | Dao, 2023. Improved parallelism and division of work |
@@ -249,7 +250,7 @@ The attention kernel follows the FlashAttention line of work.
 
 ### 2.7 AI assistance and Skills
 
-| | |
+| Tool | Used for |
 | --- | --- |
 | Claude Opus | Kernel development, debugging, measurement, and documentation |
 | Gemini Flash | Supporting querie and understanding concepts |
@@ -634,6 +635,8 @@ means restructuring the kernel around tiles rather than rows. The interface is c
 it works through **fragments**: bundles of registers, shared across 32 threads, holding one tile.
 
 Each block takes 64 Query rows split across four thread groups, and walks the Keys in tiles of 32.
+Those two sizes are the tuned constants of section 5.3, so they are not the same at every head
+size — above 64 dimensions per head the block narrows to 32 rows.
 
 **Simply calling the tensor-core instructions made it slower.** Three further changes turned it
 into a win:
@@ -1037,7 +1040,119 @@ The layout check at the top is optimization 2 from section 5.2: when Query, Key 
 slices of one result, as the combined multiply leaves them, they are read where they sit and the
 copy never happens.
 
-### 6.3 Precision is a separate choice
+### 6.3 Inside the attention kernel
+
+
+```mermaid
+flowchart TD
+    entry(["one block handles<br/>64 words"])
+
+    subgraph prologue ["Set up — once"]
+        direction TB
+        pq["load this block's words<br/>into fast on-chip memory"]
+        pf["move them into registers<br/>and keep them there"]
+        pp["work out which register<br/>holds which word"]
+        pz["start the running totals<br/>at zero"]
+        pq --> pf --> pp --> pz
+    end
+
+    subgraph loop ["Key loop — one batch of keys at a time"]
+        direction TB
+        stage["load the next batch of<br/>keys and values"]
+        g1["<b>1 · score</b><br/>compare our words against them<br/>on the matrix-multiply hardware"]
+        sm["<b>2 · softmax</b><br/>turn scores into weights,<br/>and correct the running totals"]
+        g2["<b>3 · accumulate</b><br/>add the weighted values<br/>into the answer, in registers"]
+        stage --> g1 --> sm --> g2
+    end
+
+    subgraph epi ["Finish"]
+        direction TB
+        sp{"was the work split<br/>across blocks?"}
+        part["save this piece<br/>unfinished"]
+        comb["a second kernel joins<br/>the pieces together"]
+        norm["divide by the running total"]
+        dir{"is the tile<br/>complete?"}
+        d1["write straight out"]
+        d2["write out via<br/>on-chip memory"]
+        sp -->|"yes"| part --> comb
+        sp -->|"no"| norm --> dir
+        dir -->|"yes"| d1
+        dir -->|"no"| d2
+    end
+
+    out(["64 words of output"])
+
+    entry --> pq
+    pz --> stage
+    g2 -.->|"next batch of keys"| stage
+    g2 --> sp
+    comb --> out
+    d1 --> out
+    d2 --> out
+
+    classDef reg fill:#dcfce7,stroke:#16a34a,color:#0f172a;
+    classDef shm fill:#fef3c7,stroke:#d97706,color:#0f172a;
+    classDef glb fill:#e0f2fe,stroke:#0284c7,color:#0f172a;
+    classDef gate fill:#f1f5f9,stroke:#64748b,color:#0f172a;
+    classDef box fill:transparent,stroke:#94a3b8;
+    class pf,pp,pz,g2 reg;
+    class pq,stage,g1,sm shm;
+    class part,comb,d1,d2,norm glb;
+    class sp,dir gate;
+    class entry,out glb;
+    class prologue,loop,epi box;
+```
+
+Green is a value held in registers, the fastest storage a thread has, amber the chip's fast shared
+memory, blue the card's main memory. Sections 6.1 and 6.2 stop at the launch; this is what the
+chosen kernel does once the card is running it.
+
+The loop is the algorithm of section 4.1: **score, softmax, accumulate**, one batch of Keys at a
+time. Two things in it are worth pointing at. The Query and the answer are green for the whole
+loop — they are loaded into registers once and stay there, so the only traffic each time round is
+the batch of Keys and Values. And softmax appears twice: the exponential and the running totals are
+done per batch, but the division that finishes it cannot happen until every Key has been seen, so
+it waits until *Finish*.
+
+**The softmax lane assignment.** Step 2 gives each thread a whole row rather than a column, which
+section 4.4 measured at 1.94× — the largest single improvement in the kernel:
+
+```mermaid
+flowchart LR
+    subgraph old ["The obvious way — one thread per column"]
+        direction TB
+        o1["each thread takes<br/>one column of scores"]
+        o2["but softmax adds up<br/>along rows, not columns"]
+        o3["so every total has to be<br/>passed between threads<br/><b>five times over</b>"]
+        o4["and that cost stays the same<br/>however small the work gets"]
+        o1 --> o2 --> o3 --> o4
+    end
+
+    subgraph new ["What the kernel does — one thread per row"]
+        direction TB
+        n1["each thread takes<br/>a whole row instead"]
+        n2["so it can add up<br/>its own row by itself"]
+        n3["only <b>one</b> exchange left,<br/>between the two threads<br/>sharing a row"]
+        n4["the largest single<br/>improvement in the kernel"]
+        n1 --> n2 --> n3 --> n4
+    end
+
+    old -.->|"1.94× faster"| new
+
+    classDef bad fill:#fecdd3,stroke:#e11d48,color:#9f1239;
+    classDef good fill:#dcfce7,stroke:#16a34a,color:#0f172a;
+    class o1,o2,o3,o4 bad;
+    classDef box fill:transparent,stroke:#94a3b8;
+    class n1,n2,n3,n4 good;
+    class old,new box;
+```
+
+A thread group is 32 threads and a stripe is 16 rows, so on the right exactly two threads share
+each row — which is the one exchange that remains.
+
+---
+
+### 6.4 Precision is a separate choice
 
 Which kernel runs and which number format it computes in are **independent**. They used to be one
 setting, which meant asking for a precision also meant asking for a kernel. Splitting them means
@@ -1055,7 +1170,7 @@ The choice only arises for full-precision input — data already supplied in a 1
 computed in that format, since narrowing further is pointless and widening cannot recover what was
 lost.
 
-### 6.4 The decisions and their thresholds
+### 6.5 The decisions and their thresholds
 
 | Decision | Threshold | What happens past it |
 | --- | --- | --- |
@@ -1188,7 +1303,7 @@ All fourteen graded shapes, measured on the hardware in section 2.1. Every one p
 check, with **zero** failing values out of the billions compared.
 
 
-| | |
+| Measure | Speedup |
 | --- | ---: |
 | Geometric mean | **8.13×** |
 | Median | **9.39×** |
