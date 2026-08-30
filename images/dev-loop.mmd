@@ -1,0 +1,24 @@
+flowchart LR
+    cycle(["start of a cycle"]) --> propose["research agent proposes<br/>an optimization"]
+    propose --> g1{"worth testing?"}
+    g1 -->|"no"| propose
+    g1 -->|"yes"| base["measure the<br/>current best"]
+    base --> build["implement<br/>the proposal"]
+    build --> retime["time the two alternately,<br/>alongside a control"]
+    retime --> ana["compare and analyse"]
+    ana --> verdict["agent proposes<br/>keep or reject"]
+    verdict --> g2{"do I agree?"}
+    g2 -->|"reject"| drop["reverted"]
+    g2 -->|"keep"| keep["recorded and<br/>committed"]
+    drop --> nxt(["next cycle"])
+    keep --> nxt
+    nxt -.-> propose
+
+    classDef ai fill:#f1f5f9,stroke:#64748b,color:#0f172a;
+    classDef me fill:#fef3c7,stroke:#d97706,color:#0f172a;
+    classDef mrun fill:#dcfce7,stroke:#16a34a,color:#0f172a;
+    classDef bad fill:#fecdd3,stroke:#e11d48,color:#9f1239;
+    class propose,build,ana,verdict ai;
+    class g1,g2 me;
+    class base,retime,keep mrun;
+    class drop bad;

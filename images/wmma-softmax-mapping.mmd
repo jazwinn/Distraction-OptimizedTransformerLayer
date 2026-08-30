@@ -1,0 +1,28 @@
+flowchart LR
+    subgraph old ["The obvious way — one thread per column"]
+        direction TB
+        o1["each thread takes<br/>one column of scores"]
+        o2["but softmax adds up<br/>along rows, not columns"]
+        o3["so every total has to be<br/>passed between threads<br/><b>five times over</b>"]
+        o4["and that cost stays the same<br/>however small the work gets"]
+        o1 --> o2 --> o3 --> o4
+    end
+
+    subgraph new ["What the kernel does — one thread per row"]
+        direction TB
+        n1["each thread takes<br/>a whole row instead"]
+        n2["so it can add up<br/>its own row by itself"]
+        n3["only <b>one</b> exchange left,<br/>between the two threads<br/>sharing a row"]
+        n4["the largest single<br/>improvement in the kernel"]
+        n1 --> n2 --> n3 --> n4
+    end
+
+    old -.->|"1.94× faster"| new
+
+    classDef bad fill:#fecdd3,stroke:#e11d48,color:#9f1239;
+    classDef good fill:#dcfce7,stroke:#16a34a,color:#0f172a;
+    class o1,o2,o3,o4 bad;
+    class n1,n2,n3,n4 good;
+
+    classDef box fill:transparent,stroke:#94a3b8;
+    class old,new box;

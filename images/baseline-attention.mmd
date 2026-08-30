@@ -1,0 +1,28 @@
+flowchart TD
+    X([input]) --> Q[Query projection]
+    X --> K[Key projection]
+    X --> V[Value projection]
+    Q --> QR[reshape and copy]
+    K --> KR[reshape and copy]
+    V --> VR[reshape and copy]
+    QR --> S1["1 - multiply Q by K
+    SCORE GRID created"]
+    KR --> S1
+    S1 --> S2["2 - multiply by a constant
+    grid rewritten"]
+    S2 --> S3["3 - build mask, blank entries
+    grid rewritten"]
+    S3 --> S4["4 - softmax
+    grid rewritten"]
+    S4 --> S5["5 - multiply by V
+    grid read"]
+    VR --> S5
+    S5 --> CR[reshape and copy]
+    CR --> O[output projection]
+    O --> OUT([output])
+
+    style S1 fill:#f9d5d5,stroke:#cc3333
+    style S2 fill:#f9d5d5,stroke:#cc3333
+    style S3 fill:#f9d5d5,stroke:#cc3333
+    style S4 fill:#f9d5d5,stroke:#cc3333
+    style S5 fill:#f9d5d5,stroke:#cc3333

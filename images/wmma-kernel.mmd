@@ -1,0 +1,59 @@
+flowchart TD
+    entry(["one block handles<br/>64 words"])
+
+    subgraph prologue ["Set up — once"]
+        direction TB
+        pq["load this block's words<br/>into fast on-chip memory"]
+        pf["move them into registers<br/>and keep them there"]
+        pp["work out which register<br/>holds which word"]
+        pz["start the running totals<br/>at zero"]
+        pq --> pf --> pp --> pz
+    end
+
+    subgraph loop ["Key loop — one batch of keys at a time"]
+        direction TB
+        stage["load the next batch of<br/>keys and values"]
+        g1["<b>1 · score</b><br/>compare our words against them<br/>on the matrix-multiply hardware"]
+        sm["<b>2 · softmax</b><br/>turn scores into weights,<br/>and correct the running totals"]
+        g2["<b>3 · accumulate</b><br/>add the weighted values<br/>into the answer, in registers"]
+        stage --> g1 --> sm --> g2
+    end
+
+    subgraph epi ["Finish"]
+        direction TB
+        sp{"was the work split<br/>across blocks?"}
+        part["save this piece<br/>unfinished"]
+        comb["a second kernel joins<br/>the pieces together"]
+        norm["divide by the running total"]
+        dir{"is the tile<br/>complete?"}
+        d1["write straight out"]
+        d2["write out via<br/>on-chip memory"]
+        sp -->|"yes"| part --> comb
+        sp -->|"no"| norm --> dir
+        dir -->|"yes"| d1
+        dir -->|"no"| d2
+    end
+
+    out(["64 words of output"])
+
+    entry --> pq
+    pz --> stage
+    g2 -.->|"next batch of keys"| stage
+    g2 --> sp
+    comb --> out
+    d1 --> out
+    d2 --> out
+
+    classDef reg fill:#dcfce7,stroke:#16a34a,color:#0f172a;
+    classDef shm fill:#fef3c7,stroke:#d97706,color:#0f172a;
+    classDef glb fill:#e0f2fe,stroke:#0284c7,color:#0f172a;
+    classDef gate fill:#f1f5f9,stroke:#64748b,color:#0f172a;
+
+    class pf,pp,pz,g2 reg;
+    class pq,stage,g1,sm shm;
+    class part,comb,d1,d2,norm glb;
+    class sp,dir gate;
+    class entry,out glb;
+
+    classDef box fill:transparent,stroke:#94a3b8;
+    class prologue,loop,epi box;

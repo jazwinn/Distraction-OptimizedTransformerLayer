@@ -1,0 +1,12 @@
+flowchart TD
+    IN([input]) --> N1[normalise]
+    N1 --> ATT[self-attention]
+    ATT --> A1(("+"))
+    IN --> A1
+    A1 --> N2[normalise]
+    N2 --> F1[expand 512 to 2048]
+    F1 --> G[GELU activation]
+    G --> F2[shrink 2048 to 512]
+    F2 --> A2(("+"))
+    A1 --> A2
+    A2 --> OUT([output])
