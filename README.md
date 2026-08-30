@@ -382,12 +382,7 @@ limits — faster.
 
 ## Team
 
-**Solo project.** Everything here — the GPU code, the Python layer, the measurement scripts and the
-dashboard — was designed, written, measured and debugged by **Ng Jaz Winn**, the sole entrant.
-`torch_transformer_benchmark.py` is the organizers' file, changed only by the few lines that connect
-this project to it.
-
-
+**Solo project**
 
 ---
 
