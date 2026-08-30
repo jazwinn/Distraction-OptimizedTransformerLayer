@@ -25,7 +25,7 @@ One layer of the finished model. Grey is a decision made on the processor before
 sent to the card, green a kernel on the card, amber the fused kernel that replaces four of
 them:
 
-![One layer of the forward pass](../images/forward-pass.png)
+![One layer of the forward pass](https://github.com/jazwinn/Distraction-OptimizedTransformerLayer/raw/main/images/forward-pass.png)
 
 *Every gate above is explained, with the measurement behind it, in the [Technical Report](https://github.com/jazwinn/Distraction-OptimizedTransformerLayer/blob/main/TechnicalReport.md) — and
 drawn out in full, one decision at a time, in the [dispatch graph](https://github.com/jazwinn/Distraction-OptimizedTransformerLayer/blob/main/attention_dispatch_graph.md).*
@@ -48,7 +48,7 @@ Twenty optimizations in all address what the profiling exposed:
 All fourteen official test shapes, on an RTX 3070. Every one passes, with zero failing values out
 of billions compared.
 
-![Speedup on each of the 14 official test shapes](../images/speedup-by-shape.png)
+![Speedup on each of the 14 official test shapes](https://github.com/jazwinn/Distraction-OptimizedTransformerLayer/raw/main/images/speedup-by-shape.png)
 
 *Every shape runs faster than the baseline. The gains are largest where the card was sitting idle —
 a batch of 1 spends almost all its time waiting for instructions rather than computing — and
