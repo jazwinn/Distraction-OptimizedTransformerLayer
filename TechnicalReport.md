@@ -50,7 +50,7 @@
     - [9.3 The understanding behind this is newer than the results suggest](#93-the-understanding-behind-this-is-newer-than-the-results-suggest)
 - **[10. AI Involvement During Development](#10-ai-involvement-during-development)**
     - [10.1 The tools, and what they enabled](#101-the-tools-and-what-they-enabled)
-    - [10.2 The development loop](#102-the-development-loop)
+    - [10.2 The optimization development loop](#102-the-optimization-development-loop)
     - [10.3 What it could not be trusted with](#103-what-it-could-not-be-trusted-with)
     - [10.4 Working with AI, not instead of it](#104-working-with-ai-not-instead-of-it)
 
@@ -233,7 +233,7 @@ Number formats used, and where:
 | Speed measurements | Scripts timing versions alternately within one session, with a control comparison to measure background variation |
 | Profiling | NVIDIA Nsight |
 | Inspecting compiled output | `cuobjdump`, an NVIDIA tool showing what the GPU compiler produced |
-| Benchmark dashboard | A web page for running benchmarks and viewing results: Python's built-in web server, plain HTML/CSS/JavaScript |
+| Benchmark dashboard | A web page for running benchmarks and viewing results. Back end: Python's own `http.server`, plus `subprocess`/`runpy` to launch runs, `threading`/`queue` for the job queue, and `json`/`csv`/`ast` to parse harness and profiler output. Front end: one HTML file, one stylesheet and one script, using `fetch` and `localStorage` and nothing else. No framework, no build step, no third-party code at any layer |
 | Version control | Git |
 
 ### 2.6 Reference material
@@ -739,6 +739,13 @@ Run it with:
 cmd.exe /c scripts\devenv.bat python scripts\bench_attention_vs_sdpa.py
 ```
 
+![Attention time for four implementations across every test shape](images/attention-comparison.png)
+
+*Every case, every implementation, on one axis. The scale is logarithmic because the range is
+200:1 — `long seq` takes 2.766 ms where `tiny causal` takes 0.014 ms, and on a linear axis
+everything but the long-sequence rows would collapse to nothing. Grouped rather than stacked: the
+four bars are alternatives for the same work, not parts that add up.*
+
 **The tensor-core kernel wins every row.** It beats PyTorch's fused attention everywhere, by 1.7×
 to 5.8×, and beats both of the other implementations everywhere too. That settles which one is the
 default.
@@ -947,6 +954,7 @@ contains no such decisions.
 
 ### 6.1 The forward pass
 
+
 ```mermaid
 flowchart TD
     entry(["forward"]) --> probe["check the mask once"]
@@ -956,7 +964,7 @@ flowchart TD
 
     replay ==>|"one instruction"| qkv["combined Q/K/V multiply"]
     eager ==>|"per kernel"| qkv
-    qkv --> attn["attention"] --> outp["output multiply"] --> gate{"model width"}
+    qkv --> attn["custom attention kernel"] --> outp["output multiply"] --> gate{"model width"}
     gate -->|"64 or less"| fused["whole rest of the block,<br/>one kernel"]
     gate -->|"wider"| chain["four separate kernels"]
     fused --> out(["layer output"])
@@ -979,6 +987,14 @@ residual addition before it, so it runs on its own; every other one is fused int
 feeds it — including the last, which absorbs the model's final normalisation so it never needs a
 kernel of its own. And the **width check** costs nothing: it reads a remembered flag and a shape
 that are both known before the layer starts, so the card is never kept waiting for the answer.
+
+**Why the width decides it.** The fused kernel has to keep a whole intermediate row on chip, which
+limits it to 16 rows at a time — and each of those small groups still has to read the entire weight
+matrices. When the model is narrow the weights are small, so that re-reading costs little and saving
+three kernel launches wins. When it is wide the weights are large and get re-read far too often,
+while the four separate kernels can take many more rows at once and read the weights once for all of
+them. The crossover was measured, not reasoned: **5.6×** for the fused kernel at width 32, **0.90×
+to 0.98×** at 128.
 
 Measured with PyTorch's synchronisation debugger, a settled forward pass performs **zero** waits
 between card and processor. The mask check is the only point that ever needs one, and its answer is
@@ -1171,22 +1187,6 @@ worse than one that refuses to run.
 All fourteen graded shapes, measured on the hardware in section 2.1. Every one passes the accuracy
 check, with **zero** failing values out of the billions compared.
 
-| # | Shape | Baseline | Optimized | Speedup | Worst error | Failed |
-| :---: | --- | ---: | ---: | ---: | ---: | :---: |
-| 1 | base | 5.91 ms | 1.34 ms | **4.41×** | 9.2e-4 | 0 / 2.1 M |
-| 2 | batch 1 | 5.63 ms | 0.14 ms | **39.67×** | 7.4e-4 | 0 / 32.8 K |
-| 3 | batch 4 | 3.78 ms | 0.16 ms | **23.37×** | 8.0e-4 | 0 / 131 K |
-| 4 | batch 16 | 3.66 ms | 0.37 ms | **9.86×** | 1.1e-3 | 0 / 524 K |
-| 5 | batch 128 | 9.97 ms | 2.29 ms | **4.35×** | 9.6e-4 | 0 / 4.2 M |
-| 6 | batch 10000 | 6.89 s | 1.05 s | **6.53×** | 1.3e-3 | 0 / 328 M |
-| 7 | d_model 32 | 3.86 ms | 0.28 ms | **13.63×** | 1.4e-3 | 0 / 524 K |
-| 8 | d_model 1024 | 38.12 ms | 27.01 ms | **1.41×** | 1.1e-3 | 0 / 16.8 M |
-| 9 | 1 head | 3.40 ms | 1.44 ms | **2.36×** | 1.0e-3 | 0 / 2.1 M |
-| 10 | 2 heads | 3.95 ms | 1.26 ms | **3.14×** | 1.0e-3 | 0 / 2.1 M |
-| 11 | 16 heads | 12.71 ms | 1.42 ms | **8.93×** | 8.8e-4 | 0 / 2.1 M |
-| 12 | seq 32 | 4.03 ms | 0.37 ms | **11.00×** | 1.1e-3 | 0 / 524 K |
-| 13 | seq 1024 | 181.38 ms | 11.98 ms | **15.14×** | 1.1e-3 | 0 / 16.8 M |
-| 14 | seq 100000 | 43.19 s | 1.89 s / slice | **22.84×** | 7.4e-4 | 0 / 6.55 B |
 
 | | |
 | --- | ---: |
@@ -1196,6 +1196,8 @@ check, with **zero** failing values out of the billions compared.
 | Worst — shape 8, d_model 1024 | **1.41×** |
 | Shapes at or above 4× | 11 of 14 |
 | Shapes failing the accuracy check | **0 of 14** |
+
+![Speedup on each of the 14 official test shapes](images/speedup-by-shape.png)
 
 ### 8.1 Reading the spread
 
@@ -1319,9 +1321,11 @@ before it went on new features.
 
 ## 10. AI Involvement During Development
 
-The problem statement encourages AI use, on the grounds that it lets a participant implement
-different kernels for different input shapes in limited time. That is precisely what it was used
-for here.
+The large optimizations are the obvious ones. Keeping the score grid on the chip, reaching the
+tensor cores, fusing neighbouring steps — those follow from reading the profile and knowing what a
+GPU is bad at. Where AI earned its place was everything after that: suggesting and implementing the
+smaller optimizations that would not otherwise have been found, or would have been found and judged
+not worth the time.
 
 ### 10.1 The tools, and what they enabled
 
@@ -1353,7 +1357,7 @@ by the tool rather than remembered by the person running it, and the profiling i
 what located the launch-bound region and the memory limits that the optimizations were then aimed
 at.
 
-### 10.2 The development loop
+### 10.2 The optimization development loop
 
 Everything in section 10.1 came out of one cycle, run over and over. There are two gates in it, and
 both of them are me.

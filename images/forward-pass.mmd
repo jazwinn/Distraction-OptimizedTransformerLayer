@@ -1,0 +1,23 @@
+flowchart LR
+    entry(["forward"]) --> probe["check mask"]
+    probe --> cache{"shape seen<br/>before?"}
+    cache -->|"yes"| replay["replay recording"]
+    cache -->|"no"| eager["issue kernels"]
+
+    replay ==>|"one instruction"| qkv["Q/K/V multiply"]
+    eager ==>|"per kernel"| qkv
+    qkv --> attn["custom attention<br/>kernel"] --> outp["output multiply"] --> gate{"model<br/>width"}
+    gate -->|"64 or less"| fused["rest of block,<br/>one kernel"]
+    gate -->|"wider"| chain["four separate<br/>kernels"]
+    fused --> out(["layer output"])
+    chain --> out
+    out -.->|"next layer"| qkv
+
+    classDef host fill:#f1f5f9,stroke:#64748b,color:#0f172a;
+    classDef dev fill:#dcfce7,stroke:#16a34a,color:#0f172a;
+    classDef fuse fill:#fef3c7,stroke:#d97706,color:#0f172a;
+    classDef edge fill:#ffffff,stroke:#94a3b8,color:#0f172a;
+    class probe,cache,replay,eager,gate host;
+    class qkv,attn,outp,chain dev;
+    class fused fuse;
+    class entry,out edge;

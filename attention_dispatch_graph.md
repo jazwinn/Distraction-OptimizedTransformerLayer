@@ -23,7 +23,7 @@ flowchart TD
     eager["Eager Loop"]
 
     qkv["Fused QKV GEMM"]
-    attn["Attention Kernel"]
+    attn["Custom Attention Kernel"]
     outp["out_proj GEMM"]
     fuse{"FFN Fuse Gate"}
 
@@ -327,6 +327,8 @@ flowchart TD
     class fused fusedwork;
 ```
 
+**Why the width gate exists.** The second GEMM reduces across `ffn_dim`, so a thread block cannot emit any output column until the full intermediate row is resident in shared memory. That pins the fused kernel's row tile to $M=16$ (one WMMA tile), and every block must read both weight matrices in full to serve only those 16 rows. Unfused `linear_gelu` is under no such constraint: it picks a much larger row tile and amortizes one weight load across far more rows. At `d_model <= 64` the weights are small enough that eliminating 4 kernel launches outweighs the worse tiling; above it, the redundant weight traffic scales with `d_model` and the launch savings stop compensating.
+
 | Label | Rule |
 | :--- | :--- |
 | `padded` | Explicit padded mask tensor present. Padded rows are zeroed *between* residual addition and LayerNorm; reference LayerNorm normalizes zeroed elements rather than unpadded sums, preventing kernel fusion |
@@ -345,7 +347,6 @@ Measured against the tuned `linear_gelu` kernel baseline:
 | **128** | Shape 13 | 0.919x |
 | **128** | Shape 6 | 0.897x |
 
-This crossover point is architectural: the second GEMM reduces across `ffn_dim`, preventing a thread block from emitting output columns until the full intermediate row is stored in shared memory. This constrains the row tile to $M=16$ (a single WMMA tile). Conversely, unfused `linear_gelu` configures larger row tile dimensions, achieving higher arithmetic intensity per weight byte loaded. At `d_model <= 64`, eliminating 4 kernel launches outweighs suboptimal tiling; above `d_model == 64`, launch overhead savings no longer compensate for tiling constraints.
 
 ---
 

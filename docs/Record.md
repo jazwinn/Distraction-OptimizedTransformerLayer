@@ -1,7 +1,7 @@
 # Distraction — engineering record
 
 Everything measured, and the record of what was built, what broke, and what each fix was
-actually worth. [README.md](README.md) covers installing, building and how the code works;
+actually worth. [README.md](../README.md) covers installing, building and how the code works;
 this file covers what it does and how well.
 
 It opens with a plain-language account for readers who don't work with GPUs, then goes into
@@ -655,7 +655,7 @@ crossover is really the point where the GPU stops starving, which depends on the
 throughput relative to how fast the host can feed it — so a faster GPU starves at larger
 shapes and wants a *larger* value. `scripts/ab_graph.py --recommend` re-derives it on whatever
 machine it runs on; the procedure is in
-[README.md, Setup step 4](README.md#4-find-the-cuda-graph-gate-value-for-your-machine).
+[README.md, Setup step 4](../README.md#4-find-the-cuda-graph-gate-value-for-your-machine).
 
 Getting it wrong is cheap either way: too low leaves latency on the table, too high pins
 memory for nothing, and neither can produce a wrong answer, because replay is bit-identical to
@@ -746,7 +746,7 @@ kernel keeps Q, O, K, V and the score tile live at once, and past a footprint th
 compiler spills and the cost jumps an order of magnitude. At `head_dim=64`, `BLOCK_N=16`
 runs at 1.5 ms where `BLOCK_N=32` runs at 10.9 ms. The per-`head_dim` shapes in `BlockCfg`
 were measured on SM 8.6 and are worth re-measuring on another architecture; the tables are in
-[`csrc/TUNING.md`](csrc/TUNING.md).
+[`csrc/TUNING.md`](../csrc/TUNING.md).
 
 **Tensor cores did not cost precision the way an earlier note predicted.** The worry was
 that TF32 fragments would push the kernel away from the baseline. On the attention op the
@@ -1511,7 +1511,7 @@ python torch_transformer_benchmark.py --seq-len 2048 --batch-size 1 --attn-backe
 
 ### Choosing the attention backend
 
-Edit `ATTENTION_BACKEND` in [`optimized/config.py`](optimized/config.py), or pass
+Edit `ATTENTION_BACKEND` in [`optimized/config.py`](../optimized/config.py), or pass
 `--attn-backend` for a single run:
 
 | Value | Behavior |
@@ -1619,7 +1619,7 @@ cmd.exe /c scripts\devenv.bat python scripts\compare_backends.py
 ```
 
 The measurements behind the kernels' block shapes and thresholds — and the two rules every
-one of them follows — are in [`csrc/TUNING.md`](csrc/TUNING.md).
+one of them follows — are in [`csrc/TUNING.md`](../csrc/TUNING.md).
 
 ---
 
@@ -1637,7 +1637,7 @@ one of them follows — are in [`csrc/TUNING.md`](csrc/TUNING.md).
 
 > **Mixed provenance, not yet reconciled.** The tables above were taken across two machines.
 > The RTX 4050 Laptop in this table is the original development machine. Later work — the
-> tile-kernel comparison, everything in [`csrc/TUNING.md`](csrc/TUNING.md), the split-KV
+> tile-kernel comparison, everything in [`csrc/TUNING.md`](../csrc/TUNING.md), the split-KV
 > measurements and the whole of [CUDA graphs](#cuda-graphs) — was measured on an **RTX 3070
 > (8 GiB, SM 8.6, 46 SMs, driver 610.47, CUDA 13.3, PyTorch 2.12.0+cu132, Python 3.10.6)**,
 > and those sections say so where it matters. Ratios within one section are internally

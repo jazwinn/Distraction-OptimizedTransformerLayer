@@ -1,4 +1,4 @@
-# Distraction - *A faster attention layer for Transformers*
+# Distraction - *A faster GPU Kernel for Transformer Layers*
 
 
 
@@ -8,6 +8,7 @@ the same answers, and runs faster.
 
 - [Project overview](#project-overview)
 - [Setup and installation](#setup-and-installation)
+- [The benchmark dashboard](#the-benchmark-dashboard)
 - [Reproducing the results](#reproducing-the-results)
 - [Limitations, and what I would improve](#limitations-and-what-i-would-improve)
 - [Team](#team)
@@ -67,6 +68,42 @@ input size to an existing implementation; this one does not, because implementin
 task. A size nothing covers is reported as an error rather than quietly served by somebody else's
 code.
 
+
+One layer of the finished model, with every decision made before anything reaches the card.
+Grey is a decision on the processor, green a kernel on the card, amber the fused kernel that
+replaces four of them:
+
+```mermaid
+flowchart TD
+    entry(["forward"]) --> probe["check the mask once"]
+    probe --> cache{"seen this shape<br/>before?"}
+    cache -->|"yes"| replay["replay the recording"]
+    cache -->|"no"| eager["issue kernels one by one"]
+
+    replay ==>|"one instruction"| qkv["combined Q/K/V multiply"]
+    eager ==>|"per kernel"| qkv
+    qkv --> attn["custom attention kernel"] --> outp["output multiply"] --> gate{"model width"}
+    gate -->|"64 or less"| fused["whole rest of the block,<br/>one kernel"]
+    gate -->|"wider"| chain["four separate kernels"]
+    fused --> out(["layer output"])
+    chain --> out
+    out -.->|"next layer"| qkv
+
+    classDef host fill:#f1f5f9,stroke:#64748b,color:#0f172a;
+    classDef dev fill:#dcfce7,stroke:#16a34a,color:#0f172a;
+    classDef fuse fill:#fef3c7,stroke:#d97706,color:#0f172a;
+    class probe,cache,replay,eager,gate host;
+    class qkv,attn,outp,chain dev;
+    class fused fuse;
+```
+
+
+
+*Every gate above is explained, with the measurement behind it, in
+[TechnicalReport.md](TechnicalReport.md) section 6 — and drawn out in full, one decision at a
+time, in [attention_dispatch_graph.md](attention_dispatch_graph.md).*
+
+
 Around that sit nineteen further changes — combining neighbouring steps into single kernels, doing
 three small multiplications as one large one, reading data where it already sits instead of copying
 it, skipping regions of the grid that would only be thrown away, and recording the whole sequence of
@@ -108,24 +145,8 @@ numbers out of the billions compared.
 
 Case by case:
 
-| # | Test case | Reference | This project | Speedup | Worst error |
-| :---: | --- | ---: | ---: | ---: | ---: |
-| 1 | base | 5.91 ms | 1.34 ms | **4.41×** | 9.2e-4 |
-| 2 | 1 sequence | 5.63 ms | 0.14 ms | **39.67×** | 7.4e-4 |
-| 3 | 4 sequences | 3.78 ms | 0.16 ms | **23.37×** | 8.0e-4 |
-| 4 | 16 sequences | 3.66 ms | 0.37 ms | **9.86×** | 1.1e-3 |
-| 5 | 128 sequences | 9.97 ms | 2.29 ms | **4.35×** | 9.6e-4 |
-| 6 | 10,000 sequences | 6.89 s | 1.05 s | **6.53×** | 1.3e-3 |
-| 7 | width 32 | 3.86 ms | 0.28 ms | **13.63×** | 1.4e-3 |
-| 8 | width 1024 | 38.12 ms | 27.01 ms | **1.41×** | 1.1e-3 |
-| 9 | 1 head | 3.40 ms | 1.44 ms | **2.36×** | 1.0e-3 |
-| 10 | 2 heads | 3.95 ms | 1.26 ms | **3.14×** | 1.0e-3 |
-| 11 | 16 heads | 12.71 ms | 1.42 ms | **8.93×** | 8.8e-4 |
-| 12 | 32 words | 4.03 ms | 0.37 ms | **11.00×** | 1.1e-3 |
-| 13 | 1024 words | 181.38 ms | 11.98 ms | **15.14×** | 1.1e-3 |
-| 14 | 100,000 words | 43.19 s | 1.89 s per slice | **22.84×** | 7.4e-4 |
+![Speedup on each of the 14 official test shapes](images/speedup-by-shape.png)
 
-The allowed error is 0.002, so every case in that last column finishes comfortably inside it.
 
 **The spread is wide, and it is not random.** The biggest gains are where the card was sitting idle:
 cases 2 and 3 give it so little work at a time that the original spent most of the pass waiting to
@@ -177,7 +198,9 @@ pip install -r requirements.txt
 ```
 
 That installs PyTorch and `ninja`, and nothing else — everything else this project uses comes with
-Python itself.
+Python itself. That includes the whole dashboard: its server is Python's own `http.server`, its job
+queue is `threading` and `queue`, its parsing is `json`, `csv` and `ast`, and its front end is one
+HTML file, one stylesheet and one script with no framework and no code fetched from a third party.
 
 The version of PyTorch has to match your CUDA Toolkit, so `requirements.txt` points pip at NVIDIA's
 build of it rather than the default one. If your toolkit is not 13.x, change the `cu132` in that
@@ -269,6 +292,33 @@ If that version is not installed, the script lists the ones that are.
 **"'vswhere.exe' is not recognized."** Harmless. The build succeeds anyway.
 
 **It runs, but is slower than expected.** Check which kernel actually ran by passing `--attn-impl`.
+
+---
+
+## The benchmark dashboard
+
+Tuning a kernel means running the same measurement hundreds of times, and the rules that make a
+measurement *mean* something are easy to skip when you are typing the command by hand. So the
+second thing built here is a local web page that runs the benchmarks for you and enforces those
+rules automatically.
+
+```bash
+python -m dashboard
+```
+
+| Tab | What it is for |
+| --- | --- |
+| **Run** | One configuration, on one test case or on all fourteen. Fills the table row by row and reports the geometric mean |
+| **Compare** | Two configurations against the same cases, timed alternately, with a control run to establish the noise floor |
+| **Profile** | One traced run under NVIDIA Nsight — where the time inside a pass actually goes, and per-kernel counters saying whether a kernel is limited by arithmetic or by memory |
+| **Scripts** | Every script in `scripts/`, with a form built automatically from its own arguments |
+| **Presets** | The fourteen official test cases, editable in a table and validated by the same rule the benchmark applies |
+| **History** | Every finished run, with its full log |
+
+Full instructions are in [dashboard/README.md](dashboard/README.md) — every tab and every
+control, the measurement rules it enforces, and what it refuses to run and why.
+
+![The dashboard running a benchmark](images/dashboard-run.png)
 
 ---
 
@@ -389,9 +439,9 @@ limits — faster.
 ## Further reading
 
 | Document | What it covers |
-| --- | -
+| --- | --- |
 | **[TechnicalReport.md](TechnicalReport.md)** | The full write-up: the problem, the tools used, why the original is slow, all twenty optimizations and what each was worth, results, limitations, and the AI-use disclosure. **Start here.** |
 | [attention_dispatch_graph.md](attention_dispatch_graph.md) | Which kernel runs for which input, as a diagram |
-| [dashboard/README.md](dashboard/README.md) | What each tab of the dashboard does |
-| [Record.md](Record.md) | The engineering record: every measurement in the order it was taken, including the ones that came back negative |
+| [dashboard/README.md](dashboard/README.md) | The benchmark dashboard in full: every tab, the measurement rules it enforces, the preflight checks that refuse impossible runs, how the form stays in sync with the harness, and how runs are stopped and cleaned up |
+| [docs/Record.md](docs/Record.md) | The engineering record: every measurement in the order it was taken, including the ones that came back negative |
 | [csrc/TUNING.md](csrc/TUNING.md) | The measurements behind every tuned constant in the kernels |

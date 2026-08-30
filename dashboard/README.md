@@ -220,8 +220,11 @@ variables the extension reads at startup:
 | variable | read in |
 | --- | --- |
 | `TILE_SPLIT_KV` | `csrc/tile_attention.cu` |
-| `WMMA_CAUSAL_REVERSE`, `WMMA_FP16` | `csrc/attention_wmma.cuh` |
+| `WMMA_CAUSAL_REVERSE`, `WMMA_FP16`, `WMMA_SOFTMAX_MODE`, `WMMA_MASK_CLASSIFY`, `WMMA_ACC_FORMULA`, `WMMA_DIRECT_O`, `WMMA_SPLIT_KV`, `WMMA_SPLIT_COUNT` | `csrc/attention_wmma.cuh` |
 | `LAYERNORM_FUSED_REDUCE`, `LAYERNORM_WARP_WIDTH`, `LAYERNORM_WARP_ROWS`, `LAYERNORM_BLOCK_THREADS` | `csrc/add_layernorm.cuh` |
+
+Thirteen in all; `knobs.py` is the list, and each carries the explanation the
+dashboard shows beside its checkbox.
 
 Because each run is a fresh child process, the dashboard can set these in that
 child's environment — so they are checkboxes here, under *Kernel switches* in
@@ -275,9 +278,12 @@ Before anything is spawned, the server checks the combination and blocks the
 ones that cannot produce a number. Each of these otherwise costs 5–15 s of torch
 startup to discover:
 
-- a forced `--attn-impl` outside its head-dim coverage (wmma/scalar cover
-  `{8,16,32,64,128}`, the tile kernels `{8,16,32,64}`) — the kernel raises
-  rather than falling back, by design
+- a forced `--attn-impl` outside its head-dim coverage — `wmma` and the tile
+  kernels both cover `{8,16,32,64,128,256}` (`HEAD_DIM_COVERAGE` in `knobs.py`),
+  while `scalar` is deliberately absent from that table: a generic kernel sits
+  behind its tuned instantiations and takes any head_dim up to
+  `SCALAR_MAX_HEAD_DIM`, 2048. The kernel raises rather than falling back, by
+  design
 - `d_model` not divisible by `heads`
 - a tile impl under `--dtype float16`/`bfloat16`, where the launcher raises
 - `--compile-user` together with an explicit `--cuda-graph`
@@ -309,17 +315,18 @@ causal; `layers` is 4 except shape 14, which is 2.
 Shape 1 is the base and the rest vary one axis from it: 2–6 batch, 7–8 d_model,
 9–11 heads, 12–13 seq_len, and 14 is its own thing.
 
-`head_dim = d_model / heads` decides which attention kernel can run each shape —
-wmma and scalar cover `{8,16,32,64,128}`, the tile kernels `{8,16,32,64}` — so
-the Sweep list shows it per row:
+`head_dim = d_model / heads` decides which attention kernel can run each shape,
+so the shape list shows it per row. Every head_dim in the grading set is covered
+by every kernel — `wmma` and the tile kernels each take
+`{8,16,32,64,128,256}`, and `scalar` takes anything up to 2048:
 
 ```
-shape            head_dim   note
+shape            head_dim
 1-6, 12, 13            32
 7, 11                   8
 10, 14                 64
-9                     128   tile kernels cannot take it
-8                     256   wmma only; tile kernels cannot take it
+9                     128
+8                     256
 ```
 
 **Shape 14 runs**, and the list says how. Its full `[32,100000,1024]` input is
@@ -456,6 +463,8 @@ argspec.py    the harness's argparse calls, read out of the source
 knobs.py      the env-var knobs, and the preflight rules
 parse.py      harness stdout -> a row of numbers
 presets.py    saved shapes
+profiling.py  the nsys and ncu command lines, and their output parsed
+_profile_shim.py  runs the harness under a profiler; see the Profile tab
 static/       one HTML page, one stylesheet, one script
 runs/         per-job logs and history.jsonl (gitignored)
 ```
