@@ -49,8 +49,9 @@
     - [9.3 The understanding behind this is newer than the results suggest](#93-the-understanding-behind-this-is-newer-than-the-results-suggest)
 - **[10. AI Involvement During Development](#10-ai-involvement-during-development)**
     - [10.1 The tools, and what they enabled](#101-the-tools-and-what-they-enabled)
-    - [10.2 What it could not be trusted with](#102-what-it-could-not-be-trusted-with)
-    - [10.3 Working with AI, not instead of it](#103-working-with-ai-not-instead-of-it)
+    - [10.2 The development loop](#102-the-development-loop)
+    - [10.3 What it could not be trusted with](#103-what-it-could-not-be-trusted-with)
+    - [10.4 Working with AI, not instead of it](#104-working-with-ai-not-instead-of-it)
 
 ---
 
@@ -1283,7 +1284,60 @@ by the tool rather than remembered by the person running it, and the profiling i
 what located the launch-bound region and the memory limits that the optimizations were then aimed
 at.
 
-### 10.2 What it could not be trusted with
+### 10.2 The development loop
+
+Everything in section 10.1 came out of one cycle, run over and over. There are two gates in it, and
+both of them are me.
+
+```mermaid
+flowchart TD
+    cycle(["start of a cycle"]) --> propose["research agent proposes<br/>an optimization"]
+    propose --> g1{"worth testing?"}
+    g1 -->|"yes"| base["measure the current best"]
+    g1 -->|"no"| propose
+    base --> build["implement the proposal"]
+    build --> retime["time the two alternately,<br/>alongside a control"]
+    retime --> ana["compare and analyse"]
+    ana --> verdict["agent proposes<br/>keep or reject"]
+    verdict --> g2{"do I agree?"}
+    g2 -->|"reject"| drop["reverted"]
+    g2 -->|"keep"| keep["Recorded and Commited"]
+    drop --> nxt(["next cycle"])
+    keep --> nxt
+    nxt -.-> propose
+
+    classDef ai fill:#f1f5f9,stroke:#64748b,color:#0f172a;
+    classDef me fill:#fef3c7,stroke:#d97706,color:#0f172a;
+    classDef mrun fill:#dcfce7,stroke:#16a34a,color:#0f172a;
+    classDef bad fill:#fecdd3,stroke:#e11d48,color:#9f1239;
+    class propose,build,ana,verdict ai;
+    class g1,g2 me;
+    class base,retime,keep mrun;
+    class drop bad;
+```
+
+Grey is the agent working, amber a decision I make.
+
+**The loop could close without me.** Neither gate is strictly necessary. The second one is already
+arithmetic: run the control, take the spread, keep only what clears it. The first is a priority
+call, which a ranked queue of candidates could make just as well. Give each proposal its own branch
+and revert automatically on a regression, and the cycle runs unattended.
+
+**I kept both gates anyway.** The first reason is that I wanted to learn this, and the way that
+happened was seeing a proposal, predicting what it would do, and being wrong in front of a
+measurement. An unattended loop would have produced the same kernels and left me unable to defend a
+single decision inside them.
+
+The second is that measurement only catches what it measures. It compares speed against a control
+and accuracy against a tolerance, and it is good at that. It does not catch a proposal that is
+faster because it quietly made the problem smaller — a kernel that stops covering a case, a
+constant fitted on one shape and applied to all of them. Those pass every numeric check. Only
+someone who knows what the kernel was meant to do will stop them.
+
+The cost is throughput. The loop runs no faster than I can read it, and that is the trade taken
+deliberately: fewer cycles, each one understood.
+
+### 10.3 What it could not be trusted with
 
 AI is confident whether or not it is right. A wrong answer arrives just as quickly, and sounds just
 as reasonable, as a correct one — so reading the output is not enough to tell them apart. The same
@@ -1306,7 +1360,7 @@ switchable**, so its benefit can be measured instead of assumed. And every tuned
 down in `csrc/TUNING.md` next to the measurement that produced it, so any number can be traced back
 to a run rather than to somebody's memory of one.
 
-### 10.3 Working with AI, not instead of it
+### 10.4 Working with AI, not instead of it
 
 Neither side of this project would have worked alone.
 
@@ -1315,7 +1369,7 @@ sweeping block shapes across every head size and number format, is more work tha
 It also suggested things I would not have reached for — the base-2 softmax, and classifying key
 tiles rather than testing every score, both came from that direction.
 
-**I supplied the judgement about what to keep.** Section 10.2 is the reason: AI is equally
+**I supplied the judgement about what to keep.** Section 10.3 is the reason: AI is equally
 confident when it is wrong, so someone has to decide what is actually true. That meant knowing
 which questions were worth measuring, recognising when an answer was too good to believe, and
 noticing when an explanation had been repeated so often that nobody had checked it. The three
