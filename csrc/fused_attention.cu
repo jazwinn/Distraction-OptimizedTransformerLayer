@@ -134,13 +134,32 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("bias"),
           pybind11::arg("tile") = kGemmTileAuto,
           pybind11::arg("math") = kGemmMathAuto);
+    m.def("linear_bias", &linear_bias,
+          "x @ weight^T + bias in one kernel; undefined tensor if unsupported. "
+          "out_half stores C as fp16, for a consumer that narrows anyway",
+          pybind11::arg("x"),
+          pybind11::arg("weight"),
+          pybind11::arg("bias"),
+          pybind11::arg("tile") = kGemmTileAuto,
+          pybind11::arg("math") = kGemmMathAuto,
+          pybind11::arg("out_half") = false);
     m.def("fused_add_layernorm", &fused_add_layernorm,
-          "Fused residual add + LayerNorm; returns {x + sub, norm(x + sub)}",
+          "Fused residual add + LayerNorm; returns {x + sub, norm(x + sub)}. "
+          "normed_half stores only the normalised output as fp16",
           pybind11::arg("x"),
           pybind11::arg("sub"),
           pybind11::arg("weight"),
           pybind11::arg("bias"),
-          pybind11::arg("eps") = 1e-5);
+          pybind11::arg("eps") = 1e-5,
+          pybind11::arg("normed_half") = false);
+    m.def("fused_layernorm", &fused_layernorm,
+          "Plain LayerNorm over the last dimension; the same kernels with the "
+          "residual add compiled out. out_half stores the result as fp16",
+          pybind11::arg("x"),
+          pybind11::arg("weight"),
+          pybind11::arg("bias"),
+          pybind11::arg("eps") = 1e-5,
+          pybind11::arg("out_half") = false);
     m.def("layernorm_set_block_threads",
           [](int threads) { layernorm_threads_override() = threads; },
           "Force fused_add_layernorm's block size, or 0 to restore the "
@@ -237,6 +256,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("wmma_softmax_mode",
           []() { return softmax_mode_flag(); },
           "Which softmax mode the wmma attention kernel is currently using");
+    m.def("wmma_set_cp_async",
+          [](int mode) { cp_async_mode() = mode; },
+          "Use cp.async for the attention kernel's K/V staging. Only takes "
+          "effect where the stored type already IS the compute type -- the "
+          "fp32-tensor path still narrows on the way in and cannot use an "
+          "async copy. Runtime-settable so both paths can be timed in one "
+          "process.",
+          pybind11::arg("mode"));
+    m.def("wmma_cp_async_mode", [] { return cp_async_mode(); },
+          "0 scalar staging, 1 cp.async, 2 cp.async double buffered");
     m.def("wmma_set_mask_classify",
           [](bool on) { mask_classify_flag() = on; },
           "Classify each key tile once and skip the per-element bounds, "

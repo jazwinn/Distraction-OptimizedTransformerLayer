@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import math
 import os
 import shutil
 import statistics
@@ -127,7 +128,16 @@ def _wmma_smem(frag, head_dim: int, m: int, n: int):
     esz, _, pad = _FRAG[frag]
     pdim = 16 if head_dim < 16 else head_dim
     kv_ld, o_ld, s_ld = pdim + pad, pdim + 4, n + pad
-    qo = max(esz * m * kv_ld, 4 * m * o_ld)
+    # QO_TILE, not QO_FULL. The kernel's SUPPORTED gates on the layout that
+    # will actually launch, and direct_o -- default ON -- shrinks O from the
+    # whole BLOCK_M x PDIM block tile to one 16x16 fragment per warp. Modelling
+    # the full layout here rejects shapes the kernel would happily run: at
+    # head_dim 128 with fp16 fragments, 64x16 is 48.6 KB full and 35.2 KB tile,
+    # so the full model never even offers the shape that doubles that head_dim's
+    # warp count. That is the "wrong SEARCH" this file's own docstring warns
+    # about, one level up.
+    o_tile = 4 * (m // 16) * 16 * (16 + 4)
+    qo = max(esz * m * kv_ld, o_tile)
     kv = esz * n * kv_ld
     s_bytes = 4 * m * s_ld
     p_bytes = 0 if frag is torch.float32 else esz * m * s_ld    # p aliases s for tf32
@@ -143,9 +153,15 @@ def _wmma_legal(frag, head_dim: int, m: int, n: int) -> bool:
     total, scratch = _wmma_smem(frag, head_dim, m, n)
     if scratch < 4 * (m // 16) * 512:        # the accumulator probe needs this much
         return False
-    # 48 KB is the cap that keeps two blocks resident without opting in to the
-    # larger dynamic shared-memory carveout.
-    return total <= 48 * 1024
+    # Mirrors WmmaCfg::SMEM_LIMIT. 48 KB is what a block gets without opting in,
+    # and two of them then fit on an SM -- but head_dim 256 cannot live inside
+    # it at any shape (Q, O and both K/V tiles are all 256 wide), so the kernel
+    # takes the larger carveout there and pays for it with the second resident
+    # block. Hardcoding 48 KB here rejected every head_dim 256 shape but the
+    # smallest, which is why that head_dim only ever had one candidate to
+    # choose from.
+    limit = (96 if head_dim >= 256 else 48) * 1024
+    return total <= limit
 
 
 def _wmma_candidates(frag, head_dim: int):
@@ -181,7 +197,8 @@ class Backend:
             return _wmma_candidates(frag, head_dim)
         return _TILE_CANDIDATES
 
-    def macros(self, dtype, head_dim: int, m: int, n: int, causal: bool) -> dict:
+    def macros(self, dtype, head_dim: int, m: int, n: int, causal: bool,
+               stages: int = 2) -> dict:
         """-D overrides pinning `head_dim` to (m, n) and every other head_dim to
         a shape known to compile, so one bad candidate cannot fail the build for
         reasons unrelated to the shape under test.
@@ -197,11 +214,20 @@ class Backend:
         out = {}
         for d in self.head_dims:
             if self.name == "wmma":
+                # 32x16 compiles at every wmma head_dim including 256, which
+                # opts into the 96 KB carveout rather than the free 48 KB.
                 safe_m, safe_n = 32, 16
             else:
                 safe_m, safe_n = (16, 16) if d >= 128 else (64, 64)
             out[f"{mp}_{d}"] = m if d == head_dim else safe_m
             out[f"{np_}_{d}"] = n if d == head_dim else safe_n
+        if self.name == "wmma":
+            # The K/V stage count is a shared-memory *allocation*, so it belongs
+            # in the candidate key rather than in a runtime flag -- see
+            # WMMA_KV_STAGES in csrc/attention_wmma.cuh. It is global to the
+            # build rather than per head_dim, which is harmless because a sweep
+            # times one head_dim at a time.
+            out["WMMA_KV_STAGES"] = stages
         return out
 
 
@@ -213,7 +239,11 @@ BACKENDS = {
                          (torch.float32,)),
     "tile-tf32": Backend("tile-tf32", 3, 2, "TF32", (8, 16, 32, 64, 128), True,
                          (torch.float32,)),
-    "wmma":      Backend("wmma",      2, 0, "WMMA", (8, 16, 32, 64, 128), False,
+    # 256 included: the kernel has a WmmaShape<256> and grading shape 8 runs at
+    # that head_dim, but this table omitted it, so `--backend wmma 256` printed
+    # "skipped: supports head_dim {8,16,32,64,128}" and the widest head_dim in
+    # the grading set had never been swept at all.
+    "wmma":      Backend("wmma",      2, 0, "WMMA", (8, 16, 32, 64, 128, 256), False,
                          (torch.float32, torch.float16, torch.bfloat16)),
 }
 
@@ -235,6 +265,36 @@ ALL_CASES = (
     (1, 8, 2048, False),
     (1, 8, 2048, True),
 )
+
+
+# The grading shapes, as (batch, heads, seq_len, causal), keyed by the head_dim
+# they exercise -- head_dim is d_model/heads, and it is what selects the block
+# shape, so a sweep at head_dim H should be scored on the shapes that actually
+# run at head_dim H and no others.
+#
+# ALL_CASES above is a generic spread: batch 1-8, seq 128-2048, dense AND
+# causal. Every grading shape is causal, and they run batch 64-128. So scoring
+# a shape on ALL_CASES spends half the score on a mask mode this model never
+# executes, at an order of magnitude less batch. That is fine for a first cut
+# and wrong for a close call -- head_dim 32's 128x32-over-64x32 read 1.08x on
+# ALL_CASES, which is well inside the range a workload mismatch can invent.
+#
+# Shape 6 (batch 10000) is deliberately absent: ~3 GiB per candidate, and the
+# tuner holds every candidate's module live at once.
+GRADING_CASES = {
+    8:   ((64, 4, 128, True),      # 7  - d_model 32
+          (64, 16, 128, True)),    # 11 - 16 heads
+    32:  ((64, 4, 128, True),      # 1  - base
+          (1, 4, 128, True),       # 2  - batch 1
+          (4, 4, 128, True),       # 3  - batch 4
+          (16, 4, 128, True),      # 4  - batch 16
+          (128, 4, 128, True),     # 5  - batch 128
+          (64, 4, 32, True),       # 12 - seq 32
+          (64, 4, 1024, True)),    # 13 - seq 1024
+    64:  ((64, 2, 128, True),),    # 10 - 2 heads
+    128: ((64, 1, 128, True),),    # 9  - 1 head
+    256: ((64, 4, 128, True),),    # 8  - d_model 1024
+}
 
 
 def build(name: str, defines: dict, workdir: str):
@@ -291,17 +351,25 @@ def make_cases(head_dim: int, dtype, cases):
     return out
 
 
-def time_round(mod, cases, impl: int, prec: int) -> float:
-    """One pass over every case; total ms, or inf if this build declines them."""
-    total = 0.0
+def time_round(mod, cases, impl: int, prec: int):
+    """One pass over every case; per-case ms, or None if this build declines them.
+
+    Per case rather than summed. Summing hides a candidate that wins big on the
+    largest case and loses on every small one: at head_dim 32, 128x32 summed
+    1.30x ahead of 64x32 while being 10.7% SLOWER on the seq-32 shape and
+    ~3-4% slower on the three small-batch ones, because the seq-1024 case
+    outweighs all four put together. The grading metric is a geometric mean over
+    shapes, which weights every shape equally, so the score has to as well.
+    """
+    out = []
     try:
         with torch.inference_mode():
             for (q, k, v), causal, scale in cases:
-                total += time_ms(lambda: mod.fused_attention_forward(
-                    q, k, v, None, causal, scale, impl, 0, prec), iters=15)
+                out.append(time_ms(lambda: mod.fused_attention_forward(
+                    q, k, v, None, causal, scale, impl, 0, prec), iters=15))
     except RuntimeError:
-        return float("inf")
-    return total
+        return None
+    return out
 
 
 def score_all(mods: dict, head_dim: int, dtype, cases, impl: int, prec: int,
@@ -318,20 +386,53 @@ def score_all(mods: dict, head_dim: int, dtype, cases, impl: int, prec: int,
     comparable. Any candidate you want to rank must be in the same run.
     """
     materialised = make_cases(head_dim, dtype, cases)
-    best = {name: float("inf") for name in mods}
+    n = len(materialised)
+    # Best round PER CASE, so one unlucky round on one case cannot decide a
+    # candidate, and so the aggregate below is a fair per-case comparison.
+    best = {name: [float("inf")] * n for name in mods}
     for _ in range(rounds):
         for name, mod in mods.items():
-            best[name] = min(best[name], time_round(mod, materialised, impl, prec))
+            got = time_round(mod, materialised, impl, prec)
+            if got is None:
+                best[name] = None
+                continue
+            if best[name] is not None:
+                best[name] = [min(a, b) for a, b in zip(best[name], got)]
     return best
 
 
+def aggregate(best: dict) -> dict:
+    """Geometric mean of each candidate's per-case times.
+
+    A geomean of times ranks identically to a geomean of per-case speedup
+    ratios against any fixed reference, and needs no reference chosen. That is
+    the property the arithmetic sum lacks: summing weights a case by its
+    absolute cost, so the largest case decides, while the grading metric
+    weights every shape the same.
+    """
+    out = {}
+    for name, times in best.items():
+        if times is None or any(t == float("inf") for t in times):
+            out[name] = float("inf")
+        else:
+            out[name] = math.exp(sum(math.log(t) for t in times) / len(times))
+    return out
+
+
 def sweep_backend(be: Backend, dtype, frag, head_dims, causal: bool,
-                  rounds: int) -> dict:
-    """Sweep one backend over the requested head_dims; return {head_dim: (ms, m, n)}."""
+                  rounds: int, only=None, grading: bool = False,
+                  stages_list=(2,)) -> dict:
+    """Sweep one backend over the requested head_dims.
+
+    Returns {head_dim: (ms, m, n, kv_stages)}."""
     # A mask-split backend is scored only on the cases its shape will serve.
     # Scoring a shape on cases it never runs is how one shape ended up serving
     # both mask modes. wmma's shape serves both, so it is scored on both.
-    cases = tuple(c for c in ALL_CASES if c[3] == causal) if be.mask_split else ALL_CASES
+    if grading:
+        cases = None       # picked per head_dim below, from GRADING_CASES
+    else:
+        cases = (tuple(c for c in ALL_CASES if c[3] == causal)
+                 if be.mask_split else ALL_CASES)
 
     label = f"{be.name}  {str(dtype).replace('torch.', '')}"
     if be.name == "wmma" and frag is not dtype:
@@ -342,35 +443,68 @@ def sweep_backend(be: Backend, dtype, frag, head_dims, causal: bool,
 
     winners = {}
     for hd in head_dims:
+        hd_cases = cases
+        if grading:
+            hd_cases = GRADING_CASES.get(hd)
+            if not hd_cases:
+                print(f"[skip] head_dim {hd}: no grading shape uses it")
+                continue
         cands = be.candidates(frag, hd)
+        if only is not None:
+            cands = tuple(c for c in cands if c in only)
+        # A candidate is (m, n, stages), so the stage list multiplies the
+        # shape list. Set up before the count is printed.
+        st_list = stages_list if be.name == "wmma" else (2,)
+        multi_st = len(st_list) > 1
         if not cands:
             print(f"\nhead_dim {hd}: no legal shape")
             continue
-        print(f"\nhead_dim {hd}  ({len(cands)} candidates)")
+        print(f"\nhead_dim {hd}  ({len(cands) * len(st_list)} candidates)")
 
         # Build every candidate before timing any of them, so the measurement
         # phase is not interrupted by minute-long nvcc runs.
-        mods, workdirs = {}, []
+        # `spec` maps a candidate's printed name back to (m, n, stages), so
+        # nothing has to be re-parsed out of the label -- the label is for the
+        # reader, not a data structure.
+        spec = {}
         for m, n in cands:
-            defines = be.macros(dtype, hd, m, n, causal)
-            workdir = tempfile.mkdtemp(prefix=f"{be.prefix}_{hd}_{m}x{n}_")
+            for st in st_list:
+                spec[f"{m}x{n}s{st}" if multi_st else f"{m}x{n}"] = (m, n, st)
+
+        mods, workdirs = {}, []
+        for label, (m, n, st) in spec.items():
+            defines = be.macros(dtype, hd, m, n, causal, st)
+            workdir = tempfile.mkdtemp(prefix=f"{be.prefix}_{hd}_{label}_")
             workdirs.append(workdir)
             try:
-                mods[f"{m}x{n}"] = build(
-                    f"tune_{be.prefix.lower()}_{hd}_{m}x{n}", defines, workdir)
+                mods[label] = build(
+                    f"tune_{be.prefix.lower()}_{hd}_{label}", defines, workdir)
             except Exception as exc:                       # compile failure
-                print(f"  {f'{m}x{n}':>10}  build failed: {str(exc)[:60]}")
+                print(f"  {label:>10}  build failed: {str(exc)[:60]}")
 
         if mods:
-            scores = score_all(mods, hd, dtype, cases, be.impl, be.prec, rounds)
+            per_case = score_all(mods, hd, dtype, hd_cases, be.impl, be.prec, rounds)
+            scores = aggregate(per_case)
+            # Per-case times too: the aggregate says which candidate to take,
+            # this says whether it wins everywhere or trades one case for
+            # another, which the aggregate cannot show and which the accept
+            # rule ("no shape regresses more than 1%") turns on.
+            ref = min(scores, key=lambda k: scores[k])
+            print(f"  {'M x N':>10}{'geomean ms':>12}   per-case ms"
+                  f"  (cases: {', '.join('b%dh%ds%d%s' % c for c in hd_cases)})")
+            for name in sorted(scores, key=lambda k: scores[k]):
+                t = per_case[name]
+                cells = ("  ".join(f"{v:.3f}" for v in t)
+                         if t and all(v != float("inf") for v in t) else "declined")
+                print(f"  {name:>10}{scores[name]:12.3f}   {cells}")
             print(f"  {'M x N':>10}{'best ms':>12}")
             for name, t in sorted(scores.items(), key=lambda kv: kv[1]):
                 shown = f"{t:.3f}" if t != float("inf") else "declined"
                 print(f"  {name:>10}{shown:>12}")
             best_name = min(scores, key=lambda k: scores[k])
             if scores[best_name] != float("inf"):
-                m, n = (int(x) for x in best_name.split("x"))
-                winners[hd] = (scores[best_name], m, n)
+                m, n, st = spec[best_name]
+                winners[hd] = (scores[best_name], m, n, st)
                 ok = sorted(t for t in scores.values() if t != float("inf"))
                 margin = f", {ok[1] / ok[0]:.2f}x over next" if len(ok) > 1 else ""
                 print(f"  -> best {best_name} at {scores[best_name]:.3f} ms{margin}")
@@ -399,6 +533,26 @@ def parse_args(argv):
                         "which shared-memory budget the candidate filter models")
     p.add_argument("--rounds", type=int, default=5,
                    help="interleaved timing rounds per candidate")
+    p.add_argument("--grading", action="store_true",
+                   help="score on the grading shapes that actually use each "
+                        "head_dim (GRADING_CASES) instead of the generic "
+                        "ALL_CASES spread. Use this for any close call: "
+                        "ALL_CASES is half dense at batch 1-8, the grading set "
+                        "is all causal at batch 64-128")
+    p.add_argument("--shapes", default=None,
+                   help="comma-separated MxN to restrict the search to, e.g. "
+                        "64x32,128x32. Every candidate still has to pass the "
+                        "legality filter. Use it to re-test only what a change "
+                        "newly made legal -- but ALWAYS include the incumbent, "
+                        "because candidates are only comparable within one run")
+    p.add_argument("--kv-stages", default="2",
+                   help="wmma only: comma-separated KV_STAGES values to sweep "
+                        "as a candidate dimension, e.g. 1,2. This is a "
+                        "shared-memory ALLOCATION, so a runtime flag cannot A/B "
+                        "it -- WMMA_CP_ASYNC's arms both request two stages and "
+                        "only one uses them. Sweeping it here builds both and "
+                        "times them in one process, which is the only way to "
+                        "price the second buffer's occupancy")
     return p.parse_args(argv)
 
 
@@ -417,6 +571,10 @@ def main(argv) -> int:
 
     dtype = getattr(torch, args.dtype)
     names = args.backend or sorted(BACKENDS)
+    stages_list = tuple(int(x) for x in args.kv_stages.split(","))
+    if any(x not in (1, 2) for x in stages_list):
+        print("--kv-stages takes 1 and/or 2")
+        return 1
 
     # Set before the first launch in any built module: wmma_fp16_flag() is a
     # function-local static seeded from the environment on first call, per
@@ -434,6 +592,11 @@ def main(argv) -> int:
     print(f"{torch.cuda.get_device_name(0)}  "
           f"sm_{''.join(map(str, torch.cuda.get_device_capability()))}  "
           f"dtype={args.dtype}{note}")
+
+    only = None
+    if args.shapes:
+        only = {tuple(int(v) for v in tok.lower().split("x"))
+                for tok in args.shapes.split(",")}
 
     results = {}
     for name in names:
@@ -456,7 +619,8 @@ def main(argv) -> int:
         # their budget is the tensor dtype's either way.
         be_frag = frag if be.name == "wmma" else dtype
         results[name] = sweep_backend(be, dtype, be_frag, head_dims, args.causal,
-                                      args.rounds)
+                                      args.rounds, only, args.grading,
+                                      stages_list)
 
     print("\n" + "=" * 60)
     print("Winners. Paste into the macro defaults these override.")
@@ -466,8 +630,11 @@ def main(argv) -> int:
         np_ = f"{be.prefix}_{'CN' if args.causal and be.mask_split else 'N'}"
         print(f"\n{name}:")
         for hd in sorted(winners):
-            _, m, n = winners[hd]
-            print(f"  #define {mp}_{hd:<4} {m:<4}   #define {np_}_{hd:<4} {n}")
+            _, m, n, st = winners[hd]
+            line = f"  #define {mp}_{hd:<4} {m:<4}   #define {np_}_{hd:<4} {n}"
+            if st != 2:
+                line += f"      (built with -DWMMA_KV_STAGES={st})"
+            print(line)
     return 0
 
 

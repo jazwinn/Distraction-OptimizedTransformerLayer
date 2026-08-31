@@ -61,6 +61,48 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
              "(for measurement), 'off' cuBLAS plus a separate GELU",
     )
     parser.add_argument(
+        "--linear-bias",
+        choices=("auto", "tf32", "off"),
+        default=None,
+        help="override LINEAR_BIAS for this run only: run the projections "
+             "with no activation -- QKV, out_proj, ffn_out -- on the custom "
+             "GEMM. 'auto' uses fp16 fragments, 'tf32' the same kernel at "
+             "half the tensor-core rate (for measurement), 'off' cuBLAS",
+    )
+    parser.add_argument(
+        "--layernorm",
+        choices=("auto", "off"),
+        default=None,
+        help="override LAYERNORM for this run only: run the model's entry "
+             "LayerNorm -- the only one with no residual add to fuse into -- "
+             "on the custom kernel. 'off' is F.layer_norm",
+    )
+    parser.add_argument(
+        "--qkv-fp16",
+        choices=("auto", "off"),
+        default=None,
+        help="override QKV_FP16 for this run only: write the QKV projection's "
+             "output in fp16, which is what the attention kernel narrows it to "
+             "anyway. 'off' keeps fp32",
+    )
+    parser.add_argument(
+        "--normed-fp16",
+        choices=("auto", "off"),
+        default=None,
+        help="override NORMED_FP16 for this run only: store a LayerNorm's "
+             "normalised output as fp16 where the QKV projection consumes it. "
+             "The residual stream and the model's final norm are never "
+             "narrowed. 'off' keeps fp32",
+    )
+    parser.add_argument(
+        "--cp-async",
+        choices=("auto", "sync", "off"),
+        default=None,
+        help="override CP_ASYNC for this run only: stage the attention "
+             "kernel's K/V tiles with cp.async instead of a scalar "
+             "global->register->shared copy. Only affects the fp16 path",
+    )
+    parser.add_argument(
         "--cuda-graph",
         choices=("off", "auto", "always"),
         default=None,
@@ -80,6 +122,16 @@ def apply_overrides(args: argparse.Namespace) -> None:
         config.ATTENTION_PRECISION = args.attn_precision
     if args.linear_gelu is not None:
         config.LINEAR_GELU = args.linear_gelu
+    if args.linear_bias is not None:
+        config.LINEAR_BIAS = args.linear_bias
+    if args.layernorm is not None:
+        config.LAYERNORM = args.layernorm
+    if args.qkv_fp16 is not None:
+        config.QKV_FP16 = args.qkv_fp16
+    if args.normed_fp16 is not None:
+        config.NORMED_FP16 = args.normed_fp16
+    if args.cp_async is not None:
+        config.CP_ASYNC = args.cp_async
     if args.cuda_graph is not None:
         config.CUDA_GRAPH = args.cuda_graph
 

@@ -12,8 +12,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .kernels import (_add_layernorm, _attention_dispatch, _ffn_block,
-                      _linear_gelu)
+from . import config
+from .kernels import (_add_layernorm, _attention_dispatch,
+                      _attention_wants_fp16, _ffn_block, _layernorm,
+                      _gelu_input_wants_fp16, _linear_bias, _linear_gelu,
+                      _normed_wants_fp16)
 from .util import _version_or_none
 
 
@@ -27,7 +30,11 @@ class MyLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # ====================== your codes here ======================
-        return F.linear(x, self.weight, self.bias)
+        # Reached by out_proj and ffn_out only. q/k/v_proj hold weights that
+        # _get_qkv_weight concatenates and never call this, and ffn_in is read
+        # by _linear_gelu straight off the module -- so this one line covers
+        # both of the model's activation-free projections and nothing else.
+        return _linear_bias(x, self.weight, self.bias)
         # ============================================================
 
 
@@ -42,7 +49,15 @@ class MyLayerNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # ====================== your codes here ======================
-        return F.layer_norm(x, (x.shape[-1],), self.weight, self.bias, self.eps)
+        # Reached only by the model's very first norm. Every other LayerNorm
+        # here consumes a residual add and is fused into it by _add_layernorm,
+        # so it never comes through this method.
+        #
+        # Its consumer is block 0's QKV projection, so it can carry fp16 on the
+        # same terms as any other QKV input.
+        rows = x.numel() // x.shape[-1]
+        return _layernorm(
+            x, self, out_half=_normed_wants_fp16(rows, x.shape[-1]))
         # ============================================================
 
 
@@ -115,7 +130,22 @@ class MySelfAttention(nn.Module):
         # three results are non-contiguous views, exactly as .transpose(1, 2)
         # left them, so nothing downstream sees a new layout.
         qkv_w, qkv_b = self._get_qkv_weight()
-        qkv = F.linear(x, qkv_w, qkv_b)  # [B, S, 3*d_model]
+        # fp16 when the kernel is going to narrow these anyway, which halves
+        # both this GEMM's write and attention's read of it. Bit-identical --
+        # the same __float2half, one global round trip earlier. See
+        # config.QKV_FP16.
+        # Both bounds matter, and for different reasons. Below the lower one the
+        # bandwidth saving is smaller than the fp16 read path's extra ALU.
+        # Above the UPPER one -- _LINEAR_BIAS_MAX_ROWS, shape 6 -- the custom
+        # GEMM declines the shape entirely, so asking for fp16 would buy a
+        # standalone fp32->fp16 conversion pass instead of a free epilogue: an
+        # extra launch and 18 MB of traffic to save 6. fp16 out is only free
+        # when the kernel is the thing producing it.
+        rows = x.shape[0] * x.shape[1]
+        want_half = (_attention_wants_fp16()
+                     and config._QKV_FP16_MIN_ROWS <= rows
+                     <= config._LINEAR_BIAS_MAX_ROWS)
+        qkv = _linear_bias(x, qkv_w, qkv_b, out_half=want_half)  # [B, S, 3*d]
         q, k, v = (
             qkv.view(batch, seq_len, 3, self.num_heads, self.head_dim)
             .permute(2, 0, 3, 1, 4)      # [3, B, H, S, head_dim]
@@ -180,6 +210,7 @@ class MyTransformerBlock(nn.Module):
         next_norm: "MyLayerNorm",
         valid_token_mask: Optional[torch.Tensor] = None,
         mask_is_trivial: bool = False,
+        next_norm_is_output: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Returns (residual stream, next_norm applied to it).
 
@@ -202,7 +233,14 @@ class MyTransformerBlock(nn.Module):
             if fused is not None:
                 return fused
 
-        x, normed = _add_layernorm(x, attn_out, self.norm2)
+        # norm2's output is consumed by linear_gelu, which narrows A to fp16
+        # when staging under fp16 fragments -- so it can carry fp16 on the same
+        # terms as the QKV edges. Its own consumer's fragment type matters here
+        # in a way it did not for QKV; see _gelu_input_wants_fp16.
+        rows = x.numel() // x.shape[-1]
+        x, normed = _add_layernorm(
+            x, attn_out, self.norm2,
+            normed_half=_gelu_input_wants_fp16(rows, x.shape[-1]))
 
         ffn_out = self.ffn_out(_linear_gelu(normed, self.ffn_in))
 
@@ -213,5 +251,12 @@ class MyTransformerBlock(nn.Module):
             x = (x + ffn_out).masked_fill(~valid_token_mask[..., None], 0)
             return x, next_norm(x)
 
-        return _add_layernorm(x, ffn_out, next_norm)
+        # next_norm's output feeds the NEXT block's QKV projection, so it can
+        # be fp16 -- unless this is the last block, where next_norm is
+        # final_norm and its output IS the model's output. The caller knows
+        # which; the block cannot see past itself.
+        trailing_half = (not next_norm_is_output
+                         and _normed_wants_fp16(x.numel() // x.shape[-1],
+                                                x.shape[-1]))
+        return _add_layernorm(x, ffn_out, next_norm, normed_half=trailing_half)
         # ============================================================

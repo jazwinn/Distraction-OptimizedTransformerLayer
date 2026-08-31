@@ -130,7 +130,10 @@ class OptimizedTransformer(nn.Module):
         for index, layer in enumerate(self.layers):
             next_norm = self.final_norm if index == last else self.layers[index + 1].norm1
             x, normed = layer(
-                x, normed, next_norm, valid_token_mask, not use_mask
+                x, normed, next_norm, valid_token_mask, not use_mask,
+                # The last block's next_norm is final_norm, whose output this
+                # function returns -- so that one may not be narrowed.
+                index == last,
             )
 
         # The last block folded final_norm into its trailing add, so `normed` is

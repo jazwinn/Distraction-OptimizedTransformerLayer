@@ -17,23 +17,23 @@ from matplotlib.patches import PathPatch
 
 # shape number, short description, speedup vs baseline
 SHAPES = [
-    (1, "base", 4.41),
-    (2, "batch 1", 39.67),
-    (3, "batch 4", 23.37),
-    (4, "batch 16", 9.86),
-    (5, "batch 128", 4.35),
-    (6, "batch 10000", 6.53),
-    (7, "d_model 32", 13.63),
-    (8, "d_model 1024", 1.41),
-    (9, "1 head", 2.36),
-    (10, "2 heads", 3.14),
-    (11, "16 heads", 8.93),
-    (12, "seq 32", 11.00),
-    (13, "seq 1024", 15.14),
-    (14, "seq 100000", 22.84),
+    (1, "base", 5.20),
+    (2, "batch 1", 33.68),
+    (3, "batch 4", 46.93),
+    (4, "batch 16", 24.82),
+    (5, "batch 128", 6.00),
+    (6, "batch 10000", 1.52),
+    (7, "d_model 32", 16.83),
+    (8, "d_model 1024", 1.80),
+    (9, "1 head", 3.40),
+    (10, "2 heads", 4.84),
+    (11, "16 heads", 12.58),
+    (12, "seq 32", 28.47),
+    (13, "seq 1024", 21.20),
+    (14, "seq 100000", 14.92),
 ]
 
-GEOMEAN = 8.13
+GEOMEAN = 10.04
 
 SURFACE = "#fcfcfb"
 INK = "#0b0b0b"
@@ -44,7 +44,7 @@ BASELINE = "#c3c2b7"
 SERIES = "#2a78d6"
 
 DPI = 200
-X_MAX = 44.0
+X_MAX = 52.0
 
 
 def rounded_end_bar(ax, y, width, height, radius, **kw):
@@ -161,7 +161,7 @@ def main():
         )
 
     ax.set_xlim(0, X_MAX)
-    ax.set_xticks([0, 5, 10, 15, 20, 25, 30, 35, 40])
+    ax.set_xticks([0, 10, 20, 30, 40, 50])
     ax.tick_params(axis="x", labelsize=8.5, colors=MUTED, length=0)
     ax.tick_params(axis="y", length=0)
     for lbl in ax.get_yticklabels():

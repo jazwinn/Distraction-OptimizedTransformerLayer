@@ -35,6 +35,8 @@
 
 #include "kernel_common.cuh"
 
+#include <cuda_pipeline.h>
+
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp16.h>
@@ -189,6 +191,48 @@ __device__ __forceinline__ float attn_exp(float x) {
 #define WMMA_M_16  64
 #define WMMA_N_16  32
 #endif
+// head_dim 32 stays at 64x32, and 128x32 -- which SUPPORTED now admits, and
+// which the tuner picks -- is REJECTED. It is not a wash, it is a size split:
+//
+//   shape 13 (seq 1024)   11.988 -> 10.977 ms   -8.4%
+//   shape  6 (batch 10k)  2134.1 -> 1736.7 ms
+//   shape  1, 5                            both faster
+//   shape 12 (seq 32)     0.2478 -> 0.2744 ms  +10.7%
+//   shape  2 (batch 1)    0.1178 -> 0.1229 ms   +4.3%
+//   shape  3, 4                            both ~+2.7%
+//
+// BLOCK_M is the query rows a block owns, so 128 of them against shape 12's
+// seq_len of 32 is a block doing a quarter of a tile's worth of work, and
+// against shape 2 it collapses the grid to ceil(128/128) * 4 heads * 1 batch =
+// 4 blocks on a 46-SM card. Where there is enough work to fill the machine the
+// taller block wins clearly; where there is not, it starves it.
+//
+// The tuner said 1.30x for it even on --grading cases because it scores the
+// SUM of milliseconds across cases, and shape 13 alone outweighs 2, 3, 4 and 12
+// put together. A geometric mean of per-case ratios -- which is what the
+// grading metric actually is -- says otherwise. See score_all().
+//
+// The real fix is a runtime choice between two instantiations keyed on block
+// count, not a different constant here; logged as an open candidate.
+// Online softmax in the accumulator registers instead of through `s_s`.
+// Compile-time because the prize is an *allocation* -- deleting `s_s` is what
+// frees 10.00 KB at head_dim 32 and takes it from 2 resident blocks per SM to 4
+// -- and row 12 of docs/OPTIMIZATION_LEDGER.md established that a runtime flag
+// cannot measure an allocation. Swept by scripts/tune_block_shapes.py.
+//
+// Requires the acc_row_of/acc_col_of formulas, which the probed mapping cannot
+// substitute for: the reduction needs shuffle offsets known at compile time.
+#ifndef WMMA_REG_SOFTMAX
+#define WMMA_REG_SOFTMAX 1
+#endif
+
+// Compile-time cap on WmmaCfg::KV_STAGES; see the note there. 2 is the kernel's
+// own default and 1 builds the single-buffered form, which is what makes the
+// second K/V stage's shared memory measurable instead of merely arguable.
+#ifndef WMMA_KV_STAGES
+#define WMMA_KV_STAGES 2
+#endif
+
 #ifndef WMMA_M_32
 #define WMMA_M_32  64
 #define WMMA_N_32  32
@@ -197,8 +241,16 @@ __device__ __forceinline__ float attn_exp(float x) {
 #define WMMA_M_64  64
 #define WMMA_N_64  16
 #endif
+// head_dim 128 was 32x16 -- two warps, 4 of an SM's 48 -- not because that was
+// the fastest shape but because it was the tallest one SUPPORTED would admit.
+// That gate asked whether the FULL O layout fit, and 64x16 is 48.6 KB there
+// against the free 48 KB. It is 35.2 KB under the tile layout that direct_o
+// actually launches, so deleting o_s had already paid for the taller block and
+// the shape table was simply not allowed to spend it. Re-swept once SUPPORTED
+// asked about the launchable layout instead: 64x16 at 2.412 ms against 32x16's
+// 3.704, 1.54x, the largest margin in the sweep.
 #ifndef WMMA_M_128
-#define WMMA_M_128 32
+#define WMMA_M_128 64
 #define WMMA_N_128 16
 #endif
 // head_dim 256 is the one shape that does not fit in the free 48 KB at all:
@@ -225,6 +277,26 @@ __device__ __forceinline__ float attn_exp(float x) {
 // hence half the K/V passes over global memory -- the same reason a taller
 // block wins at every other head_dim.
 //
+// That table only ever contained three shapes because nothing taller could be
+// BUILT. scripts/tune_block_shapes.py ended its legality test with a hardcoded
+// `total <= 48 * 1024` while this kernel takes the 96 KB carveout at head_dim
+// 256, so every 64-row shape was filtered out before it was compiled and this
+// head_dim had exactly one legal candidate: its own incumbent. A search space
+// of one always agrees with you.
+//
+// With the limit corrected, on grading shape 8's own dimensions (b64 h4 s128
+// causal, the only head_dim 256 shape in the set):
+//
+//   64x32   0.565 ms      <- 1.285x over the incumbent
+//   64x16   0.588 ms
+//   32x16   0.726 ms      <- what the three-shape table had chosen
+//   32x32   1.256 ms
+//
+// Taking the argument above one step further than it could previously be
+// taken: 64x32 halves the blocks again. It needs 81.8 KB, so FULL_O_FITS is
+// false and the launcher forces direct_o on -- which is exactly the mechanism
+// that makes the shape available at all.
+//
 // 16x32 loses everywhere, which is the head_dim 128 result again (see the
 // WmmaShape note above): a wider key tile doubles the staging without adding
 // parallelism, and Q is register-resident so there is nothing for it to buy.
@@ -233,8 +305,8 @@ __device__ __forceinline__ float attn_exp(float x) {
 // see wmma_preferred_by_auto in attention_dispatch.cuh -- and this table is
 // about being the best forced `--attn-impl wmma`, not about winning.
 #ifndef WMMA_M_256
-#define WMMA_M_256 32
-#define WMMA_N_256 16
+#define WMMA_M_256 64
+#define WMMA_N_256 32
 #endif
 
 // The primary template keeps the 64x32 general case for any head_dim the
@@ -268,7 +340,14 @@ struct WmmaCfg {
 
     static constexpr int WK = FragTraits<scalar_t>::K;
     static constexpr int PAD = FragTraits<scalar_t>::LD_PAD;
-    static constexpr bool P_ALIASES_S = std::is_same<scalar_t, float>::value;
+    // With the register softmax there is no `s_s` for P to alias, so P always
+    // gets its own space. For fp16 that is a straight 10.00 KB saving at
+    // head_dim 32 (S_BYTES goes, P_BYTES was already separate); for tf32, where
+    // P used to live inside S, it is a wash -- which is fine, the model runs
+    // fp16 and the tf32 path exists for comparison.
+    static constexpr bool REG_SOFTMAX = (WMMA_REG_SOFTMAX != 0);
+    static constexpr bool P_ALIASES_S =
+        std::is_same<scalar_t, float>::value && !REG_SOFTMAX;
 
     static constexpr int KV_LD = PDIM + PAD;       // k_s, v_s, and Q staging
     static constexpr int O_LD  = PDIM + 4;         // o_s is always fp32
@@ -299,7 +378,8 @@ struct WmmaCfg {
     static constexpr size_t QO_TILE =
         (Q_BYTES > O_TILE_BYTES) ? Q_BYTES : O_TILE_BYTES;
     static constexpr size_t KV_BYTES  = sizeof(scalar_t) * BLOCK_N * KV_LD;
-    static constexpr size_t S_BYTES   = sizeof(float) * BLOCK_M * S_LD;
+    static constexpr size_t S_BYTES   =
+        REG_SOFTMAX ? 0 : (sizeof(float) * BLOCK_M * S_LD);
     static constexpr size_t P_BYTES   = P_ALIASES_S ? 0 : sizeof(scalar_t) * BLOCK_M * S_LD;
     static constexpr size_t ROW_BYTES = sizeof(float) * BLOCK_M;
 
@@ -316,6 +396,7 @@ struct WmmaCfg {
     static constexpr size_t SMEM      = QO_FULL + TAIL_BYTES;
     static constexpr size_t SMEM_TILE = QO_TILE + TAIL_BYTES;
 
+
     // The accumulator probe below needs 512 floats of scratch per warp. It runs
     // after Q has been hoisted into registers and before the first K/V tile is
     // staged, so the whole O/K/V/S span is dead and can host it -- but that
@@ -323,6 +404,20 @@ struct WmmaCfg {
     static constexpr size_t PROBE_BYTES = sizeof(float) * WARPS * 512;
     // Sized on the SMALLER O layout, so the probe fits whichever one is live.
     static constexpr size_t SCRATCH_BYTES = QO_TILE + 2 * KV_BYTES + S_BYTES;
+
+    // Whether the probe fits at all. It stopped always fitting at iteration 19:
+    // `s_s` was 20.00 KB of the scratch span at BLOCK_M 128 / BLOCK_N 32, and
+    // REG_SOFTMAX deletes it, which drops SCRATCH_BYTES to 15.00 KB against the
+    // 16.00 KB eight warps need. That silently un-admitted 128x32 -- a shape
+    // SUPPORTED had accepted since iteration 4.
+    //
+    // Under REG_SOFTMAX the probe is not merely redundant, it is incompatible:
+    // the softmax is written against acc_row_of() directly (the T_OF table), so
+    // a probed mapping that disagreed with the closed form would leave the
+    // softmax and the O rescale indexing different rows. The formula is
+    // load-bearing there whether the probe runs or not, which is why
+    // REG_SOFTMAX may waive this requirement rather than merely tolerate it.
+    static constexpr bool PROBE_FITS = (SCRATCH_BYTES >= PROBE_BYTES);
 
     // Whether causal blocks are worth dispatching longest-first. Per head_dim
     // for the same reason WmmaShape is: head_dim 128 runs a 32x16 block of two
@@ -353,7 +448,63 @@ struct WmmaCfg {
     // failing the launch itself several frames later.
     static constexpr size_t SMEM_FREE  = 48 * 1024;
     static constexpr size_t SMEM_LIMIT = (HEAD_DIM >= 256) ? (96 * 1024) : SMEM_FREE;
-    static constexpr bool NEEDS_CARVEOUT = (SMEM > SMEM_FREE);
+
+
+    // Whether the FULL O layout -- and therefore WMMA_DIRECT_O=0 -- is
+    // available at this shape. SUPPORTED asks only that the TILE layout fits,
+    // because that is the one the default configuration launches; a shape whose
+    // full layout would overflow is still perfectly runnable, it simply cannot
+    // have the direct-to-global epilogue turned off. The launcher forces
+    // direct_o on for those rather than launching a request for more shared
+    // memory than the device will grant.
+    //
+    // This distinction is worth block-shape headroom, which is the whole point
+    // of it. At head_dim 128 with fp16 fragments, 64x16 is 48.6 KB under the
+    // full layout -- rejected -- and 35.2 KB under the tile layout. Gating on
+    // the full layout meant deleting o_s bought occupancy the shape table was
+    // then forbidden from spending: head_dim 128 stayed at 32x16, two warps,
+    // 4 of an SM's 48.
+    // K/V stages. Two lets the cp.async copy for the next key tile fly while
+    // the current one is being contracted; one is the copy-then-wait shape.
+    // A second pair costs 2 * KV_BYTES, which every head_dim here can afford
+    // except 256 -- its tiles are 256 wide, so at 64x32 two stages want
+    // 114.8 KB against a 96 KB carveout. That head_dim keeps one stage and
+    // still gets cp.async, just without the overlap.
+    //
+    // Declared HERE, above FULL_O_FITS, because CARVEOUT_BYTES has to know
+    // whether the extra stage is being asked for. Requesting it
+    // unconditionally would push head_dim 256 to 114.8 KB and the carveout
+    // would be refused at launch.
+    // DIM == PDIM is part of the decision, not just of whether the fast path
+    // runs. At head_dim 8, PDIM pads to 16 and the staging must zero-fill the
+    // padded columns, so neither cp.async nor double buffering ever engages --
+    // but a second stage would still be REQUESTED, and shared memory requested
+    // is shared memory spent. 23.8 KB -> 26.8 KB took head_dim 8 from 4
+    // resident blocks per SM to 3 and cost grading shapes 7 and 11 about 5%
+    // each, for a buffer neither of them can use.
+    //
+    // WMMA_KV_STAGES caps this at build time so the *allocation* can be A/B'd,
+    // not just the code path. WMMA_CP_ASYNC is a runtime flag and KV_STAGES is
+    // constexpr, so both arms of a cp_async_mode A/B request two stages' worth
+    // of shared memory and only one of them uses it -- that A/B prices the
+    // overlap and is blind to the occupancy the second buffer costs. Build with
+    // -DWMMA_KV_STAGES=1 to get a kernel that never asks for it.
+    static constexpr int KV_STAGES =
+        ((WMMA_KV_STAGES >= 2) && (DIM == PDIM) &&
+         (SMEM_TILE + 2 * KV_BYTES <= SMEM_LIMIT)) ? 2 : 1;
+    static constexpr size_t KV_SPAN = KV_STAGES * KV_BYTES;
+    static constexpr size_t STAGE_EXTRA = (KV_STAGES == 2) ? (2 * KV_BYTES) : 0;
+
+    static constexpr bool FULL_O_FITS = (SMEM <= SMEM_LIMIT);
+
+    // The opt-in has to cover the largest layout that can actually launch, and
+    // no more: a carveout is taken out of the same 100 KB the SM splits with
+    // L1, so asking for the full layout at a shape that will only ever run the
+    // tile one costs resident blocks for nothing.
+    static constexpr size_t CARVEOUT_BYTES =
+        (FULL_O_FITS ? SMEM : SMEM_TILE) + STAGE_EXTRA;
+    static constexpr bool NEEDS_CARVEOUT = (CARVEOUT_BYTES > SMEM_FREE);
+
 
     // GEMM1 contracts over the padded head_dim, GEMM2 over the key tile; both
     // must be a whole number of fragments.
@@ -361,7 +512,7 @@ struct WmmaCfg {
         FragTraits<scalar_t>::supported &&
         (PDIM % WK == 0) && (PDIM % 16 == 0) &&
         (BLOCK_N % WK == 0) && (BLOCK_M % 16 == 0) &&
-        (SCRATCH_BYTES >= PROBE_BYTES) && (SMEM <= SMEM_LIMIT);
+        (PROBE_FITS || REG_SOFTMAX) && (SMEM_TILE <= SMEM_LIMIT);
 };
 
 // Runtime off switch for the causal block-index reversal below, so the two
@@ -475,6 +626,29 @@ bool& direct_o_flag() {
         return !(e != nullptr && e[0] == '0');
     }();
     return on;
+}
+
+// cp.async for the K/V staging. On by default; off restores the scalar
+// global->register->shared path so the two can be timed in one process.
+//
+// This was blocked until q/k/v became fp16 IN GLOBAL MEMORY (see
+// optimized/config.py, QKV_FP16). cp.async copies bytes global->shared without
+// passing through registers, and therefore cannot convert -- so while the
+// kernel was handed fp32 tensors and contracted them as __half, the narrowing
+// on the staging path made an async copy impossible. Once the tensor is already
+// the compute type the copy is a pure move and cp.async is legal.
+// 0 = scalar staging, 1 = cp.async single-buffered, 2 = cp.async double
+// buffered. Three values rather than a bool because the two links of the chain
+// are separate results and have to be timeable against each other in one
+// process: 0->1 is the register bypass, 1->2 is the overlap.
+int& cp_async_mode() {
+    static int mode = [] {
+        const char* e = std::getenv("WMMA_CP_ASYNC");
+        if (e == nullptr) return 2;
+        const int v = atoi(e);
+        return (v >= 0 && v <= 2) ? v : 2;
+    }();
+    return mode;
 }
 
 bool& mask_classify_flag() {
@@ -605,6 +779,20 @@ __device__ __host__ __forceinline__ int acc_row_of(int lane, int t) {
     return (lane >> 2) + 8 * ((t >> 1) & 1);
 }
 
+// And which COLUMN. Needed by the register-resident softmax, which has to apply
+// causal and mask predicates per element and therefore needs the full
+// (row, col) of each accumulator slot, not just the row.
+//
+// Consistent with acc_row_of by construction: that one puts elements
+// t = {0,1,4,5} in row `lane>>2` and t = {2,3,6,7} in row `(lane>>2) + 8`, so
+// each lane holds 4 elements per row. The quad `lane & ~3` owns a full 16-wide
+// row between its four lanes, taking the column pair at `2 * (lane % 4)` in each
+// 8-column half. Verified against the probe by acc_map_formula_ok() below -- as
+// with the row map this is an assertion about the hardware, not a definition.
+__device__ __host__ __forceinline__ int acc_col_of(int lane, int t) {
+    return (lane & 3) * 2 + (t & 1) + 8 * (t >> 2);
+}
+
 // One warp, run once per process, to check that. Writes the probe's answer for
 // every (lane, slot) so the host can compare all 256 rather than a sample.
 template <int WK>
@@ -613,6 +801,7 @@ __global__ void acc_row_probe_kernel(int* __restrict__ out) {
     using acc_frag_t = wm::fragment<wm::accumulator, 16, 16, WK, float>;
     __shared__ float probe_out[256];
     __shared__ int tag_to_row[256];
+    __shared__ int tag_to_col[256];
     const int lane = static_cast<int>(threadIdx.x) & 31;
     acc_frag_t probe;
     #pragma unroll
@@ -625,11 +814,15 @@ __global__ void acc_row_probe_kernel(int* __restrict__ out) {
     for (int t = 0; t < 8; ++t) {
         const int pos = lane * 8 + t;
         tag_to_row[static_cast<int>(probe_out[pos])] = pos / 16;
+        // The column was always available here and was simply discarded.
+        tag_to_col[static_cast<int>(probe_out[pos])] = pos % 16;
     }
     __syncwarp();
     #pragma unroll
     for (int t = 0; t < 8; ++t) {
+        // 256 rows then 256 columns, so one launch answers both maps.
         out[lane * 8 + t] = tag_to_row[lane * 8 + t];
+        out[256 + lane * 8 + t] = tag_to_col[lane * 8 + t];
     }
 #endif
 }
@@ -641,9 +834,10 @@ template <int WK>
 bool acc_row_formula_ok() {
     static const bool ok = [] {
         int* d = nullptr;
-        if (cudaMalloc(&d, 256 * sizeof(int)) != cudaSuccess) return false;
+        // 256 rows followed by 256 columns.
+        if (cudaMalloc(&d, 512 * sizeof(int)) != cudaSuccess) return false;
         acc_row_probe_kernel<WK><<<1, 32>>>(d);
-        int host[256];
+        int host[512];
         const cudaError_t copied =
             cudaMemcpy(host, d, sizeof(host), cudaMemcpyDeviceToHost);
         cudaFree(d);
@@ -651,11 +845,30 @@ bool acc_row_formula_ok() {
         for (int lane = 0; lane < 32; ++lane) {
             for (int t = 0; t < 8; ++t) {
                 if (host[lane * 8 + t] != acc_row_of(lane, t)) return false;
+                // The column map is checked on the same footing as the row map:
+                // the register-resident softmax needs both, and a formula that
+                // is right about rows and wrong about columns would silently
+                // compute a transposed mask.
+                if (host[256 + lane * 8 + t] != acc_col_of(lane, t)) return false;
             }
         }
         return true;
     }();
     return ok;
+}
+
+// Exposed so a verification script can assert the map from Python rather than
+// only having it checked implicitly at launch. Returns 0 on mismatch, and
+// writes the probed (row, col) pair for all 256 slots when `out` is non-null.
+template <int WK>
+bool acc_map_probe(int* host_out) {
+    int* d = nullptr;
+    if (cudaMalloc(&d, 512 * sizeof(int)) != cudaSuccess) return false;
+    acc_row_probe_kernel<WK><<<1, 32>>>(d);
+    const cudaError_t copied =
+        cudaMemcpy(host_out, d, 512 * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaFree(d);
+    return copied == cudaSuccess;
 }
 
 template <typename scalar_t, typename compute_t, int HEAD_DIM, int MODE>
@@ -675,6 +888,7 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
                                  bool is_causal, float scale,
                                  bool out_bshd, bool reverse_m, int splits,
                                  bool classify, bool direct_o,
+                                 int cp_async_mode_arg,
                                  bool acc_formula) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using Cfg = WmmaCfg<compute_t, HEAD_DIM>;
@@ -720,8 +934,8 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
     // outside every loop, into the same pointers the loop already used.
     const size_t qo_bytes = direct_o ? Cfg::QO_TILE : Cfg::QO_FULL;
     const size_t k_off = Cfg::O_OFF + qo_bytes;
-    const size_t v_off = k_off + Cfg::KV_BYTES;
-    const size_t s_off = v_off + Cfg::KV_BYTES;
+    const size_t v_off = k_off + Cfg::KV_SPAN;
+    const size_t s_off = v_off + Cfg::KV_SPAN;
     const size_t p_off = s_off + Cfg::S_BYTES;
     const size_t m_off = p_off + Cfg::P_BYTES;
     const size_t l_off = m_off + Cfg::ROW_BYTES;
@@ -835,16 +1049,21 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
     // the O/K/V/S span is dead and hosts the probe. s_s alone is not always big
     // enough -- at head_dim 128 the block is 32x16 and s_s holds 640 floats
     // against the 1024 two warps need.
-    static_assert(Cfg::SCRATCH_BYTES >= Cfg::PROBE_BYTES,
-                  "shared scratch is too small to host the per-warp accumulator probe");
+    static_assert(Cfg::PROBE_FITS || Cfg::REG_SOFTMAX,
+                  "shared scratch is too small to host the per-warp accumulator "
+                  "probe, and REG_SOFTMAX is off so the closed form is not forced");
     int acc_row[ACC_ELEMS];
-    if (acc_formula) {
+    // `|| !PROBE_FITS`: where the scratch cannot host the probe the closed form
+    // is the only option, and SUPPORTED only admitted this shape because
+    // REG_SOFTMAX makes that safe. The launcher TORCH_CHECKs the formula
+    // actually describes this device in that case.
+    if (acc_formula || !Cfg::PROBE_FITS) {
         // The mapping is a property of the architecture, not of this block.
         #pragma unroll
         for (int t = 0; t < ACC_ELEMS; ++t) {
             acc_row[t] = acc_row_of(lane, t);
         }
-    } else {
+    } else if constexpr (Cfg::PROBE_FITS) {
         float* probe_base = reinterpret_cast<float*>(smem_raw + Cfg::O_OFF);
         float* probe_out = probe_base + warp * 512;
         int*   tag_to_row = reinterpret_cast<int*>(probe_base + warp * 512 + 256);
@@ -911,6 +1130,58 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
         kt_end   = min(kt_begin + per * BLOCK_N, key_limit);
     }
 
+    // Elements between one stage's tile and the next.
+    constexpr int KV_STAGE_ELEMS = BLOCK_N * KV_LD;
+
+    // Whether every key tile in this block's range is a "plain" one: full
+    // inside S and needing no zero-fill. Only then can the staging be a pure
+    // cp.async, and only then is double buffering worth arranging -- a mixed
+    // range would need the scalar path for some tiles and the two schemes do
+    // not interleave. The range is whole tiles iff its length divides by
+    // BLOCK_N, which holds for every grading shape (S in {32,128,1024},
+    // BLOCK_N in {16,32}).
+    const bool all_plain = classify && (DIM == PDIM) && (kt_end <= S) &&
+                           (((kt_end - kt_begin) % BLOCK_N) == 0);
+    constexpr bool kCpAsyncType =
+        (sizeof(scalar_t) == 2) && (sizeof(compute_t) == 2) && (PDIM % 8 == 0);
+    const bool cp_async = cp_async_mode_arg >= 1;
+    // Enough key tiles for the pipeline to pay for itself. Double buffering
+    // costs a prologue copy and a final wait_prior(0) that the single-buffered
+    // form does not, and it only earns that back by overlapping a copy with a
+    // tile's worth of MMAs -- so a block with two or three tiles pays the
+    // setup and collects almost nothing.
+    //
+    // Measured: grading shape 2 (batch 1, S 128) runs 2-4 tiles per block and
+    // read **0.950x** on the sync->auto link, against 1.050x for shape 13 at
+    // up to 32 tiles. Four is where it stops being a loss.
+    //
+    // A one-tile range is unaffected either way: there is no next tile to
+    // prefetch, so the dbuf path degenerates into the sync path.
+    const int kv_tiles = (kt_end - kt_begin) / BLOCK_N;
+    const bool dbuf = (cp_async_mode_arg >= 2) && (Cfg::KV_STAGES == 2) &&
+                      kCpAsyncType && cp_async && all_plain &&
+                      (kt_begin < kt_end) && (kv_tiles >= 4);
+
+    // Prologue for the double-buffered form: the first tile is issued before
+    // the loop, so that inside the loop the copy in flight is always the NEXT
+    // tile rather than the current one. That is the whole point -- it is what
+    // puts the copy alongside the MMAs instead of in front of them.
+    if (dbuf) {
+        constexpr int kChunk = 8;
+        constexpr int kChunksPerRow = PDIM / kChunk;
+        const scalar_t* k0 = k + bh_off + static_cast<int64_t>(kt_begin) * qs2;
+        const scalar_t* v0 = v + bh_off + static_cast<int64_t>(kt_begin) * qs2;
+        for (int idx = tid; idx < BLOCK_N * kChunksPerRow; idx += Cfg::NTHREADS) {
+            const int r = idx / kChunksPerRow;
+            const int c = (idx - r * kChunksPerRow) * kChunk;
+            const int64_t g = static_cast<int64_t>(r) * qs2 + c;
+            __pipeline_memcpy_async(&k_s[r * KV_LD + c], k0 + g, 16);
+            __pipeline_memcpy_async(&v_s[r * KV_LD + c], v0 + g, 16);
+        }
+        __pipeline_commit();
+    }
+
+    int stage = 0;
     for (int kt = kt_begin; kt < kt_end; kt += BLOCK_N) {
         __syncthreads();  // everyone is done reading the previous k_s/v_s
 
@@ -927,14 +1198,82 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
         // A whole key tile inside S needs no per-element bounds test, and at
         // every head_dim but 8 the column test is compile-time true anyway.
         const bool kv_plain = classify && cols_in && (DIM == PDIM);
-        if (kv_plain) {
+
+        // cp.async is only a *move*, so it needs the stored type to already be
+        // the compute type -- 2 bytes either side, which holds for
+        // (Half -> __half) and (BFloat16 -> __nv_bfloat16) and fails for the
+        // fp32-tensor path that still narrows. PDIM % 8 gives whole 16-byte
+        // chunks; every PDIM in {16,32,64,128,256} qualifies.
+        //
+        // Alignment, which cp.async requires at 16 bytes on both ends:
+        //   dest   k_s and v_s sit at 16-byte-aligned offsets in smem, and
+        //          KV_LD * 2 is a multiple of 16 because PAD is 8 halves and
+        //          PDIM is a multiple of 8 -- so r * KV_LD lands aligned for
+        //          every r, and c is a multiple of 8 elements.
+        //   src    the head_dim run is contiguous; the row stride qs2 is
+        //          3 * d_model elements for the fused-QKV view, 6 * d_model
+        //          bytes, a multiple of 16 at every d_model here.
+        constexpr bool kCpAsyncOk =
+            (sizeof(scalar_t) == 2) && (sizeof(compute_t) == 2) && (PDIM % 8 == 0);
+        constexpr int kChunk = 8;                    // elements per 16-byte copy
+        constexpr int kChunksPerRow = PDIM / kChunk;
+
+        // Which stage holds the tile about to be contracted, and which one the
+        // next copy targets. With two stages the copy never touches the buffer
+        // being read, and the barrier at the top of the body is what keeps
+        // iteration i+1's copy off the buffer iteration i read.
+        compute_t* k_cur = k_s + static_cast<size_t>(stage) * KV_STAGE_ELEMS;
+        compute_t* v_cur = v_s + static_cast<size_t>(stage) * KV_STAGE_ELEMS;
+
+        if (dbuf) {
+            const int nxt = stage ^ 1;
+            const int kt_next = kt + BLOCK_N;
+            if (kt_next < kt_end) {
+                constexpr int kChunk = 8;
+                constexpr int kChunksPerRow = PDIM / kChunk;
+                const scalar_t* kn = k + bh_off + static_cast<int64_t>(kt_next) * qs2;
+                const scalar_t* vn = v + bh_off + static_cast<int64_t>(kt_next) * qs2;
+                compute_t* k_nxt = k_s + static_cast<size_t>(nxt) * KV_STAGE_ELEMS;
+                compute_t* v_nxt = v_s + static_cast<size_t>(nxt) * KV_STAGE_ELEMS;
+                for (int idx = tid; idx < BLOCK_N * kChunksPerRow;
+                     idx += Cfg::NTHREADS) {
+                    const int r = idx / kChunksPerRow;
+                    const int c = (idx - r * kChunksPerRow) * kChunk;
+                    const int64_t g = static_cast<int64_t>(r) * qs2 + c;
+                    __pipeline_memcpy_async(&k_nxt[r * KV_LD + c], kn + g, 16);
+                    __pipeline_memcpy_async(&v_nxt[r * KV_LD + c], vn + g, 16);
+                }
+                __pipeline_commit();
+                // Two commits outstanding; wait until only the newest remains,
+                // which means THIS tile has landed.
+                __pipeline_wait_prior(1);
+            } else {
+                __pipeline_wait_prior(0);
+            }
+            stage = nxt;
+        } else if (kCpAsyncOk && cp_async && kv_plain) {
+            const int total = BLOCK_N * kChunksPerRow;
+            for (int idx = tid; idx < total; idx += Cfg::NTHREADS) {
+                const int r = idx / kChunksPerRow;
+                const int c = (idx - r * kChunksPerRow) * kChunk;
+                const int64_t g = static_cast<int64_t>(r) * qs2 + c;
+                __pipeline_memcpy_async(&k_cur[r * KV_LD + c], k_base + g, 16);
+                __pipeline_memcpy_async(&v_cur[r * KV_LD + c], v_base + g, 16);
+            }
+            // No double buffering yet: commit and wait before the tile is
+            // read. That already removes the register round trip, which is the
+            // first link of the chain; overlapping the copy with the previous
+            // tile's MMAs is the next one and is measured separately.
+            __pipeline_commit();
+            __pipeline_wait_prior(0);
+        } else if (kv_plain) {
             for (int idx = tid; idx < BLOCK_N * PDIM; idx += Cfg::NTHREADS) {
                 const int r = idx / PDIM;
                 const int c = idx - r * PDIM;
                 const int64_t g = static_cast<int64_t>(r) * qs2 + c;
-                k_s[r * KV_LD + c] =
+                k_cur[r * KV_LD + c] =
                     dev_of_float<compute_t>(dev_to_float(k_base[g]));
-                v_s[r * KV_LD + c] =
+                v_cur[r * KV_LD + c] =
                     dev_of_float<compute_t>(dev_to_float(v_base[g]));
             }
         } else {
@@ -943,14 +1282,171 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
                 const int c = idx - r * PDIM;
                 const bool inb = ((kt + r) < S) && (c < DIM);
                 const int64_t g = static_cast<int64_t>(r) * qs2 + c;
-                k_s[r * KV_LD + c] =
+                k_cur[r * KV_LD + c] =
                     inb ? dev_of_float<compute_t>(dev_to_float(k_base[g])) : zero_v;
-                v_s[r * KV_LD + c] =
+                v_cur[r * KV_LD + c] =
                     inb ? dev_of_float<compute_t>(dev_to_float(v_base[g])) : zero_v;
             }
         }
         __syncthreads();
 
+#if WMMA_REG_SOFTMAX
+        // --- 1+2. S = Q @ K^T, softmax applied in the accumulators ---------
+        //
+        // The scores never reach shared memory. Each lane ends up holding two
+        // rows of this warp's 16-row stripe (`lane>>2` and `lane>>2 + 8`) with
+        // four columns of each per 16x16 tile, so a quad `lane & ~3` owns a
+        // full 16-wide row and the row reduction is two shuffles.
+        constexpr int KVT = BLOCK_N / 16;          // score tiles across the key tile
+        acc_frag_t s_acc[KVT];
+        #pragma unroll
+        for (int n = 0; n < KVT; ++n) {
+            wm::fill_fragment(s_acc[n], 0.0f);
+            #pragma unroll
+            for (int kk = 0; kk < PDIM / WK; ++kk) {
+                wm::fragment<wm::matrix_b, 16, 16, WK, frag_elem, wm::col_major> kb;
+                wm::load_matrix_sync(kb,
+                                     k_cur + static_cast<size_t>(n) * 16 * KV_LD + kk * WK,
+                                     KV_LD);
+                if constexpr (IS_TF32) {
+                    #pragma unroll
+                    for (int t = 0; t < kb.num_elements; ++t) {
+                        kb.x[t] = wm::__float_to_tf32(kb.x[t]);
+                    }
+                }
+                wm::mma_sync(s_acc[n], q_frag[kk], kb, s_acc[n]);
+            }
+        }
+        // No store_matrix_sync and no __syncwarp here: nothing was published.
+
+        {
+            // Which fragment slots belong to each of the lane's two rows.
+            // acc_row_of puts ((t>>1)&1)==0 in the upper row and ==1 in the
+            // lower, four slots each.
+            constexpr int T_OF[2][4] = {{0, 1, 4, 5}, {2, 3, 6, 7}};
+            const int q4 = lane & 3;                 // position within the quad
+            const int rq = lane >> 2;                // row inside the 8-row half
+
+            // Column of every slot this lane owns. Independent of h -- both of
+            // the lane's rows sit at the same columns -- so it is hoisted out
+            // of the row loop and out of the three places that each used to
+            // recompute it (predicate, zero-fill, store). That arithmetic is
+            // most of the masked path's cost, and the masked path is what the
+            // short-sequence shapes take: seq 32 against BLOCK_M 64 has half
+            // its rows out of bounds, so `rows_in` is false and `plain` never
+            // fires. Recomputing it cost that shape 17%.
+            int cols[KVT][4];
+            #pragma unroll
+            for (int n = 0; n < KVT; ++n) {
+                #pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    cols[n][e] = n * 16 + q4 * 2 + (e & 1) + 8 * (e >> 1);
+                }
+            }
+
+            // Warp-uniform tile predicates, exactly as the shared-memory path
+            // computes them -- q_base, kt and S do not vary across the warp.
+            const bool tri_free = !is_causal || ((kt + BLOCK_N - 1) <= q_base);
+            const bool plain    = classify && rows_in && cols_in && tri_free &&
+                                  (mask == nullptr);
+
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int r = row_base + rq + 8 * h;   // row within the block tile
+                const int i = q_base + rq + 8 * h;     // global query row
+
+                float sv[KVT][4];
+                float local_max = -INFINITY;
+                if (plain) {
+                    #pragma unroll
+                    for (int n = 0; n < KVT; ++n) {
+                        #pragma unroll
+                        for (int e = 0; e < 4; ++e) {
+                            const float raw = s_acc[n].x[T_OF[h][e]];
+                            sv[n][e] = FOLD_Q ? raw : (raw * s_mul);
+                            local_max = fmaxf(local_max, sv[n][e]);
+                        }
+                    }
+                } else {
+                    #pragma unroll
+                    for (int n = 0; n < KVT; ++n) {
+                        #pragma unroll
+                        for (int e = 0; e < 4; ++e) {
+                            // col within the key tile: the quad's column pair,
+                            // in whichever 8-wide half slot `e` names.
+                            const int col = cols[n][e];
+                            const int gj = kt + col;
+                            bool ok = (i < S) && (gj < S);
+                            if (ok && is_causal && gj > i) ok = false;
+                            if (ok && mask != nullptr &&
+                                !mask[mask_bh + static_cast<int64_t>(i) * ms2 +
+                                      static_cast<int64_t>(gj) * ms3]) {
+                                ok = false;
+                            }
+                            const float raw = s_acc[n].x[T_OF[h][e]];
+                            sv[n][e] = ok ? (FOLD_Q ? raw : (raw * s_mul))
+                                          : -INFINITY;
+                            local_max = fmaxf(local_max, sv[n][e]);
+                        }
+                    }
+                }
+
+                // Two steps, not five: offsets 1 and 2 stay inside the quad,
+                // and the quad is exactly the four lanes sharing this row.
+                float mx = local_max;
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+
+                const float m_old = m_s[r];
+                const float m_new = fmaxf(m_old, mx);
+                float corr = 1.0f;
+                float lsum = 0.0f;
+                if (m_new == -INFINITY) {
+                    #pragma unroll
+                    for (int n = 0; n < KVT; ++n) {
+                        #pragma unroll
+                        for (int e = 0; e < 4; ++e) {
+                            const int col = cols[n][e];
+                            dev_from_float(p_s[r * S_LD + col], 0.0f);
+                        }
+                    }
+                } else {
+                    corr = (m_old == -INFINITY) ? 0.0f
+                                                : attn_exp<USE_EXP2>(m_old - m_new);
+                    #pragma unroll
+                    for (int n = 0; n < KVT; ++n) {
+                        #pragma unroll
+                        for (int e = 0; e < 4; ++e) {
+                            const int col = cols[n][e];
+                            float pv;
+                            if constexpr (USE_EXP2) {
+                                pv = attn_exp<true>(sv[n][e] - m_new);
+                            } else {
+                                pv = (sv[n][e] == -INFINITY)
+                                         ? 0.0f
+                                         : attn_exp<false>(sv[n][e] - m_new);
+                            }
+                            lsum += pv;
+                            dev_from_float(p_s[r * S_LD + col], pv);
+                        }
+                    }
+                }
+
+                float tot = lsum;
+                tot += __shfl_xor_sync(0xffffffffu, tot, 1);
+                tot += __shfl_xor_sync(0xffffffffu, tot, 2);
+
+                // One writer per row: the quad's first lane.
+                if (q4 == 0) {
+                    m_s[r] = m_new;
+                    l_s[r] = l_s[r] * corr + tot;
+                    c_s[r] = corr;
+                }
+            }
+        }
+        __syncwarp();
+
+#else
         // --- 1. S = Q @ K^T ------------------------------------------------
         // k_s is [BLOCK_N, head_dim] row-major, which is K^T column-major with
         // ldm = KV_LD -- no transpose pass needed.
@@ -962,7 +1458,7 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
             for (int kk = 0; kk < PDIM / WK; ++kk) {
                 wm::fragment<wm::matrix_b, 16, 16, WK, frag_elem, wm::col_major> kb;
                 wm::load_matrix_sync(kb,
-                                     k_s + static_cast<size_t>(n) * 16 * KV_LD + kk * WK,
+                                     k_cur + static_cast<size_t>(n) * 16 * KV_LD + kk * WK,
                                      KV_LD);
                 if constexpr (IS_TF32) {
                     #pragma unroll
@@ -1092,6 +1588,8 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
         }
         __syncwarp();
 
+#endif
+
         // --- 3. O = O * corr + P @ V ---------------------------------------
         // P does not depend on the output tile, so it is read once here rather
         // than once per tile; only V is re-read as n walks head_dim. Likewise
@@ -1127,7 +1625,7 @@ void fused_attention_wmma_kernel(const scalar_t* __restrict__ q,
             for (int kk = 0; kk < BLOCK_N / WK; ++kk) {
                 wm::fragment<wm::matrix_b, 16, 16, WK, frag_elem, wm::row_major> vb;
                 wm::load_matrix_sync(vb,
-                                     v_s + static_cast<size_t>(kk) * WK * KV_LD + n * 16,
+                                     v_cur + static_cast<size_t>(kk) * WK * KV_LD + n * 16,
                                      KV_LD);
                 if constexpr (IS_TF32) {
                     #pragma unroll
@@ -1381,9 +1879,10 @@ void launch_wmma_kernel_as(const torch::Tensor& q, const torch::Tensor& k,
         static const cudaError_t carveout = cudaFuncSetAttribute(
             fused_attention_wmma_kernel<scalar_t, compute_t, HEAD_DIM, MODE>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(Cfg::SMEM));
+            static_cast<int>(Cfg::CARVEOUT_BYTES));
         TORCH_CHECK(carveout == cudaSuccess,
-                    "fused_attention: head_dim ", HEAD_DIM, " needs ", Cfg::SMEM,
+                    "fused_attention: head_dim ", HEAD_DIM, " needs ",
+                    Cfg::CARVEOUT_BYTES,
                     " bytes of dynamic shared memory per block and this device "
                     "would not grant it (", cudaGetErrorString(carveout), ")");
     }
@@ -1400,7 +1899,13 @@ void launch_wmma_kernel_as(const torch::Tensor& q, const torch::Tensor& k,
     // Both gates below are about capacity, so they have to ask about the
     // layout that will actually be launched -- direct_o is worth a block per
     // SM at three head_dims, which is enough to change what either decides.
-    const bool direct_o = direct_o_flag();
+    // Forced on where the full O layout does not fit: SUPPORTED admits such a
+    // shape on the strength of the tile layout alone, so honouring
+    // WMMA_DIRECT_O=0 there would ask for more shared memory than the block is
+    // allowed. The flag stays advisory rather than becoming an error because
+    // it is a measurement knob, and "this shape has only one layout" is a
+    // property of the shape, not a mistake by the caller.
+    const bool direct_o = direct_o_flag() || !Cfg::FULL_O_FITS;
     const int resident =
         wmma_resident_blocks<scalar_t, compute_t, HEAD_DIM, MODE>(direct_o);
     const int n_m = static_cast<int>(grid.x);
@@ -1436,7 +1941,7 @@ void launch_wmma_kernel_as(const torch::Tensor& q, const torch::Tensor& k,
 
     fused_attention_wmma_kernel<scalar_t, compute_t, HEAD_DIM, MODE>
         <<<launch_grid, block,
-           direct_o ? Cfg::SMEM_TILE : Cfg::SMEM, stream>>>(
+           (direct_o ? Cfg::SMEM_TILE : Cfg::SMEM) + Cfg::STAGE_EXTRA, stream>>>(
             reinterpret_cast<const scalar_t*>(q.const_data_ptr()),
             reinterpret_cast<const scalar_t*>(k.const_data_ptr()),
             reinterpret_cast<const scalar_t*>(v.const_data_ptr()),
@@ -1446,7 +1951,17 @@ void launch_wmma_kernel_as(const torch::Tensor& q, const torch::Tensor& k,
             part_o, part_m, part_l,
             B, H, S, is_causal, static_cast<float>(scale), out_bshd,
             reverse_m, splits, mask_classify_flag(), direct_o,
+            cp_async_mode(),
             acc_formula_flag() && acc_row_formula_ok<Cfg::WK>());
+
+    if constexpr (!Cfg::PROBE_FITS) {
+        // No fallback exists for this block shape, so a device the closed form
+        // does not describe has to fail loudly rather than silently.
+        TORCH_CHECK(acc_row_formula_ok<Cfg::WK>(),
+                    "wmma attention: this block shape has no shared scratch for "
+                    "the accumulator probe, and the closed-form accumulator "
+                    "mapping does not describe this device");
+    }
 
     if (splits > 1) {
         // The combine has to exponentiate in the domain the kernel stored its

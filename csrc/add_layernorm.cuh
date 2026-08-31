@@ -18,11 +18,29 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <cstdlib>
+#include <type_traits>
 #include <vector>
 
 namespace {
+
+// How the NORMALISED output is stored. x_new is not affected and never will be:
+// it is the residual stream, every later layer adds to it, and narrowing it
+// would compound. `normed` is different -- its consumer is the QKV GEMM, which
+// stages A into shared memory through __float2half anyway, so storing it fp16
+// is the same rounding one global round trip earlier. See config.NORMED_FP16.
+// The template covers float and the ATen types the AT_DISPATCH instantiates --
+// c10::Half and c10::BFloat16 both convert from float by static_cast, which is
+// exactly what this store used to do inline. The __half overload is spelled out
+// because the build defines __CUDA_NO_HALF_CONVERSIONS__, so static_cast to the
+// CUDA type is not available; __float2half is the same RNE the GEMM's staging
+// path applies.
+template <typename T>
+__device__ __forceinline__ void store_norm(T& d, float s) { d = static_cast<T>(s); }
+__device__ __forceinline__ void store_norm(__half& d, float s) { d = __float2half(s); }
 
 // Sum of v across the whole block, broadcast back to every thread. scratch
 // needs one float per warp. It is clobbered, so callers must not keep live data
@@ -106,13 +124,17 @@ __device__ __forceinline__ float2 block_reduce_sum2(float a, float b,
 // are kept and both are instantiated so they can be A/B'd inside one process --
 // see layernorm_set_fused_reduce. The arithmetic is identical either way; only
 // the barrier and shared-traffic count differs.
-template <typename scalar_t, bool FUSED>
+// HAS_SUB false is a plain LayerNorm: no residual to add, and no x_new to
+// write. That is the model's very first norm, the one with no residual add
+// before it -- it was the last op still served by ATen, at 198 GB/s against
+// this kernel's 350.
+template <typename scalar_t, bool FUSED, bool HAS_SUB, typename NormT>
 __global__ void fused_add_layernorm_kernel(const scalar_t* __restrict__ x,
                                            const scalar_t* __restrict__ sub,
                                            const scalar_t* __restrict__ w,
                                            const scalar_t* __restrict__ beta,
                                            scalar_t* __restrict__ x_new,
-                                           scalar_t* __restrict__ normed,
+                                           NormT* __restrict__ normed,
                                            int D, float eps) {
     extern __shared__ __align__(16) char smem_raw[];
     float* s_row = reinterpret_cast<float*>(smem_raw);   // D floats
@@ -131,11 +153,14 @@ __global__ void fused_add_layernorm_kernel(const scalar_t* __restrict__ x,
     // the harness measures. For float the round-trip is the identity.
     float local_sum = 0.0f;
     for (int d = tid; d < D; d += blockDim.x) {
-        const scalar_t v = static_cast<scalar_t>(
-            static_cast<float>(x[base + d]) + static_cast<float>(sub[base + d]));
+        scalar_t v = x[base + d];
+        if constexpr (HAS_SUB) {
+            v = static_cast<scalar_t>(
+                static_cast<float>(v) + static_cast<float>(sub[base + d]));
+            x_new[base + d] = v;
+        }
         const float vf = static_cast<float>(v);
         s_row[d] = vf;
-        x_new[base + d] = v;
         local_sum += vf;
     }
     __syncthreads();
@@ -183,8 +208,8 @@ __global__ void fused_add_layernorm_kernel(const scalar_t* __restrict__ x,
 
     for (int d = tid; d < D; d += blockDim.x) {
         const float v = (s_row[d] - mean) * rstd;
-        normed[base + d] = static_cast<scalar_t>(
-            v * static_cast<float>(w[d]) + static_cast<float>(beta[d]));
+        store_norm(normed[base + d],
+                   v * static_cast<float>(w[d]) + static_cast<float>(beta[d]));
     }
 }
 
@@ -216,13 +241,13 @@ __global__ void fused_add_layernorm_kernel(const scalar_t* __restrict__ x,
 // deliberately so: a plain sum-then-mean drifts to 1.5e-3 at mean 1e4, past atol
 // on its own. The sum is likewise rounded through scalar_t before being kept,
 // because the reference adds in the tensor dtype and normalises *that*.
-template <typename scalar_t, int ELEMS_PER_LANE>
+template <typename scalar_t, int ELEMS_PER_LANE, bool HAS_SUB, typename NormT>
 __global__ void warp_add_layernorm_kernel(const scalar_t* __restrict__ x,
                                           const scalar_t* __restrict__ sub,
                                           const scalar_t* __restrict__ w,
                                           const scalar_t* __restrict__ beta,
                                           scalar_t* __restrict__ x_new,
-                                          scalar_t* __restrict__ normed,
+                                          NormT* __restrict__ normed,
                                           int D, int rows, float eps) {
     const int row = static_cast<int>(blockIdx.x) * blockDim.y + threadIdx.y;
     // Uniform across the warp -- the row is chosen by threadIdx.y alone -- so a
@@ -240,10 +265,13 @@ __global__ void warp_add_layernorm_kernel(const scalar_t* __restrict__ x,
     for (int t = 0; t < ELEMS_PER_LANE; ++t) {
         const int d = lane + t * 32;
         if (d < D) {
-            const scalar_t s = static_cast<scalar_t>(
-                static_cast<float>(x[base + d]) + static_cast<float>(sub[base + d]));
+            scalar_t s = x[base + d];
+            if constexpr (HAS_SUB) {
+                s = static_cast<scalar_t>(
+                    static_cast<float>(s) + static_cast<float>(sub[base + d]));
+                x_new[base + d] = s;
+            }
             v[t] = static_cast<float>(s);
-            x_new[base + d] = s;
             local_sum += v[t];
         } else {
             v[t] = 0.0f;
@@ -283,8 +311,8 @@ __global__ void warp_add_layernorm_kernel(const scalar_t* __restrict__ x,
         const int d = lane + t * 32;
         if (d < D) {
             const float nv = (v[t] - mean) * rstd;
-            normed[base + d] = static_cast<scalar_t>(
-                nv * static_cast<float>(w[d]) + static_cast<float>(beta[d]));
+            store_norm(normed[base + d],
+                       nv * static_cast<float>(w[d]) + static_cast<float>(beta[d]));
         }
     }
 }
@@ -443,7 +471,7 @@ int layernorm_blocks_per_sm(int64_t D) {
     const size_t smem = sizeof(float) * static_cast<size_t>(D + 2 * nwarps);
     int per_sm = 0;
     if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &per_sm, fused_add_layernorm_kernel<float, true>, threads, smem)
+            &per_sm, fused_add_layernorm_kernel<float, true, true, float>, threads, smem)
         != cudaSuccess) {
         return 0;
     }
@@ -451,6 +479,173 @@ int layernorm_blocks_per_sm(int64_t D) {
 }
 
 }  // namespace
+
+
+// Shared body of fused_add_layernorm and fused_layernorm.
+//
+// `sub` undefined means "no residual to add": the result is a plain LayerNorm,
+// x_new is not written, and the returned vector holds only the normalised
+// tensor. Everything else -- the kernel choice, the corrected two-pass
+// statistics, the dispatch -- is identical, which is the reason this is one
+// function and not two that drift apart.
+static std::vector<torch::Tensor> layernorm_impl(const torch::Tensor& x,
+                                                 const torch::Tensor& sub,
+                                                 const torch::Tensor& weight,
+                                                 const torch::Tensor& bias,
+                                                 double eps, bool normed_half,
+                                                 const char* who) {
+    const bool has_sub = sub.defined();
+    TORCH_CHECK(x.is_cuda(), who, ": x must be CUDA");
+    if (has_sub) {
+        TORCH_CHECK(sub.is_cuda(), who, ": sub must be CUDA");
+        TORCH_CHECK(x.sizes() == sub.sizes(),
+                    who, ": x and sub must have identical shapes, got ",
+                    x.sizes(), " and ", sub.sizes());
+        TORCH_CHECK(x.scalar_type() == sub.scalar_type(),
+                    who, ": x and sub must share a dtype");
+    }
+    TORCH_CHECK(x.dim() >= 1, who, ": x needs at least one dimension");
+
+    const int64_t D = x.size(-1);
+    TORCH_CHECK(weight.numel() == D && bias.numel() == D,
+                who, ": weight/bias must have ", D, " elements");
+    TORCH_CHECK(weight.scalar_type() == x.scalar_type() &&
+                    bias.scalar_type() == x.scalar_type(),
+                who, ": weight/bias must share x's dtype");
+
+    auto xc = x.contiguous();
+    auto sc = has_sub ? sub.contiguous() : torch::Tensor();
+    auto wc = weight.contiguous();
+    auto bc = bias.contiguous();
+
+    // Not allocated at all on the plain-LayerNorm path: it would be half this
+    // kernel's write traffic, and nothing would read it.
+    auto x_new = has_sub ? torch::empty_like(xc) : torch::Tensor();
+    // Only `normed` may narrow. x_new is the residual stream and stays put.
+    TORCH_CHECK(!normed_half || xc.scalar_type() == at::kFloat,
+                who, ": normed_half is only defined for an fp32 input, got ",
+                xc.scalar_type());
+    auto normed = normed_half
+                      ? torch::empty(xc.sizes(),
+                                     xc.options().dtype(at::kHalf))
+                      : torch::empty_like(xc);
+
+    const int64_t rows = xc.numel() / D;
+    // Scaled to the row width rather than fixed, so narrow rows do not run
+    // eight warps over one element each. See layernorm_block_threads.
+    const int threads = layernorm_block_threads(D);
+    // Two scratch floats per warp, not one: block_reduce_sum2 stages both sums
+    // at once. The unfused path uses only the first half.
+    const int nwarps = (threads + 31) / 32;
+    const size_t smem = sizeof(float) * static_cast<size_t>(D + 2 * nwarps);
+
+    // The row has to fit in shared memory. 48 KB is the limit that needs no
+    // opt-in carveout, which covers d_model up to 12280 -- far past anything
+    // the harness produces, but check rather than corrupt memory if it is not.
+    TORCH_CHECK(smem <= 48 * 1024,
+                who, ": last dimension ", D,
+                " needs ", smem, " bytes of shared memory, over the 48 KB budget");
+
+    // Narrow rows go to the warp-per-row kernel, which packs several rows into
+    // one block. See warp_add_layernorm_kernel for why the block-per-row form
+    // cannot fill the card there.
+    const bool use_warp = (D <= layernorm_warp_width());
+    const int warp_rows = layernorm_warp_rows();
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        xc.scalar_type(), "layernorm_impl", [&] {
+            auto stream = at::cuda::getCurrentCUDAStream();
+            const scalar_t* sub_ptr =
+                has_sub ? sc.const_data_ptr<scalar_t>() : nullptr;
+            scalar_t* x_new_ptr = has_sub ? x_new.data_ptr<scalar_t>() : nullptr;
+            if (use_warp) {
+                const dim3 block(32, warp_rows);
+                const dim3 grid(static_cast<unsigned>(
+                    (rows + warp_rows - 1) / warp_rows));
+                // ELEMS_PER_LANE is a template parameter so the row lives in a
+                // register array; the launcher picks the smallest that covers D.
+                auto launch = [&](auto elems, auto hassub) {
+                    // NormT is __half only for an fp32 input, which the check
+                    // above enforces, so the narrowing instantiations exist for
+                    // one scalar_t rather than all three.
+                    if (normed_half) {
+                        if constexpr (std::is_same<scalar_t, float>::value) {
+                            warp_add_layernorm_kernel<scalar_t, decltype(elems)::value,
+                                                      decltype(hassub)::value, __half>
+                                <<<grid, block, 0, stream>>>(
+                                    xc.const_data_ptr<scalar_t>(), sub_ptr,
+                                    wc.const_data_ptr<scalar_t>(),
+                                    bc.const_data_ptr<scalar_t>(),
+                                    x_new_ptr,
+                                    reinterpret_cast<__half*>(normed.data_ptr()),
+                                    static_cast<int>(D), static_cast<int>(rows),
+                                    static_cast<float>(eps));
+                        }
+                        return;
+                    }
+                    warp_add_layernorm_kernel<scalar_t, decltype(elems)::value,
+                                              decltype(hassub)::value, scalar_t>
+                        <<<grid, block, 0, stream>>>(
+                            xc.const_data_ptr<scalar_t>(), sub_ptr,
+                            wc.const_data_ptr<scalar_t>(),
+                            bc.const_data_ptr<scalar_t>(),
+                            x_new_ptr, normed.data_ptr<scalar_t>(),
+                            static_cast<int>(D), static_cast<int>(rows),
+                            static_cast<float>(eps));
+                };
+                auto by_width = [&](auto hassub) {
+                    if (D <= 32)       launch(std::integral_constant<int, 1>{}, hassub);
+                    else if (D <= 64)  launch(std::integral_constant<int, 2>{}, hassub);
+                    else if (D <= 128) launch(std::integral_constant<int, 4>{}, hassub);
+                    else               launch(std::integral_constant<int, 8>{}, hassub);
+                };
+                if (has_sub) by_width(std::true_type{});
+                else         by_width(std::false_type{});
+            } else {
+                auto launch_block = [&](auto fused, auto hassub) {
+                    if (normed_half) {
+                        if constexpr (std::is_same<scalar_t, float>::value) {
+                            fused_add_layernorm_kernel<scalar_t, decltype(fused)::value,
+                                                       decltype(hassub)::value, __half>
+                                <<<static_cast<int>(rows), threads, smem, stream>>>(
+                                    xc.const_data_ptr<scalar_t>(), sub_ptr,
+                                    wc.const_data_ptr<scalar_t>(),
+                                    bc.const_data_ptr<scalar_t>(),
+                                    x_new_ptr,
+                                    reinterpret_cast<__half*>(normed.data_ptr()),
+                                    static_cast<int>(D), static_cast<float>(eps));
+                        }
+                        return;
+                    }
+                    fused_add_layernorm_kernel<scalar_t, decltype(fused)::value,
+                                               decltype(hassub)::value, scalar_t>
+                        <<<static_cast<int>(rows), threads, smem, stream>>>(
+                            xc.const_data_ptr<scalar_t>(), sub_ptr,
+                            wc.const_data_ptr<scalar_t>(),
+                            bc.const_data_ptr<scalar_t>(),
+                            x_new_ptr, normed.data_ptr<scalar_t>(),
+                            static_cast<int>(D), static_cast<float>(eps));
+                };
+                const bool fused_reduce = layernorm_fused_reduce_flag();
+                if (has_sub) {
+                    if (fused_reduce) launch_block(std::true_type{}, std::true_type{});
+                    else              launch_block(std::false_type{}, std::true_type{});
+                } else {
+                    if (fused_reduce) launch_block(std::true_type{}, std::false_type{});
+                    else              launch_block(std::false_type{}, std::false_type{});
+                }
+            }
+        });
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess,
+                who, ": kernel launch failed: ", cudaGetErrorString(err));
+    if (has_sub) {
+        return {x_new, normed};
+    }
+    return {normed};
+}
 
 
 // Fused residual add + LayerNorm over the last dimension.
@@ -469,100 +664,29 @@ std::vector<torch::Tensor> fused_add_layernorm(torch::Tensor x,
                                                torch::Tensor sub,
                                                torch::Tensor weight,
                                                torch::Tensor bias,
-                                               double eps) {
-    TORCH_CHECK(x.is_cuda() && sub.is_cuda(), "fused_add_layernorm: x/sub must be CUDA");
-    TORCH_CHECK(x.sizes() == sub.sizes(),
-                "fused_add_layernorm: x and sub must have identical shapes, got ",
-                x.sizes(), " and ", sub.sizes());
-    TORCH_CHECK(x.scalar_type() == sub.scalar_type(),
-                "fused_add_layernorm: x and sub must share a dtype");
-    TORCH_CHECK(x.dim() >= 1, "fused_add_layernorm: x needs at least one dimension");
+                                               double eps,
+                                               bool normed_half) {
+    TORCH_CHECK(sub.defined(), "fused_add_layernorm: sub is required");
+    return layernorm_impl(x, sub, weight, bias, eps, normed_half,
+                          "fused_add_layernorm");
+}
 
-    const int64_t D = x.size(-1);
-    TORCH_CHECK(weight.numel() == D && bias.numel() == D,
-                "fused_add_layernorm: weight/bias must have ", D, " elements");
-    TORCH_CHECK(weight.scalar_type() == x.scalar_type() &&
-                    bias.scalar_type() == x.scalar_type(),
-                "fused_add_layernorm: weight/bias must share x's dtype");
 
-    auto xc = x.contiguous();
-    auto sc = sub.contiguous();
-    auto wc = weight.contiguous();
-    auto bc = bias.contiguous();
-
-    auto x_new = torch::empty_like(xc);
-    auto normed = torch::empty_like(xc);
-
-    const int64_t rows = xc.numel() / D;
-    // Scaled to the row width rather than fixed, so narrow rows do not run
-    // eight warps over one element each. See layernorm_block_threads.
-    const int threads = layernorm_block_threads(D);
-    // Two scratch floats per warp, not one: block_reduce_sum2 stages both sums
-    // at once. The unfused path uses only the first half.
-    const int nwarps = (threads + 31) / 32;
-    const size_t smem = sizeof(float) * static_cast<size_t>(D + 2 * nwarps);
-
-    // The row has to fit in shared memory. 48 KB is the limit that needs no
-    // opt-in carveout, which covers d_model up to 12280 -- far past anything
-    // the harness produces, but check rather than corrupt memory if it is not.
-    TORCH_CHECK(smem <= 48 * 1024,
-                "fused_add_layernorm: last dimension ", D,
-                " needs ", smem, " bytes of shared memory, over the 48 KB budget");
-
-    // Narrow rows go to the warp-per-row kernel, which packs several rows into
-    // one block. See warp_add_layernorm_kernel for why the block-per-row form
-    // cannot fill the card there.
-    const bool use_warp = (D <= layernorm_warp_width());
-    const int warp_rows = layernorm_warp_rows();
-
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
-        xc.scalar_type(), "fused_add_layernorm", [&] {
-            auto stream = at::cuda::getCurrentCUDAStream();
-            if (use_warp) {
-                const dim3 block(32, warp_rows);
-                const dim3 grid(static_cast<unsigned>(
-                    (rows + warp_rows - 1) / warp_rows));
-                // ELEMS_PER_LANE is a template parameter so the row lives in a
-                // register array; the launcher picks the smallest that covers D.
-                auto launch = [&](auto elems) {
-                    warp_add_layernorm_kernel<scalar_t, decltype(elems)::value>
-                        <<<grid, block, 0, stream>>>(
-                            xc.const_data_ptr<scalar_t>(),
-                            sc.const_data_ptr<scalar_t>(),
-                            wc.const_data_ptr<scalar_t>(),
-                            bc.const_data_ptr<scalar_t>(),
-                            x_new.data_ptr<scalar_t>(),
-                            normed.data_ptr<scalar_t>(),
-                            static_cast<int>(D), static_cast<int>(rows),
-                            static_cast<float>(eps));
-                };
-                if (D <= 32)       launch(std::integral_constant<int, 1>{});
-                else if (D <= 64)  launch(std::integral_constant<int, 2>{});
-                else if (D <= 128) launch(std::integral_constant<int, 4>{});
-                else               launch(std::integral_constant<int, 8>{});
-            } else {
-                auto launch_block = [&](auto fused) {
-                    fused_add_layernorm_kernel<scalar_t, decltype(fused)::value>
-                        <<<static_cast<int>(rows), threads, smem, stream>>>(
-                            xc.const_data_ptr<scalar_t>(),
-                            sc.const_data_ptr<scalar_t>(),
-                            wc.const_data_ptr<scalar_t>(),
-                            bc.const_data_ptr<scalar_t>(),
-                            x_new.data_ptr<scalar_t>(),
-                            normed.data_ptr<scalar_t>(),
-                            static_cast<int>(D), static_cast<float>(eps));
-                };
-                if (layernorm_fused_reduce_flag()) {
-                    launch_block(std::true_type{});
-                } else {
-                    launch_block(std::false_type{});
-                }
-            }
-        });
-
-    cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess,
-                "fused_add_layernorm: kernel launch failed: ", cudaGetErrorString(err));
-    return {x_new, normed};
+// Plain LayerNorm over the last dimension -- the same kernels with the residual
+// add compiled out.
+//
+// Every LayerNorm in this model consumes the output of a residual add and so
+// fuses into it, except the very first, which has nothing before it. That one
+// was the last op in the forward pass still served by ATen, and ATen ran it at
+// 198 GB/s where these kernels reach 350.
+//
+//   x             : CUDA, normalised over its last dimension
+//   weight, bias  : [D]
+//
+// returns         : LayerNorm(x) * weight + bias
+torch::Tensor fused_layernorm(torch::Tensor x, torch::Tensor weight,
+                              torch::Tensor bias, double eps,
+                              bool out_half) {
+    return layernorm_impl(x, torch::Tensor(), weight, bias, eps, out_half,
+                          "fused_layernorm")[0];
 }

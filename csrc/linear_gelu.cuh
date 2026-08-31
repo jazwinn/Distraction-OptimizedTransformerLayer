@@ -1,4 +1,13 @@
-// GEMM with a fused bias + GELU epilogue:   C = GELU(A @ W^T + bias)
+// GEMM with a fused bias epilogue, with or without GELU:
+//
+//     C = A @ W^T + bias            (linear_bias)
+//     C = GELU(A @ W^T + bias)      (linear_gelu)
+//
+// One kernel templated on the activation rather than two: everything before
+// the epilogue -- staging, the software pipeline, the fragment loop -- is the
+// same GEMM, and the only difference is one erff in the store loop. The
+// bias-only form is what the QKV projection and the two output projections
+// use, which is where most of this model's remaining cuBLAS time sat.
 //
 //   A     [M, K]  row-major. The layer input, M = batch * seq_len.
 //   W     [N, K]  row-major -- nn.Linear's own weight layout, which makes W^T
@@ -75,7 +84,24 @@ struct GemmSmem {
     static constexpr int LD = BK + Math::LD_PAD;
     static constexpr size_t staging =
         sizeof(typename Math::store_t) * static_cast<size_t>(BM + BN) * LD;
-    static constexpr size_t scratch = sizeof(float) * 8 * 256;   // 8 warps, 16x16
+    // 8 warps, each materialising a 16 x SEG strip of its own row block.
+    // SEG is capped at 32 columns so this stays at 16 KB for every block tile:
+    // at 8 warps a block is capped to 6 residents by the SM's 48-warp limit
+    // anyway, and 100 KB / 16 KB is exactly 6 -- so the wider strip that makes
+    // the stores 128 bytes wide costs no occupancy. For BN 128 the staging area
+    // is 20 KB and already dominates, so `bytes` does not move there at all.
+    static constexpr int SEG_WANT = (BN / 2 < 32) ? (BN / 2) : 32;
+    static constexpr size_t scratch_want = sizeof(float) * 8 * 16 * SEG_WANT;
+    // The wide strip is only taken when it fits inside the staging area it
+    // aliases. Growing `bytes` is NOT free even when resident blocks are
+    // unchanged: at 8 warps a block is capped to 6 residents by the SM's
+    // 48-warp limit, but 6 x 16 KB = 98 KB forces the driver onto the 100 KB
+    // shared carveout instead of 64 KB, which leaves ~28 KB of L1 instead of
+    // ~64 KB. Measured cost of getting that wrong: shape 8's QKV GEMM (K=1024,
+    // N=3072, 64x64 tile) went 11.5 ms against ~8 ms expected and the shape
+    // regressed 15.9%.
+    static constexpr int SEG = (scratch_want <= staging) ? SEG_WANT : 16;
+    static constexpr size_t scratch = sizeof(float) * 8 * 16 * SEG;
     static constexpr size_t bytes = staging > scratch ? staging : scratch;
 };
 
@@ -101,6 +127,43 @@ __device__ __forceinline__ void store4(__half* dst, const float4& v) {
     *reinterpret_cast<float2*>(dst) = *reinterpret_cast<const float2*>(h);
 }
 
+// Epilogue store. The fp16 overload is the SAME __float2half the attention
+// kernel's staging path applies (dev_from_float in attention_wmma.cuh), so
+// moving the conversion here changes no value -- it only moves it upstream of a
+// global round trip.
+// Four elements of A, widened to float4 whatever they were stored as. The
+// vector width stays 4 ELEMENTS rather than 16 bytes, so an fp16 A reads 8
+// bytes per lane instead of 16 -- which is the point -- and STORE_TILES below
+// needs no change at all. Alignment holds: K % 4 == 0 is already required, so
+// a row start is a multiple of 4 halves, and the column offset is a multiple
+// of VEC == 4.
+__device__ __forceinline__ float4 load4(const float* p) {
+    return *reinterpret_cast<const float4*>(p);
+}
+__device__ __forceinline__ float4 load4(const __half* p) {
+    const float2 raw = *reinterpret_cast<const float2*>(p);
+    const __half* h = reinterpret_cast<const __half*>(&raw);
+    return make_float4(__half2float(h[0]), __half2float(h[1]),
+                       __half2float(h[2]), __half2float(h[3]));
+}
+
+__device__ __forceinline__ void store_out(float& d, float s)  { d = s; }
+__device__ __forceinline__ void store_out(__half& d, float s)  { d = __float2half(s); }
+
+// Four elements in one instruction, for the epilogue's coalesced path. fp32 is
+// a 16-byte float4; fp16 is four halves, which is 8 bytes and so a float2-sized
+// store. Both need the destination aligned to their own width, which the caller
+// guarantees by only taking this path when N % 4 == 0 and the column offset is
+// a multiple of 4 -- torch's base pointers are 16-byte aligned.
+__device__ __forceinline__ void store_out4(float* p, const float (&v)[4]) {
+    *reinterpret_cast<float4*>(p) = make_float4(v[0], v[1], v[2], v[3]);
+}
+__device__ __forceinline__ void store_out4(__half* p, const float (&v)[4]) {
+    const __half h[4] = {__float2half(v[0]), __float2half(v[1]),
+                         __float2half(v[2]), __float2half(v[3])};
+    *reinterpret_cast<float2*>(p) = *reinterpret_cast<const float2*>(h);
+}
+
 // Exact GELU, matching F.gelu(approximate="none") rather than the tanh form.
 // The harness's accuracy gate is tight enough that the tanh approximation
 // fails atol on its own, so this has to be the erf version.
@@ -110,13 +173,24 @@ __device__ __forceinline__ float gelu_exact(float v) {
     return 0.5f * v * (1.0f + erff(v * kInvSqrt2));
 }
 
-template <typename Math, int BM, int BN, int BK>
+// OutT is the type C is STORED as, not the type anything is computed in: the
+// accumulator and the epilogue are fp32 either way, and only the final store
+// narrows. Writing __half is what lets the QKV projection hand the attention
+// kernel a tensor it does not have to narrow itself -- see the note on
+// linear_bias's out_half argument.
+// InT is how A arrives, OutT how C leaves. Only A varies: W and bias are
+// nn.Linear parameters and stay fp32, and the accumulator is fp32 throughout.
+// An fp16 A is what the attention output already is once the QKV projection
+// writes fp16 -- reading it wide would mean widening it only to narrow it
+// again on the way into shared memory.
+template <typename Math, int BM, int BN, int BK, bool ACT,
+          typename InT, typename OutT>
 __global__ __launch_bounds__(256)
-void gemm_bias_gelu_kernel(const float* __restrict__ A,
-                           const float* __restrict__ W,
-                           const float* __restrict__ bias,
-                           float* __restrict__ C,
-                           int M, int N, int K) {
+void gemm_bias_act_kernel(const InT* __restrict__ A,
+                          const float* __restrict__ W,
+                          const float* __restrict__ bias,
+                          OutT* __restrict__ C,
+                          int M, int N, int K) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr int WARPS_M = 4;
     constexpr int WARPS_N = 2;
@@ -191,7 +265,7 @@ void gemm_bias_gelu_kernel(const float* __restrict__ A,
                 const int c = (i - r * COLS4) * VEC;                                 \
                 pa[j] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);                         \
                 if (m0 + r < M && (kbase) + c < K) {                                 \
-                    pa[j] = *reinterpret_cast<const float4*>(                        \
+                    pa[j] = load4(                        \
                         A + static_cast<int64_t>(m0 + r) * K + (kbase) + c);         \
                 }                                                                    \
             }                                                                        \
@@ -291,40 +365,94 @@ void gemm_bias_gelu_kernel(const float* __restrict__ A,
 
     // --- epilogue: bias, GELU, store ---------------------------------------
     //
-    // One 16x16 tile at a time through a small shared scratch, rather than
-    // applying the activation to accumulator elements directly. The
-    // element-to-row mapping inside an accumulator fragment is
-    // architecture-defined, and the attention kernel had to probe it at
-    // runtime to work around that. Here nothing needs the row *during* the
-    // loop -- the bias depends only on the column and GELU is elementwise --
-    // so storing the tile first and reading it back with known indexing avoids
-    // the whole problem for the cost of one 1 KB round trip per warp per tile.
-    // The K loop is over, so the staging tiles are dead and host the scratch.
+    // Through a shared scratch strip, rather than applying the activation to
+    // accumulator elements directly. The element-to-row mapping inside an
+    // accumulator fragment is architecture-defined, and the attention kernel
+    // had to probe it at runtime to work around that. Here nothing needs the
+    // row *during* the loop -- the bias depends only on the column and GELU is
+    // elementwise -- so storing the tile first and reading it back with known
+    // indexing avoids the whole problem. The K loop is over, so the staging
+    // tiles are dead and host the scratch.
+    //
+    // The strip is SEG columns wide, not 16, and that width is the point. This
+    // used to round-trip one 16x16 tile at a time and store it with one float
+    // per lane, which put 16 consecutive floats -- 64 bytes, half a sector --
+    // in each half-warp's store. No lane remapping can fix that: a row of a
+    // 16-wide tile IS 64 bytes. Materialising SEG_T adjacent tiles into one
+    // 16 x SEG strip makes a row SEG floats of *contiguous* global memory, so
+    // float4 stores from 8 lanes cover 128 bytes.
+    //
+    // Row 1a of docs/OPTIMIZATION_LEDGER.md is the motivation: at shape 6, whose
+    // working set does not fit in 8 GB, the whole forward runs at ~86 GB/s
+    // against the 350 GB/s these kernels reach at shape 1, and a partial sector
+    // costs disproportionately more in that regime -- which is why cuBLAS, with
+    // a vectorized epilogue, degrades less there.
     __syncthreads();
-    // The staging tiles are dead, so the scratch lives in them. It is fp32
-    // whatever the fragments were, and GemmSmem::bytes is what guarantees the
-    // allocation covers it -- in fp16 the staging area alone does not.
-    static_assert(GemmSmem<Math, BM, BN, BK>::bytes >= NTHREADS / 32 * 256 * sizeof(float),
+    constexpr int SEG = GemmSmem<Math, BM, BN, BK>::SEG;   // columns per strip
+    constexpr int SEG_T = SEG / 16;                        // wmma tiles in one
+    constexpr int SEGS = NT / SEG_T;                       // strips across WN
+    static_assert(SEG % 16 == 0 && NT % SEG_T == 0,
+                  "the strip must be a whole number of fragment tiles");
+    static_assert(GemmSmem<Math, BM, BN, BK>::bytes
+                      >= NTHREADS / 32 * 16 * SEG * sizeof(float),
                   "epilogue scratch overruns the shared allocation");
-    float* scratch = reinterpret_cast<float*>(smem_raw) + warp * 256;
+    float* scratch = reinterpret_cast<float*>(smem_raw) + warp * (16 * SEG);
 
     #pragma unroll
     for (int mt = 0; mt < MT; ++mt) {
         #pragma unroll
-        for (int nt = 0; nt < NT; ++nt) {
-            wm::store_matrix_sync(scratch, acc[mt][nt], 16, wm::mem_row_major);
+        for (int sg = 0; sg < SEGS; ++sg) {
+            // Lay the segment's tiles side by side in one strip. The leading
+            // dimension is SEG, so tile t lands at column t * 16.
+            #pragma unroll
+            for (int t = 0; t < SEG_T; ++t) {
+                wm::store_matrix_sync(scratch + t * 16, acc[mt][sg * SEG_T + t],
+                                      SEG, wm::mem_row_major);
+            }
             __syncwarp();
 
             const int tile_m = m0 + wm * WM + mt * 16;
-            const int tile_n = n0 + wn * WN + nt * 16;
-            for (int idx = lane; idx < 256; idx += 32) {
-                const int r = idx >> 4;
-                const int c = idx & 15;
-                const int gr = tile_m + r;
-                const int gc = tile_n + c;
-                if (gr < M && gc < N) {
-                    C[static_cast<int64_t>(gr) * N + gc] =
-                        gelu_exact(scratch[idx] + bias[gc]);
+            const int tile_n = n0 + wn * WN + sg * SEG;
+
+            // The vector path needs the whole strip in bounds and a row stride
+            // that keeps every 4-element group aligned. Everything else falls
+            // back to the scalar loop, which is also what handles a ragged M or
+            // N -- so correctness never depends on the fast path being taken.
+            const bool whole = (tile_m + 16 <= M) && (tile_n + SEG <= N)
+                               && ((N & 3) == 0);
+            if (whole) {
+                constexpr int V = SEG / 4;             // float4s per row
+                for (int idx = lane; idx < 16 * V; idx += 32) {
+                    const int r = idx / V;
+                    const int c = (idx - r * V) * 4;
+                    float v[4];
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        v[e] = scratch[r * SEG + c + e] + bias[tile_n + c + e];
+                    }
+                    // if constexpr: the bias-only form must not pay for a
+                    // branch, and must not even instantiate erff.
+                    if constexpr (ACT) {
+                        #pragma unroll
+                        for (int e = 0; e < 4; ++e) v[e] = gelu_exact(v[e]);
+                    }
+                    // One RNE narrowing per element, in exactly the place the
+                    // consumer would otherwise do it. store_out4 is a plain
+                    // float4 for fp32 out.
+                    store_out4(&C[static_cast<int64_t>(tile_m + r) * N
+                                  + tile_n + c], v);
+                }
+            } else {
+                for (int idx = lane; idx < 16 * SEG; idx += 32) {
+                    const int r = idx / SEG;
+                    const int c = idx - r * SEG;
+                    const int gr = tile_m + r;
+                    const int gc = tile_n + c;
+                    if (gr < M && gc < N) {
+                        const float v = scratch[idx] + bias[gc];
+                        const float o = ACT ? gelu_exact(v) : v;
+                        store_out(C[static_cast<int64_t>(gr) * N + gc], o);
+                    }
                 }
             }
             __syncwarp();
@@ -348,38 +476,41 @@ constexpr int kGemmMathAuto = -1;
 constexpr int kGemmMathTf32 = 0;
 constexpr int kGemmMathFp16 = 1;
 
-template <typename Math, int BM, int BN, int BK>
-void launch_gemm_bias_gelu(const torch::Tensor& x, const torch::Tensor& w,
-                           const torch::Tensor& bias, torch::Tensor& out,
-                           int64_t M, int64_t N, int64_t K) {
+template <typename Math, int BM, int BN, int BK, bool ACT,
+          typename InT, typename OutT>
+void launch_gemm_bias_act(const torch::Tensor& x, const torch::Tensor& w,
+                          const torch::Tensor& bias, torch::Tensor& out,
+                          int64_t M, int64_t N, int64_t K) {
     using Plan = GemmSmem<Math, BM, BN, BK>;
     static_assert(Plan::bytes <= 48 * 1024,
                   "staging tiles exceed the 48 KB shared-memory budget");
     const dim3 block(256);
     const dim3 grid(static_cast<unsigned>((N + BN - 1) / BN),
                     static_cast<unsigned>((M + BM - 1) / BM));
-    gemm_bias_gelu_kernel<Math, BM, BN, BK>
+    gemm_bias_act_kernel<Math, BM, BN, BK, ACT, InT, OutT>
         <<<grid, block, Plan::bytes, at::cuda::getCurrentCUDAStream()>>>(
-            x.const_data_ptr<float>(), w.const_data_ptr<float>(),
-            bias.const_data_ptr<float>(), out.data_ptr<float>(),
+            reinterpret_cast<const InT*>(x.const_data_ptr()),
+            w.const_data_ptr<float>(),
+            bias.const_data_ptr<float>(),
+            reinterpret_cast<OutT*>(out.data_ptr()),
             static_cast<int>(M), static_cast<int>(N), static_cast<int>(K));
 }
 
 // Tile and precision are independent axes, so the dispatch is one function of
 // both rather than a switch duplicated per precision.
-template <typename Math>
+template <typename Math, bool ACT, typename InT, typename OutT>
 void launch_gemm_tile(int tile, const torch::Tensor& x, const torch::Tensor& w,
                       const torch::Tensor& bias, torch::Tensor& out,
                       int64_t M, int64_t N, int64_t K) {
     switch (tile) {
         case kGemmTile128x128:
-            launch_gemm_bias_gelu<Math, 128, 128, 32>(x, w, bias, out, M, N, K);
+            launch_gemm_bias_act<Math, 128, 128, 32, ACT, InT, OutT>(x, w, bias, out, M, N, K);
             break;
         case kGemmTile64x64:
-            launch_gemm_bias_gelu<Math, 64, 64, 32>(x, w, bias, out, M, N, K);
+            launch_gemm_bias_act<Math, 64, 64, 32, ACT, InT, OutT>(x, w, bias, out, M, N, K);
             break;
         case kGemmTile64x32:
-            launch_gemm_bias_gelu<Math, 64, 32, 32>(x, w, bias, out, M, N, K);
+            launch_gemm_bias_act<Math, 64, 32, 32, ACT, InT, OutT>(x, w, bias, out, M, N, K);
             break;
         default:
             TORCH_CHECK(false, "linear_gelu: unknown tile id ", tile);
@@ -448,7 +579,7 @@ int pick_gemm_tile(int64_t M, int64_t N, int64_t K) {
 }  // namespace
 
 
-// Linear followed by exact GELU, in one kernel:  GELU(x @ weight^T + bias)
+// Shared body of linear_gelu and linear_bias:  C = act(x @ weight^T + bias)
 //
 //   x       [..., K]  contiguous; every leading dimension is flattened into M
 //   weight  [N, K]    nn.Linear layout
@@ -458,28 +589,33 @@ int pick_gemm_tile(int64_t M, int64_t N, int64_t K) {
 //
 // Declines (returns an undefined tensor) rather than raising when the shape or
 // dtype is outside what the kernel covers, so the caller can fall back to
-// F.linear + F.gelu instead of failing. Requirements: float32, SM 8.0+, and
-// K divisible by 4 for the float4 staging path.
+// F.linear instead of failing. Requirements: float32, SM 8.0+, and K divisible
+// by 4 for the float4 staging path.
 //
 // `tile` selects the block tile: kGemmTileAuto asks pick_gemm_tile(), and an
 // explicit id forces one, which is what scripts/tune_linear_gelu.py sweeps.
 // `math` selects the fragment precision the same way; both default to auto.
-torch::Tensor linear_gelu(torch::Tensor x, torch::Tensor weight,
-                          torch::Tensor bias, int64_t tile, int64_t math) {
+static torch::Tensor gemm_bias_act(const torch::Tensor& x, const torch::Tensor& weight,
+                                   const torch::Tensor& bias, int64_t tile, int64_t math,
+                                   bool act, bool out_half, const char* who) {
     TORCH_CHECK(x.is_cuda() && weight.is_cuda() && bias.is_cuda(),
-                "linear_gelu: all inputs must be CUDA tensors");
-    TORCH_CHECK(weight.dim() == 2, "linear_gelu: weight must be 2-D [N, K]");
+                who, ": all inputs must be CUDA tensors");
+    TORCH_CHECK(weight.dim() == 2, who, ": weight must be 2-D [N, K]");
     TORCH_CHECK(x.dim() >= 1 && x.size(-1) == weight.size(1),
-                "linear_gelu: x's last dimension must match weight's, got ",
+                who, ": x's last dimension must match weight's, got ",
                 x.sizes(), " and ", weight.sizes());
     TORCH_CHECK(bias.numel() == weight.size(0),
-                "linear_gelu: bias must have ", weight.size(0), " elements");
+                who, ": bias must have ", weight.size(0), " elements");
 
     const int64_t K = weight.size(1);
     const int64_t N = weight.size(0);
 
+    // A may be fp32 or fp16; W and bias are nn.Linear parameters and are always
+    // fp32. An fp16 A is the attention output once the QKV projection writes
+    // fp16 -- see linear_bias's out_half.
+    const bool in_half = x.scalar_type() == torch::kFloat16;
     const bool covered =
-        x.scalar_type() == torch::kFloat32 &&
+        (x.scalar_type() == torch::kFloat32 || in_half) &&
         weight.scalar_type() == torch::kFloat32 &&
         bias.scalar_type() == torch::kFloat32 &&
         (K % 4) == 0 &&
@@ -496,17 +632,125 @@ torch::Tensor linear_gelu(torch::Tensor x, torch::Tensor weight,
 
     auto out_sizes = xc.sizes().vec();
     out_sizes.back() = N;
-    auto out = torch::empty(out_sizes, xc.options());
+    // Spelled from x's options with the dtype REPLACED rather than inherited:
+    // an fp16 A must still be able to produce an fp32 C, which is exactly what
+    // out_proj needs -- it consumes the fp16 attention output and feeds an fp32
+    // residual add.
+    auto out = torch::empty(
+        out_sizes,
+        xc.options().dtype(out_half ? torch::kFloat16 : torch::kFloat32));
 
     const int chosen = (tile == kGemmTileAuto) ? pick_gemm_tile(M, N, K) : tile;
-    if (math == kGemmMathTf32) {
-        launch_gemm_tile<Tf32Math>(chosen, xc, wc, bc, out, M, N, K);
+    // The activation and the store type are both template parameters: the
+    // bias-only form then has no erff in its store loop at all, and the fp16
+    // store is a single __float2half rather than a branch.
+    //
+    // out_half is instantiated for the bias-only form ONLY. It exists for the
+    // QKV projection, whose consumer narrows anyway; nothing consuming a GELU
+    // output wants fp16, so pairing them would double the instantiation count
+    // for a combination no caller asks for.
+    // Four (InT, OutT, ACT) combinations are instantiated, not all eight, because
+    // only four occur in this model:
+    //
+    //   (float, float, GELU)   linear_gelu -- the FFN's first projection
+    //   (float, float, -)      ffn_out, and any fp32 fallback
+    //   (float, __half, -)     the QKV projection, fp32 normed in
+    //   (__half, float, -)     out_proj: fp16 attention output in, fp32 out
+    //   (__half, __half, -)    the QKV projection once the LayerNorm feeding it
+    //                          also emits fp16 -- see config.NORMED_FP16
+    //
+    // The last of those was refused when out_half landed, on the grounds that
+    // no chain in this model needed it. That was true then and stopped being
+    // true one cycle later, and the TORCH_CHECK is what said so -- loudly, at
+    // the first forward pass, rather than by quietly mis-dispatching.
+    //
+    //   (__half, float, GELU)  linear_gelu once the norm2 LayerNorm feeding it
+    //                          also emits fp16
+    //
+    // Still refused: (anything, __half, GELU). Nothing consuming a GELU output
+    // wants fp16 -- ffn_out reads it and the GELU result is the one value here
+    // that is computed rather than copied, so narrowing it would be a real
+    // precision loss rather than a moved rounding. That combination costs
+    // 2 math modes x 3 tiles and buys an error.
+    TORCH_CHECK(!(out_half && act), who,
+                ": out_half is not instantiated with an activation -- nothing "
+                "consuming a GELU output wants fp16");
+
+    if (in_half && act) {
+        // An fp16 A into linear_gelu. Only bit-identical under fp16 fragments:
+        // Fp16Math narrows A to __half when staging, so pre-narrowing changes
+        // nothing, whereas Tf32Math keeps it float and would genuinely lose the
+        // mantissa. The caller gates on that -- see _gelu_input_wants_fp16 --
+        // and this refuses the pair rather than trusting it to.
+        TORCH_CHECK(math != kGemmMathTf32, who,
+                    ": an fp16 input with tf32 fragments would lose mantissa "
+                    "rather than move a rounding -- tf32 stages A as float");
+        launch_gemm_tile<Fp16Math, true, __half, float>(chosen, xc, wc, bc, out, M, N, K);
+    } else if (in_half && out_half) {
+        if (math == kGemmMathTf32) {
+            launch_gemm_tile<Tf32Math, false, __half, __half>(chosen, xc, wc, bc, out, M, N, K);
+        } else {
+            launch_gemm_tile<Fp16Math, false, __half, __half>(chosen, xc, wc, bc, out, M, N, K);
+        }
+    } else if (in_half) {
+        if (math == kGemmMathTf32) {
+            launch_gemm_tile<Tf32Math, false, __half, float>(chosen, xc, wc, bc, out, M, N, K);
+        } else {
+            launch_gemm_tile<Fp16Math, false, __half, float>(chosen, xc, wc, bc, out, M, N, K);
+        }
+    } else if (out_half) {
+        if (math == kGemmMathTf32) {
+            launch_gemm_tile<Tf32Math, false, float, __half>(chosen, xc, wc, bc, out, M, N, K);
+        } else {
+            launch_gemm_tile<Fp16Math, false, float, __half>(chosen, xc, wc, bc, out, M, N, K);
+        }
+    } else if (math == kGemmMathTf32) {
+        if (act) launch_gemm_tile<Tf32Math, true,  float, float>(chosen, xc, wc, bc, out, M, N, K);
+        else     launch_gemm_tile<Tf32Math, false, float, float>(chosen, xc, wc, bc, out, M, N, K);
     } else {
-        launch_gemm_tile<Fp16Math>(chosen, xc, wc, bc, out, M, N, K);
+        if (act) launch_gemm_tile<Fp16Math, true,  float, float>(chosen, xc, wc, bc, out, M, N, K);
+        else     launch_gemm_tile<Fp16Math, false, float, float>(chosen, xc, wc, bc, out, M, N, K);
     }
 
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess,
-                "linear_gelu: kernel launch failed: ", cudaGetErrorString(err));
+                who, ": kernel launch failed: ", cudaGetErrorString(err));
     return out;
+}
+
+
+// Linear followed by exact GELU, in one kernel:  GELU(x @ weight^T + bias).
+// Matches F.gelu(F.linear(...), approximate="none"), not the tanh form -- the
+// harness's accuracy gate is tight enough that the approximation fails atol on
+// its own.
+torch::Tensor linear_gelu(torch::Tensor x, torch::Tensor weight,
+                          torch::Tensor bias, int64_t tile, int64_t math) {
+    return gemm_bias_act(x, weight, bias, tile, math, /*act=*/true,
+                         /*out_half=*/false, "linear_gelu");
+}
+
+
+// Plain linear, in one kernel:  x @ weight^T + bias. The same GEMM without the
+// activation, for the three projections that have none -- QKV, out_proj and
+// ffn_out. Those were the last cuBLAS calls in the forward pass, and cuBLAS
+// serves them in TF32 (or, at the small-K grading shapes, in *SIMT fp32* --
+// shapes 7 and 12 land on cutlass_80_simt_sgemm), where fp16 fragments carry
+// the same 10-bit mantissa at twice the tensor-core rate.
+//
+// `out_half` stores C as fp16 instead of fp32. It is for the QKV projection and
+// the reason is that the conversion is already happening: the attention kernel
+// stages q/k/v into shared memory through dev_from_float, narrowing fp32 to
+// __half with RNE, so an fp32 qkv buffer is written wide, read wide, and then
+// thrown away one mantissa at a time. Doing the same RNE here instead makes the
+// values the attention kernel contracts BIT-IDENTICAL while halving both the
+// write and the read: 12 MB to 6 MB each at grading shape 1.
+//
+// Only valid when the consumer really does contract in fp16. An fp32 or tf32
+// attention precision, or the scalar kernel, needs the wide operands, so the
+// caller gates this -- see optimized/kernels.py.
+torch::Tensor linear_bias(torch::Tensor x, torch::Tensor weight,
+                          torch::Tensor bias, int64_t tile, int64_t math,
+                          bool out_half) {
+    return gemm_bias_act(x, weight, bias, tile, math, /*act=*/false,
+                         out_half, "linear_bias");
 }

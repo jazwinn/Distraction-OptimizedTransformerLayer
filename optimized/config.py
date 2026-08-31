@@ -117,6 +117,178 @@ _OUT_LAYOUT_BSHD = 1
 # does not.
 LINEAR_GELU = "auto"
 
+# cp.async for the attention kernel's K/V staging. --cp-async overrides.
+#
+#   "auto"  cp.async, double buffered where the shared budget allows a second
+#           K/V stage -- everything but head_dim 256
+#   "sync"  cp.async, single buffered: the copy is committed and waited on
+#           before the tile is read, so it bypasses registers but does not
+#           overlap the MMAs. This is the intermediate link, kept so the two
+#           halves of the chain stay separately measurable
+#   "off"   the scalar global->register->shared path
+#
+# Only has an effect on the fp16 path, which is why it could not exist before
+# QKV_FP16: cp.async moves bytes global->shared without passing through
+# registers and so cannot convert. While the kernel was handed fp32 tensors and
+# contracted them as __half, the narrowing on the staging path ruled it out.
+CP_ASYNC = "auto"
+
+_CP_ASYNC_CODE = {"off": 0, "sync": 1, "auto": 2}
+
+# The model's entry LayerNorm -- the one norm with no residual add before it,
+# and so the only one _add_layernorm cannot absorb. --layernorm overrides this
+# for a single run.
+#
+#   "auto"  the custom warp-per-row kernel with the residual add compiled out
+#   "off"   F.layer_norm, which is ATen
+#
+# It was the last op in the forward pass still served by a prebuilt function.
+# ATen ran it at 198 GB/s on [64,128,128]; the same kernel reaches 350 GB/s
+# doing twice the traffic in fused_add_layernorm.
+LAYERNORM = "auto"
+
+# The activation-free projections -- QKV, out_proj, ffn_out -- on the same
+# custom GEMM as LINEAR_GELU, with the activation compiled out.
+#
+#   "auto"  fp16 fragments (the fast path)
+#   "tf32"  tf32 fragments, bit-comparable with cuBLAS, for A/B
+#   "off"   F.linear, which is cuBLAS
+#
+# Same fp16 PRECONDITION as LINEAR_GELU: operands must fit fp16's range. The
+# QKV input is post-LayerNorm and the weights are O(1/sqrt(d)), so it holds by
+# construction here. See _linear_bias in optimized/kernels.py for the measured
+# per-shape ratios against cuBLAS.
+LINEAR_BIAS = "auto"
+
+# Above this many rows, "auto" declines and F.linear runs instead. The kernel
+# COVERS every M -- this is a preference, like _FFN_BLOCK_MAX_D, and it lives
+# here for the same reason: the extension answers "can I serve this", the
+# caller decides "should I".
+#
+# Measured against cuBLAS on the QKV shape (K=128, N=384), interleaved with a
+# self-control, 2026-08-31:
+#
+#   M          cuBLAS     custom     ratio
+#   32768      261.4us    203.5us    1.284x
+#   65536      427.5us    373.4us    1.145x     <- shape 13, the largest that wins
+#   131072     797.1us    734.5us    1.085x
+#   262144     1548us     1614us     0.959x     <- crossover
+#   524288     3161us     3415us     0.926x
+#   1280000    7973us     8165us     0.977x     <- shape 6
+#
+# End to end the loss at shape 6 was far worse than that 0.977x suggests --
+# 0.902x against a 0.999x self-control. Shape 6 runs its whole forward pass at
+# ~86 GB/s against the 350 GB/s the same kernels reach at shape 1, because its
+# working set does not fit the 3070's 8 GB; in that regime the epilogue's
+# scalar stores (16 consecutive floats per half-warp, a partial 128-byte
+# sector) cost much more than they do when the card is not paging. cuBLAS
+# vectorizes its epilogue and degrades less.
+#
+# THE EPILOGUE IS NOW VECTORIZED, so the threshold above has been lifted. The
+# store takes 4 elements per lane through `store_out4` (csrc/linear_gelu.cuh),
+# which puts 4 lanes on a 64-byte row instead of 16 and cuts store instructions
+# fourfold. Re-measuring the same ladder in one process, against a 0.975..1.012
+# self-control floor:
+#
+#   M          cuBLAS     custom     was        now
+#   32768      274.0us    211.1us    1.284x     1.298x
+#   65536      492.0us    419.7us    1.145x     1.172x
+#   131072     926.3us    844.1us    1.085x     1.097x
+#   262144     1797us     1685us     0.959x     1.066x   <- was the crossover
+#   524288     3527us     3346us     0.926x     1.054x
+#   1280000    8584us     8194us     0.977x     1.048x   <- shape 6
+#
+# Both losses that set the old threshold are now wins, and -- the number that
+# actually decides it, because an op probe does not predict this shape -- shape 6
+# measured IN THE MODEL reads 1.309x (764.5ms -> 584.0ms) against a 1.002x
+# self-control. Lifting the gate also satisfies the fp16 predicates below, which
+# both bound themselves by this constant, so shape 6 simultaneously gains the
+# fp16 qkv and fp16 normed paths it had been excluded from.
+#
+# Why a finite bound at all, rather than removing it: 1280000 rows is the
+# largest M measured, standalone and in the model. The bound is a documented
+# edge of tested ground, not a claim that the kernel loses beyond it. Shape 14
+# (the 100k-sequence outlier) is the shape that would push past it and is not
+# run in the loop.
+#
+# This constant is deliberately NOT in graphs.py::_graph_key: every shape that
+# captures a graph is at most 8192 rows (shape 7), so both settings dispatch
+# identically there and no captured graph can depend on it.
+_LINEAR_BIAS_MAX_ROWS = 1 << 21   # 2097152; covers shape 6's 1280000 rows
+
+# Hand the attention kernel its q/k/v already in fp16, instead of fp32 that it
+# narrows itself. --qkv-fp16 overrides this for a single run.
+#
+#   "auto"  fp16 whenever the attention path really does contract in fp16
+#   "off"   fp32 qkv, as before
+#
+# This is not a precision trade. The wmma kernel stages q/k/v into shared memory
+# through dev_from_float, which applies __float2half with RNE -- so an fp32 qkv
+# buffer is written wide, read wide, and then discarded one mantissa at a time.
+# Doing the same rounding in the GEMM epilogue is bit-identical (verified as raw
+# int16 bits) and halves both the write and the read: 12 MB -> 6 MB each way at
+# grading shape 1.
+#
+# Only valid when the consumer narrows. An explicit fp32 or tf32 attention
+# precision, or the scalar kernel, needs the wide operands -- see
+# _attention_wants_fp16 in optimized/kernels.py, which is what gates this.
+QKV_FP16 = "auto"
+
+# Below this many rows "auto" declines and qkv stays fp32. Halving a tensor's
+# traffic is worth nothing on a shape that never waited on bandwidth, and it is
+# not free: the fp16 read path widens four halves per lane with __half2float
+# where the fp32 one issues a single float4 load, so out_proj pays ALU for a
+# bandwidth saving it cannot use.
+#
+# Measured in-process against a 0.994x self-control whose worst shape read
+# 0.970x:
+#
+#   M      shape                ratio
+#   128    2 - batch 1          0.988x   <- no gain, inside the noise floor
+#   512    3 - batch 4          0.943x   <- a real loss, below the floor
+#   2048   4 - batch 16         1.051x
+#   2048   12 - seq 32          1.047x
+#   8192   1 - base             1.101x
+#
+# The crossover is between 512 and 2048, so the gate sits at 1024. Shapes 2 and
+# 3 are the only grading shapes under it.
+_QKV_FP16_MIN_ROWS = 1024
+
+# Store a LayerNorm's normalised output as fp16 where its consumer is the QKV
+# projection, which narrows it anyway. --normed-fp16 overrides for one run.
+#
+#   "auto"  fp16 on the edges that feed the QKV GEMM
+#   "off"   fp32 everywhere, as before
+#
+# Same argument as QKV_FP16 and the same bit-identity: the GEMM stages A into
+# shared memory through __float2half, so doing it in the LayerNorm epilogue
+# moves the rounding one global round trip earlier and changes no value.
+#
+# Deliberately narrower than it could be. The residual stream x_new is NEVER
+# narrowed -- every later layer adds to it and the error would compound. The
+# model's final norm is never narrowed either, because that tensor is the
+# model's output. And the norm2 edge, which feeds linear_gelu rather than the
+# QKV GEMM, is left fp32: linear_gelu has no fp16-input instantiation and
+# adding one costs 6 more for a second-order gain.
+NORMED_FP16 = "auto"
+
+# Above this d_model, "auto" declines. d_model is the GEMM's K, so it sets how
+# many times the k-loop runs -- and the fp16 A path pays four __half2float per
+# lane per iteration where the fp32 one issues a single float4 load.
+#
+# At d_model 128 that is 4 iterations of BK=32 and the halved A read wins. At
+# 1024 it is 32 iterations, and that GEMM is compute-bound near the card's TF32
+# roofline, so there is no bandwidth to reclaim and the conversion is pure
+# overhead. Measured in-process, grading shape 8 (d_model 1024): **0.850x** --
+# a 15% loss, against 1.001x-1.040x on every d_model 128 and 32 shape.
+#
+# Worth being clear about why QKV_FP16 (row 6) does NOT need this gate and won
+# 1.02x on the very same shape: there the fp16 was the GEMM's OUTPUT, saving a
+# 96 MB -> 48 MB C write at N = 3*1024, which dwarfs the same added ALU. Here
+# only the A read changes. Same dtype, opposite verdict, because the tensor it
+# applies to is on the other side of the GEMM.
+_NORMED_FP16_MAX_K = 128
+
 # Fused post-attention block: add+LayerNorm, Linear+GELU, Linear, add+LayerNorm
 # in one kernel. --ffn-block overrides this for a single run.
 #
