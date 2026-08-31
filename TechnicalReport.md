@@ -63,7 +63,7 @@ a batch of 10,000, whose working set does not fit in 8 GB.
     - [4.6 All four, measured side by side](#46-all-four-measured-side-by-side)
 - **[5. AI Involvement During Development](#5-ai-involvement-during-development)**
     - [5.1 The tools, and what they enabled](#51-the-tools-and-what-they-enabled)
-    - [5.2 The optimization development loop](#52-the-optimization-development-loop)
+    - [5.2 The agentic optimization development loop](#52-the-agentic-optimization-development-loop)
     - [5.3 Working with AI, not instead of it](#53-working-with-ai-not-instead-of-it)
 - **[6. The Optimizations Implemented](#6-the-optimizations-implemented)**
     - [6.1 Kernel-level optimizations](#61-kernel-level-optimizations)
@@ -741,7 +741,7 @@ skipped under time pressure. Built quickly, it paid for itself — every measure
 by the tool rather than remembered by whoever is running it, and its profiling is what located the
 launch-bound region and the memory limits the optimizations were then aimed at.
 
-### 5.2 The optimization development loop
+### 5.2 The agentic optimization development loop
 
 The obvious optimizations run out quickly. What is left after them is a long tail of changes worth a
 percent or two each, and that tail is where a person's limit shows — not because any one of them is
