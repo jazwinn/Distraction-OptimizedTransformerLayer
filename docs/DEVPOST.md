@@ -1,5 +1,5 @@
 # Distraction - *A faster GPU Kernel for Transformer Layers*
-A from-scratch GPU implementation of Transformer self-attention that runs up to **39× faster** than
+A from-scratch GPU implementation of Transformer self-attention that runs up to **46× faster** than
 the PyTorch baseline on the official test shapes, with every shape passing the accuracy check.
 
 ---
