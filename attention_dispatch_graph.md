@@ -68,7 +68,7 @@ flowchart TD
 
 | Label | Rule | Source Location |
 | :--- | :--- | :--- |
-| `hit` | `(shape, dtype, device, use_mask, impl, linear_gelu, precision)` is present in `_graphs`. `ATTENTION_BACKEND` is deliberately absent: it has one legal value, so it can never make two calls differ | [`graphs._graph_key`](optimized/graphs.py) |
+| `hit` | `(shape, dtype, device, use_mask, impl, linear_gelu, linear_bias, layernorm, qkv_fp16, normed_fp16, cp_async, precision)` is present in `_graphs`. Every knob that can select a different kernel is in the key, because a capture freezes whichever one it picked — without them an in-process A/B flipping the global would silently do nothing on a captured model. `ATTENTION_BACKEND` is deliberately absent: it has one legal value, so it can never make two calls differ | [`graphs._graph_key`](optimized/graphs.py) |
 | `miss` | Not cached, or `_graph_eligible` declines: graphs disabled, non-CUDA device, capture already in progress, `_GRAPH_MAX_ENTRIES` reached, or activation exceeds `_GRAPH_MAX_ACTIVATION` | [`graphs._graph_eligible`](optimized/graphs.py) |
 | `1` | Batch size is 1, or `MICROBATCH_FALLBACK` is off — single whole-batch eager pass | [`model.forward`](optimized/model.py) |
 | `n` | Batch size > 1: predict peak memory, split up front if exceeding 85% device VRAM, then halve on every `OutOfMemoryError` | [`model._forward_chunk_on_oom`](optimized/model.py) |
@@ -238,7 +238,7 @@ Sections 1-3 stop at the launch. These two go past it: 4.1 is the kernel body it
 
 One block owns `BLOCK_M` query rows split into 16-row warp stripes, and walks the key range in `BLOCK_N` tiles. Both extents come from `WmmaShape<HEAD_DIM>` in [`csrc/attention_wmma.cuh`](csrc/attention_wmma.cuh) and are **not** fixed at 64/32 — head_dim 128 and 256 run a 32x16 block.
 
-Colour marks where the data lives: green is registers, amber shared memory, blue global. The loop is amber except step 3, which is the whole design — Q and the O accumulator stay in registers across every key tile, so the only inner-loop traffic is the K/V tile, the score tile, and the fragment reads feeding the MMA units.
+Colour marks where the data lives: green is registers, amber shared memory, blue global. Q and the O accumulator stay in registers across every key tile, and under `WMMA_REG_SOFTMAX` (default **1**) so does the score tile — `s_s` is no longer allocated at all, which frees 6.00 KB at `BLOCK_N = 16` and 10.00 KB at `BLOCK_N = 32`. The only inner-loop shared traffic left is the K/V tile and the probability tile `p_s` that feeds the second MMA.
 
 ```mermaid
 flowchart TD
@@ -255,9 +255,9 @@ flowchart TD
 
     subgraph loop ["Key loop — kt = kt_begin .. kt_end step BLOCK_N"]
         direction TB
-        stage["stage K and V tiles to shared<br/><i>classify: whole tile inside S ⇒ no per-element bounds test</i>"]
-        g1["<b>1 · S = Q @ Kᵀ</b> — wmma, fp32 accumulate<br/>k_s read as col_major ⇒ transpose is free<br/>store score tile to s_s"]
-        sm["<b>2 · online softmax</b> — one lane per row<br/>local max over COLS_PER_LANE · 1 shuffle<br/>m_new, corr = exp2(m_old−m_new), l = l·corr + Σp<br/>write P to p_s, corr to c_s"]
+        stage["stage K and V tiles to shared — <b>cp.async</b>, KV_STAGES=2<br/>next tile is issued while this one is in use<br/><i>classify: whole tile inside S ⇒ no per-element bounds test</i>"]
+        g1["<b>1 · S = Q @ Kᵀ</b> — wmma, fp32 accumulate<br/>k_s read as col_major ⇒ transpose is free<br/><b>S stays in the accumulators</b> — no store to shared"]
+        sm["<b>2 · online softmax</b> — in the accumulators<br/>quad <code>lane & ~3</code> owns a 16-wide row<br/>2-step XOR butterfly, offsets 1 and 2<br/>m_new, corr = exp2(m_old−m_new), l = l·corr + Σp<br/>write P to p_s, corr to c_s"]
         g2["<b>3 · O = O·corr + P @ V</b> — wmma<br/>rescale o_frag elements via acc_row<br/>accumulate straight into the O fragments"]
         stage --> g1 --> sm --> g2
     end
@@ -509,6 +509,36 @@ Fallbacks occur exclusively on coverage constraints: `float32` input, `K % 4 == 
 
 ---
 
+## 7a. Activation-Free Projections: `linear_bias` vs cuBLAS
+
+The three projections that carry no activation — the fused QKV GEMM, `out_proj`, and `ffn_out` — route through the same custom tensor-core GEMM rather than `F.linear`. `MyLinear.forward` is the single edit site: `q/k/v_proj` never reach it (`_get_qkv_weight` concatenates their weights), and `ffn_in` is taken by `_linear_gelu` above, so one branch covers both activation-free projections and nothing else.
+
+```mermaid
+flowchart TD
+    call(["MyLinear.forward"]) --> gate{"LINEAR_BIAS<br/>!= off ?"}
+    gate -->|"no"| aten["F.linear — cuBLAS"]
+    gate -->|"yes"| rows{"M &lt;= _LINEAR_BIAS_MAX_ROWS ?"}
+    rows -->|"no"| aten
+    rows -->|"yes"| cov{"extension covers<br/>this shape ?"}
+    cov -->|"no"| aten
+    cov -->|"yes"| custom["linear_bias — fp16 fragments,<br/>vectorized float4/float2 epilogue"]
+
+    classDef hostwork fill:#f1f5f9,stroke:#64748b,stroke-width:1.5px,color:#0f172a;
+    classDef devicework fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#0f172a;
+    classDef fallback fill:#fef3c7,stroke:#d97706,stroke-width:1.5px,color:#0f172a;
+    class gate,rows,cov hostwork;
+    class custom devicework;
+    class aten fallback;
+```
+
+**Why it wins.** cuBLAS serves these in TF32, and at the small-`K` grading shapes it selects `cutlass_80_simt_sgemm_128x256` — not tensor cores at all. fp16 fragments carry the same 10-bit mantissa at twice the rate. Measured against cuBLAS TF32 at its own shapes: **1.539x–1.658x**; per-op, 1.204x at shape 1's `[8192,128]x[128,128]`, 1.529x at shape 8's `[8192,1024]x[1024,1024]`, and ~2.0x–2.2x at the launch-bound small shapes.
+
+**Why the row bound exists.** 1,280,000 rows is the largest `M` measured, standalone and in the model. `_LINEAR_BIAS_MAX_ROWS` is a documented edge of tested ground, not a claim that the kernel loses beyond it. It is deliberately **not** in `_graph_key`: every shape that captures a graph is at most 8192 rows, so both settings dispatch identically there and no captured graph can depend on it.
+
+**Input narrowing is a separate axis.** `QKV_FP16` hands the attention kernel its q/k/v already in fp16 rather than fp32 it narrows itself, gated below `_QKV_FP16_MIN_ROWS` where the conversion costs more than the halved write saves. `NORMED_FP16` stores a LayerNorm's normalised output as fp16 where its consumer is the QKV GEMM, which narrows it anyway — bit-identical, since the GEMM stages A through `__float2half` regardless. It declines above `_NORMED_FP16_MAX_K`: at `d_model` 1024 that GEMM is compute-bound near the TF32 roofline, there is no bandwidth to reclaim, and the added conversion measures **0.850x**. The residual stream `x_new` and the model's final norm are never narrowed.
+
+---
+
 ## 8. Dispatch Thresholds Reference
 
 | Parameter Constant | Value | Behavioral Effect |
@@ -517,6 +547,11 @@ Fallbacks occur exclusively on coverage constraints: `float32` input, `K % 4 == 
 | `_GRAPH_MAX_ENTRIES` | `4` | Max distinct CUDA Graph cache entries per model instance; each maintains a dedicated memory pool |
 | `_GRAPH_POOL_SAFETY_FRACTION` | `0.25` | Captured graph pool memory cap; pools exceeding 25% GPU VRAM are released |
 | `_FFN_BLOCK_MAX_D` | `64` | Maximum `d_model` for fused FFN block execution; larger dimensions execute unfused 4-kernel chain |
+| `_LINEAR_BIAS_MAX_ROWS` | `2097152` | Row ceiling for routing activation-free projections through `linear_bias`; above it, `F.linear`. Covers shape 6's 1,280,000 rows. Deliberately absent from `_graph_key` |
+| `_QKV_FP16_MIN_ROWS` | `1024` | Minimum `M` before q/k/v are handed to attention already in fp16; crossover measured between 512 and 2048, so shapes 2 and 3 sit under it |
+| `_NORMED_FP16_MAX_K` | `128` | Maximum `d_model` for storing a LayerNorm's output as fp16 on QKV-feeding edges; at 1024 the GEMM is compute-bound and the conversion measures 0.850x |
+| `WMMA_REG_SOFTMAX` | `1` | Compile-time. Softmax runs in the wmma accumulators and `s_s` is never allocated, freeing 6.00–10.00 KB per block |
+| `WMMA_KV_STAGES` | `2` | Compile-time cap on `cp.async` K/V staging depth; 2 is double buffering. Requires 4+ key tiles and `DIM == PDIM` |
 | `layernorm_warp_width` | `256` | Hidden dimension threshold: $\le 256$ uses warp-per-row LayerNorm; $> 256$ uses block-per-row |
 | `_MICROBATCH_PEAK_FACTOR` | `10` | Peak memory prediction multiplier per row, evaluated against 85% VRAM to set batch splitting |
 | `_MICROBATCH_BUDGET_FRACTION` | `0.85` | VRAM allocation budget limit (preserves whole-batch execution for shape 6 at 6.10 GiB / 6.80 GiB) |
@@ -530,7 +565,16 @@ Fallbacks occur exclusively on coverage constraints: `float32` input, `K % 4 == 
 
 The two-axis dispatch split documented in Sections 2 and 3 is **complete** as of `99c8cd8`
 ("Separate the attention kernel from the arithmetic it uses"), and the source comments describing
-it have been brought in line. Nothing is open.
+it have been brought in line.
+
+Since then an autonomous optimization loop has run nineteen cycles over this tree, adding the
+`linear_bias` projection path of Section 7a, the fp16 input edges (`QKV_FP16`, `NORMED_FP16`), the
+`cp.async` K/V staging and register-resident softmax of Section 4.1, and the vectorized GEMM
+epilogue. Every cycle — accepted or rejected — has a row in
+[`docs/OPTIMIZATION_LEDGER.md`](docs/OPTIMIZATION_LEDGER.md), which is the authority on what is in
+the tree and why; the system prompt it works to is
+[`docs/goal_prompt.md`](docs/goal_prompt.md). Open candidates with evidence behind them but no
+verdict yet are listed there rather than here.
 
 The split touched three layers, all landed: `run_kernel` carries only the four kernel choices and
 derives the tile math mode through `tile_math_for(prec)`; `AttnArgs::prec` is populated in

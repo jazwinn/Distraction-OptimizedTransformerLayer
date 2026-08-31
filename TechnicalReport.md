@@ -1,5 +1,38 @@
 # *Distraction*, A faster attention layer for Transformers Technical Report
 
+## Summary
+
+A Transformer layer was rewritten to run faster on a graphics card, using custom GPU code in place
+of the standard PyTorch operations, while keeping its output within the accuracy tolerance the
+grader applies.
+
+Measuring the original showed the problem was not arithmetic. Most of the time went on moving one
+large table of numbers — the grid of relevance scores that attention produces — back and forth
+between the card's fast on-chip memory and its main memory. At long sequences, real arithmetic
+accounted for under a third of the time.
+
+The rewrite computes that grid in small pieces that never leave the chip, runs both of attention's
+multiplications on the card's dedicated matrix-multiply hardware, and combines neighbouring steps so
+intermediate results stop making needless trips to memory. Twenty-four further changes address what
+remains, from redundant data copies to the cost of issuing thousands of small instructions.
+
+**Results across all fourteen graded test shapes**, every one passing the accuracy check with zero
+failing values:
+
+| | Speedup |
+| --- | ---: |
+| Best (batch of 4) | **46.93×** |
+| Median | **13.75×** |
+| Geometric mean | **10.04×** |
+| Worst (batch of 10,000) | **1.52×** |
+
+The longest shape in the set — 100,000 words — goes from 23.3 seconds to 1.6 seconds per slice. The
+gain is largest where the original spent most of its time waiting rather than computing, and
+smallest on the two shapes the card itself limits: the widest model, where it was already busy, and
+a batch of 10,000, whose working set does not fit in 8 GB.
+
+---
+
 ## Contents
 
 - **[1. The Problem and the Goal](#1-the-problem-and-the-goal)**
@@ -21,7 +54,7 @@
     - [3.3 The cost of longer sequences](#33-the-cost-of-longer-sequences)
     - [3.4 The problems](#34-the-problems)
     - [3.5 Goals for the project](#35-goals-for-the-project)
-- **[4. The Attention Implementation](#4-the-attention-implementation)**
+- **[4. The Custom Attention Implementation](#4-the-custom-attention-implementation)**
     - [4.1 The attention algorithm](#41-the-attention-algorithm)
     - [4.2 Why C++/CUDA](#42-why-ccuda)
     - [4.3 First attempt: one thread per row](#43-first-attempt-one-thread-per-row)
@@ -55,37 +88,6 @@
     - [10.3 The understanding behind this is newer than the results suggest](#103-the-understanding-behind-this-is-newer-than-the-results-suggest)
 
 ---
-
-## Summary
-
-A Transformer layer was rewritten to run faster on a graphics card, using custom GPU code in place
-of the standard PyTorch operations, while keeping its output within the accuracy tolerance the
-grader applies.
-
-Measuring the original showed the problem was not arithmetic. Most of the time went on moving one
-large table of numbers — the grid of relevance scores that attention produces — back and forth
-between the card's fast on-chip memory and its main memory. At long sequences, real arithmetic
-accounted for under a third of the time.
-
-The rewrite computes that grid in small pieces that never leave the chip, runs both of attention's
-multiplications on the card's dedicated matrix-multiply hardware, and combines neighbouring steps so
-intermediate results stop making needless trips to memory. Twenty-four further changes address what
-remains, from redundant data copies to the cost of issuing thousands of small instructions.
-
-**Results across all fourteen graded test shapes**, every one passing the accuracy check with zero
-failing values:
-
-| | Speedup |
-| --- | ---: |
-| Best (batch of 4) | **46.93×** |
-| Median | **13.75×** |
-| Geometric mean | **10.04×** |
-| Worst (batch of 10,000) | **1.52×** |
-
-The longest shape in the set — 100,000 words — goes from 23.3 seconds to 1.6 seconds per slice. The
-gain is largest where the original spent most of its time waiting rather than computing, and
-smallest on the two shapes the card itself limits: the widest model, where it was already busy, and
-a batch of 10,000, whose working set does not fit in 8 GB.
 
 ## 1. The Problem and the Goal
 
@@ -519,7 +521,7 @@ per-kernel overhead that sets the floor at small sizes.
 
 ---
 
-## 4. The Attention Implementation
+## 4. The Custom Attention Implementation
 
 This section is about attention specifically: what the kernels compute, and how three different
 implementations of it were built and compared. Section 6 catalogues every optimization across the

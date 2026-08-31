@@ -6,6 +6,13 @@ A submission to **TikTok TechJam 2026, Problem Statement 3: "Implement a GPU Ker
 Transformer Layer."** It runs the same Transformer layer as the reference implementation, produces
 the same answers, and runs faster.
 
+**The full write-up is [TechnicalReport.md](TechnicalReport.md)**, and it follows the path the work
+took: profiling the baseline to find where the time actually went, building the custom attention
+kernel that stops the wasted memory traffic, then an AI-driven optimization loop that measured every
+further idea and kept the twenty-five that earned it, the dispatch architecture that decides which
+kernel runs for which input, and the limitations that remain. This README covers what it is, how to
+build it, and how to reproduce the numbers.
+
 - [Project overview](#project-overview)
 - [Setup and installation](#setup-and-installation)
 - [The benchmark dashboard](#the-benchmark-dashboard)
@@ -20,95 +27,65 @@ the same answers, and runs faster.
 
 ### The task
 
-A **Transformer** is the design behind most modern AI systems — chatbots, translation, speech,
-recommendations. A **kernel** is a small program that runs on the graphics card (GPU) rather than on
-the main processor. The task was to write faster kernels for one Transformer layer.
+A **Transformer** is the design behind most modern AI systems. A **kernel** is a small program that
+runs on the graphics card (GPU) rather than the main processor. The task was to write faster kernels
+for one Transformer layer.
 
-The catch is accuracy. The fast version's output is compared against the reference version's
-output, number by number, and every single number must be either **within 0.002** of the reference
-or **within 2%** of it. The benchmark runs that check before it times anything, and skips the
-timing entirely if it fails — so a speedup number always belongs to a correct result.
+The catch is accuracy. Every number the fast version produces must be **within 0.002** of the
+reference or **within 2%** of it, and the benchmark skips the timing entirely if the check fails —
+so a speedup number always belongs to a correct result.
 
 > Make it faster without meaningfully changing the answers.
 
-That constraint shapes almost every decision here, because the obvious ways to gain speed — using
-less precise numbers, taking mathematical shortcuts — are exactly the ways to fail the check.
+That shapes almost every decision here, because the obvious ways to gain speed — less precise
+numbers, mathematical shortcuts — are exactly the ways to fail the check.
 
 ### Why the original is slow
 
-The heart of a Transformer is **self-attention**. To work out what "it" refers to in a sentence,
-every word compares itself against every other word and scores how relevant each one is. Those
-scores form a grid: one number for every pair of words.
+The heart of a Transformer is **self-attention**: every word compares itself against every other
+word and scores how relevant each one is. Those scores form a grid, one number per pair of words.
 
-That grid is the problem. Double the length of the text and the grid *quadruples*, because it grows
-in both directions at once. At 2048 words it is 128 MiB for a single layer — and the reference
-implementation sends it out to the card's main memory and reads it back five separate times, once
-each to create it, rescale it, mask it, convert the scores to weights, and finally use it.
-
-Measuring the reference showed that real arithmetic falls from 70% of the time at short inputs to
-**under a third** at long ones. Everything else is data being moved around.
-
-At the other extreme, very small inputs are slow for the opposite reason: the card finishes each
-small piece of work before the next one arrives and spends most of the pass waiting to be given
-something to do.
+That grid is the problem. Double the length of the text and it *quadruples*. At 2048 words it is
+128 MiB for a single layer — and the reference sends it out to the card's main memory and reads it
+back five separate times, once each to create it, rescale it, mask it, convert the scores to
+weights, and use it. Real arithmetic falls from 70% of the time at short inputs to **under a third**
+at long ones; the rest is data being moved. Very small inputs are slow for the opposite reason: the
+card finishes each piece of work before the next arrives and spends the pass waiting.
 
 ### What was built
 
-Attention was rewritten so that the grid of scores is built, masked, scored and used **in small
-pieces that never leave the chip's fast on-chip memory**. Three complete versions of it exist:
+Attention was rewritten so the grid of scores is built, masked, scored and used **in small pieces
+that never leave the chip's fast on-chip memory**. Three complete versions exist: a tensor-core
+kernel (the default, running both of attention's multiplications on the card's matrix-multiply
+hardware), a simple one-thread-per-word kernel that covers older cards and serves as the correctness
+reference, and a tile kernel in NVIDIA's newer high-level style, kept as a comparison.
 
-| Version | What it is |
-| --- | --- |
-| **Tensor-core kernel** | The default. Runs both of attention's multiplications on the card's dedicated matrix-multiply hardware. |
-| **Simple kernel** | One thread per word, on the general-purpose units. Covers older cards and unusual sizes, and acts as the reference the faster ones are checked against. |
-| **Tile kernel** | The same maths written in a newer, higher-level style NVIDIA offers. Kept as a comparison between ease of writing and speed. |
+**There is no prebuilt attention anywhere in this project.** Implementing attention *is* the task,
+so a size nothing covers is reported as an error rather than quietly handed to somebody else's code.
 
-**There is no prebuilt attention anywhere in this project.** Most libraries would hand an awkward
-input size to an existing implementation; this one does not, because implementing attention *is* the
-task. A size nothing covers is reported as an error rather than quietly served by somebody else's
-code.
+The tensor-core kernel is the fastest of the three on every shape, and beats PyTorch's own fused
+attention by **1.7× to 5.8×** everywhere except the widest head size, where the two tie. That is
+what makes it the default:
 
+![Attention time for four implementations across every test shape](images/attention-comparison.png)
 
-One layer of the finished model, with every decision made before anything reaches the card.
-Grey is a decision on the processor, green a kernel on the card, amber the fused kernel that
-replaces four of them:
+Which kernel runs for which input is decided on the processor before anything reaches the card, so
+the card never waits for the answer — laid out in [TechnicalReport.md](TechnicalReport.md) section 7,
+and drawn out one decision at a time in [attention_dispatch_graph.md](attention_dispatch_graph.md).
 
-```mermaid
-flowchart TD
-    entry(["forward"]) --> probe["check the mask once"]
-    probe --> cache{"seen this shape<br/>before?"}
-    cache -->|"yes"| replay["replay the recording"]
-    cache -->|"no"| eager["issue kernels one by one"]
+Around that sit twenty-four further changes — fusing neighbouring steps, hand-written tensor-core
+kernels for every large multiplication, skipping regions of the grid that would be thrown away, and
+recording the whole sequence of GPU commands so it replays as a single instruction.
 
-    replay ==>|"one instruction"| qkv["combined Q/K/V multiply"]
-    eager ==>|"per kernel"| qkv
-    qkv --> attn["custom attention kernel"] --> outp["output multiply"] --> gate{"model width"}
-    gate -->|"64 or less"| fused["one fused kernel"]
-    gate -->|"wider"| chain["four separate kernels"]
-    fused --> out(["layer output"])
-    chain --> out
-    out -.->|"next layer"| qkv
+The later ones came out of an **autonomous optimization loop**: an agent proposes a change, builds
+it, times it, and keeps it only if every shape still passes the accuracy check, the overall score
+improves and no shape regresses more than 1%. Eighteen cycles took the thirteen shapes it runs from
+6.83× to 9.59×, and the cycles that kept nothing are as visible as the ones that worked:
 
-    classDef host fill:#f1f5f9,stroke:#64748b,color:#0f172a;
-    classDef dev fill:#dcfce7,stroke:#16a34a,color:#0f172a;
-    classDef fuse fill:#fef3c7,stroke:#d97706,color:#0f172a;
-    class probe,cache,replay,eager,gate host;
-    class qkv,attn,outp,chain dev;
-    class fused fuse;
-```
+![Speed after each cycle of the loop](images/geomean-by-iteration.png)
 
-
-
-*Every gate above is explained, with the measurement behind it, in
-[TechnicalReport.md](TechnicalReport.md) section 6 — and drawn out in full, one decision at a
-time, in [attention_dispatch_graph.md](attention_dispatch_graph.md).*
-
-
-Around that sit nineteen further changes — combining neighbouring steps into single kernels, doing
-three small multiplications as one large one, reading data where it already sits instead of copying
-it, skipping regions of the grid that would only be thrown away, and recording the whole sequence of
-GPU commands once so it can be replayed as a single instruction. Each one is listed with its
-measured effect in [TechnicalReport.md](TechnicalReport.md), section 5.
+Each change and its measured effect is in [TechnicalReport.md](TechnicalReport.md); every cycle,
+accepted or rejected, is in [docs/OPTIMIZATION_LEDGER.md](docs/OPTIMIZATION_LEDGER.md).
 
 ### The machine everything was measured on
 
@@ -124,53 +101,41 @@ Every number in this project comes from one machine:
 | C++ compiler | Microsoft Visual C++ 14.44 |
 | Framework | PyTorch 2.12, Python 3.10 |
 
-The graphics card is the part that matters. It sets which kernels can run at all, and it sets the
-speedups: the largest gains here come from keeping the card busy, so a faster card would starve at
-larger input sizes and a slower one at smaller ones. Every tuned constant in the project was chosen
-by measurement on this card.
+The card is the part that matters: it sets which kernels can run at all, and every tuned constant
+was chosen by measurement on it. A faster card would starve at larger input sizes, a slower one at
+smaller ones.
 
 ### Results
 
-All fourteen official test cases. Every one passes the accuracy check, with **zero** failing
-numbers out of the billions compared.
+All fourteen official test cases. Every one passes the accuracy check, with **zero** failing numbers
+out of the 6.93 billion compared.
 
 | Across all fourteen | Speedup |
 | --- | ---: |
-| Average (geometric mean) | **8.13×** |
-| Median | **9.39×** |
-| Best — a single sequence | **39.67×** |
-| Worst — the widest model | **1.41×** |
+| Average (geometric mean) | **10.04×** |
+| Median | **13.75×** |
+| Best — a batch of 4 | **46.93×** |
+| Worst — a batch of 10,000 | **1.52×** |
 | Cases at 4× or better | 11 of 14 |
 | Cases failing the accuracy check | **0 of 14** |
 
-Case by case:
-
 ![Speedup on each of the 14 official test shapes](images/speedup-by-shape.png)
 
-
-**The spread is wide, and it is not random.** The biggest gains are where the card was sitting idle:
-cases 2 and 3 give it so little work at a time that the original spent most of the pass waiting to
-be handed something, and removing that wait is worth 39.7× and 23.4× on its own. The next tier is
-where the grid of scores dominates — cases 13 and 14 have the longest inputs, so never writing that
-grid out is worth 15.1× and 22.8×. The smallest gain, case 8, is the widest model, where the rest
-of the layer dwarfs attention and the card was kept busy either way.
-
-Cases 9 and 10 are the honest low points. One or two heads give the card very few independent pieces
-of work, so much of it sits idle however the kernel is written.
-
-Case 14 is a special one: 32 sequences of 100,000 words need 12.2 GB of input on a card with 8 GB,
-so it does not fit. The model predicts that before starting and processes the batch in slices, which
-is why its timing is quoted per slice. This is the one place where the hardware rather than the
-implementation sets the ceiling.
+**The spread is wide, and it is not random.** The biggest gains are where the card was sitting idle,
+and the next tier is where the grid of scores dominates. The two smallest are cases where the
+original was already efficient — the widest model, where the rest of the layer dwarfs attention, and
+a batch of 10,000, whose working set does not fit in 8 GB. Both are hardware limits no kernel change
+reaches. The per-case reasoning is in [TechnicalReport.md](TechnicalReport.md), section 9.
 
 ### What is in the repository
 
 | Location | What is in it |
 | --- | --- |
-| `csrc/` | The GPU code — every kernel, about 5,700 lines |
+| `csrc/` | The GPU code — every kernel, about 6,600 lines |
 | `optimized/` | The Python side: the rewritten layer, and which kernel runs when |
 | `scripts/` | Correctness checks and measurement scripts |
 | `dashboard/` | A local web page for running benchmarks and reading the results |
+| `docs/` | The optimization ledger, the loop's system prompt, and the write-ups |
 | `torch_transformer_benchmark.py` | The organizers' benchmark, with this project wired into it |
 
 ---
@@ -246,7 +211,7 @@ cmd.exe /c scripts\devenv.bat python scripts\verify_attn_axes.py   # every kerne
 cmd.exe /c scripts\devenv.bat python scripts\verify_graph.py       # the recorded version matches the normal one exactly
 ```
 
-### 4. Find the CUDA graph gate value for your machine
+### 4. Find the CUDA graph gate value for your machine (Optional)
 
 Optional, and only worth doing on a card that is not an RTX 3070.
 
@@ -440,8 +405,10 @@ limits — faster.
 
 | Document | What it covers |
 | --- | --- |
-| **[TechnicalReport.md](TechnicalReport.md)** | The full write-up: the problem, the tools used, why the original is slow, all twenty optimizations and what each was worth, results, limitations, and the AI-use disclosure. **Start here.** |
+| **[TechnicalReport.md](TechnicalReport.md)** | The full write-up: the problem, the tools used, why the original is slow, all twenty-five optimizations and what each was worth, results, limitations, and the AI-use disclosure. **Start here.** |
 | [attention_dispatch_graph.md](attention_dispatch_graph.md) | Which kernel runs for which input, as a diagram |
+| [docs/OPTIMIZATION_LEDGER.md](docs/OPTIMIZATION_LEDGER.md) | Every optimization ever proposed — accepted, measured-and-rejected, or killed before a line was written — with the measurement behind each verdict |
+| [docs/goal_prompt.md](docs/goal_prompt.md) | The system prompt the autonomous optimization loop runs to: its scope, its rules, and its accept/reject gate |
 | [dashboard/README.md](dashboard/README.md) | The benchmark dashboard in full: every tab, the measurement rules it enforces, the preflight checks that refuse impossible runs, how the form stays in sync with the harness, and how runs are stopped and cleaned up |
 | [docs/Record.md](docs/Record.md) | The engineering record: every measurement in the order it was taken, including the ones that came back negative |
 | [csrc/TUNING.md](csrc/TUNING.md) | The measurements behind every tuned constant in the kernels |
