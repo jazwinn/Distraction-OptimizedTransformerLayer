@@ -28,32 +28,31 @@
     - [4.4 Moving to the tensor cores](#44-moving-to-the-tensor-cores)
     - [4.5 Tile programming](#45-tile-programming)
     - [4.6 All four, measured side by side](#46-all-four-measured-side-by-side)
-- **[5. The Optimizations Implemented](#5-the-optimizations-implemented)**
-    - [5.1 Kernel-level optimizations](#51-kernel-level-optimizations)
-    - [5.2 Execution-level optimizations](#52-execution-level-optimizations)
-    - [5.3 Tuning the block shapes](#53-tuning-the-block-shapes)
-- **[6. Architecture and Dispatch](#6-architecture-and-dispatch)**
-    - [6.1 The forward pass](#61-the-forward-pass)
-    - [6.2 Choosing the attention kernel](#62-choosing-the-attention-kernel)
-    - [6.3 Inside the attention kernel](#63-inside-the-attention-kernel)
-    - [6.4 Precision is a separate choice](#64-precision-is-a-separate-choice)
-    - [6.5 The decisions and their thresholds](#65-the-decisions-and-their-thresholds)
-- **[7. Dashboard and Profiling](#7-dashboard-and-profiling)**
-    - [7.1 What it is](#71-what-it-is)
-    - [7.2 The measurement rules it enforces](#72-the-measurement-rules-it-enforces)
-    - [7.3 Profiling](#73-profiling)
-- **[8. Results](#8-results)**
-    - [8.1 Reading the spread](#81-reading-the-spread)
-    - [8.2 Shape 14, and the limits of an 8 GB card](#82-shape-14-and-the-limits-of-an-8-gb-card)
-- **[9. Limitations](#9-limitations)**
-    - [9.1 The matrix-multiply hardware is barely used](#91-the-matrix-multiply-hardware-is-barely-used)
-    - [9.2 Everything is tuned for exactly one machine](#92-everything-is-tuned-for-exactly-one-machine)
-    - [9.3 The understanding behind this is newer than the results suggest](#93-the-understanding-behind-this-is-newer-than-the-results-suggest)
-- **[10. AI Involvement During Development](#10-ai-involvement-during-development)**
-    - [10.1 The tools, and what they enabled](#101-the-tools-and-what-they-enabled)
-    - [10.2 The optimization development loop](#102-the-optimization-development-loop)
-    - [10.3 What it could not be trusted with](#103-what-it-could-not-be-trusted-with)
-    - [10.4 Working with AI, not instead of it](#104-working-with-ai-not-instead-of-it)
+- **[5. AI Involvement During Development](#5-ai-involvement-during-development)**
+    - [5.1 The tools, and what they enabled](#51-the-tools-and-what-they-enabled)
+    - [5.2 The optimization development loop](#52-the-optimization-development-loop)
+    - [5.3 Working with AI, not instead of it](#53-working-with-ai-not-instead-of-it)
+- **[6. The Optimizations Implemented](#6-the-optimizations-implemented)**
+    - [6.1 Kernel-level optimizations](#61-kernel-level-optimizations)
+    - [6.2 Execution-level optimizations](#62-execution-level-optimizations)
+    - [6.3 Tuning the block shapes](#63-tuning-the-block-shapes)
+- **[7. Architecture and Dispatch](#7-architecture-and-dispatch)**
+    - [7.1 The forward pass](#71-the-forward-pass)
+    - [7.2 Choosing the attention kernel](#72-choosing-the-attention-kernel)
+    - [7.3 Inside the attention kernel](#73-inside-the-attention-kernel)
+    - [7.4 Precision is a separate choice](#74-precision-is-a-separate-choice)
+    - [7.5 The decisions and their thresholds](#75-the-decisions-and-their-thresholds)
+- **[8. Dashboard and Profiling](#8-dashboard-and-profiling)**
+    - [8.1 What it is](#81-what-it-is)
+    - [8.2 The measurement rules it enforces](#82-the-measurement-rules-it-enforces)
+    - [8.3 Profiling](#83-profiling)
+- **[9. Results](#9-results)**
+    - [9.1 Reading the spread](#91-reading-the-spread)
+    - [9.2 Shape 14, and the limits of an 8 GB card](#92-shape-14-and-the-limits-of-an-8-gb-card)
+- **[10. Limitations](#10-limitations)**
+    - [10.1 The matrix-multiply hardware is barely used](#101-the-matrix-multiply-hardware-is-barely-used)
+    - [10.2 Everything is tuned for exactly one machine](#102-everything-is-tuned-for-exactly-one-machine)
+    - [10.3 The understanding behind this is newer than the results suggest](#103-the-understanding-behind-this-is-newer-than-the-results-suggest)
 
 ---
 
@@ -70,7 +69,7 @@ accounted for under a third of the time.
 
 The rewrite computes that grid in small pieces that never leave the chip, runs both of attention's
 multiplications on the card's dedicated matrix-multiply hardware, and combines neighbouring steps so
-intermediate results stop making needless trips to memory. Nineteen further changes address what
+intermediate results stop making needless trips to memory. Twenty-four further changes address what
 remains, from redundant data copies to the cost of issuing thousands of small instructions.
 
 **Results across all fourteen graded test shapes**, every one passing the accuracy check with zero
@@ -78,14 +77,15 @@ failing values:
 
 | | Speedup |
 | --- | ---: |
-| Best (single sequence, batch 1) | **39.67×** |
-| Median | **9.39×** |
-| Geometric mean | **8.13×** |
-| Worst (widest model, 1024) | **1.41×** |
+| Best (batch of 4) | **46.93×** |
+| Median | **13.75×** |
+| Geometric mean | **10.04×** |
+| Worst (batch of 10,000) | **1.52×** |
 
-The longest shape in the set — 100,000 words — goes from 43.2 seconds to 1.9 seconds per slice, and
-a batch of 10,000 from 6.9 seconds to 1.1. The gain is largest where the original spent most of its
-time waiting rather than computing, and smallest on the widest model, where it was already busy.
+The longest shape in the set — 100,000 words — goes from 23.3 seconds to 1.6 seconds per slice. The
+gain is largest where the original spent most of its time waiting rather than computing, and
+smallest on the two shapes the card itself limits: the widest model, where it was already busy, and
+a batch of 10,000, whose working set does not fit in 8 GB.
 
 ## 1. The Problem and the Goal
 
@@ -522,7 +522,7 @@ per-kernel overhead that sets the floor at small sizes.
 ## 4. The Attention Implementation
 
 This section is about attention specifically: what the kernels compute, and how three different
-implementations of it were built and compared. Section 5 catalogues every optimization across the
+implementations of it were built and compared. Section 6 catalogues every optimization across the
 whole model, attention included, and what each one was worth.
 
 **The bar is PyTorch's own fused attention.** A custom kernel is only worth writing if it beats
@@ -633,80 +633,57 @@ correctness check on the faster kernel.
 The matrix-multiply units only accept fixed-size blocks — 16 rows by 16 columns — so reaching them
 means restructuring the kernel around tiles rather than rows. The interface is called **wmma**, and
 it works through **fragments**: bundles of registers, shared across 32 threads, holding one tile.
+Each block takes 64 Query rows across four thread groups and walks the Keys in tiles of 32 — the
+tuned constants of section 6.3, so not the same at every head size.
 
-Each block takes 64 Query rows split across four thread groups, and walks the Keys in tiles of 32.
-Those two sizes are the tuned constants of section 5.3, so they are not the same at every head
-size — above 64 dimensions per head the block narrows to 32 rows.
+**Simply calling the tensor-core instructions made it slower**, at 0.75× the simple kernel. Three
+changes turned it into a win. Padding the scratch memory took it to 0.90×: that memory is divided
+into banks, and threads reading rows a convenient distance apart land in the same bank, so a few
+unused values at the end of each row shift them out of alignment. Keeping the Query and the output
+in registers took it to 1.13×, since the output then accumulates across the whole loop instead of
+being written out and read back each time. Giving each softmax thread a whole row rather than a
+column took it to **1.94×**, the largest single improvement in the kernel — softmax adds up along
+rows, so a column-wise assignment turns every total into a multi-step exchange between threads.
 
-**Simply calling the tensor-core instructions made it slower.** Three further changes turned it
-into a win:
-
-| Stage | Speed vs the SIMT kernel |
-| --- | ---: |
-| Tensor-core version, written the obvious way | **0.75×** (slower) |
-| Padding the scratch memory layout | 0.90× |
-| Keeping Query and output in registers | 1.13× |
-| One softmax thread per row instead of per column | **1.94×** |
-
-**Padding the scratch memory.** Fast scratch memory is divided into banks, and threads reading
-rows a convenient distance apart land in the same bank, so their reads queue up instead of
-happening at once. Adding a few unused values to the end of each row shifts them out of alignment.
-
-**Keeping Query and output in registers.** The output accumulates across the whole loop instead of
-being written out and read back each time. This needs the softmax to rescale individual values
-inside a fragment — but which position holds which row is undocumented. The kernel originally
-discovered it by experiment: fill a fragment with markers, write it out, read back where each
-landed, invert the mapping. That pattern turned out to follow a short formula, which the kernel now
-uses instead; the experiment still runs once at startup to confirm the formula matches the card,
-and falls back to it if not.
-
-**One softmax thread per row.** The natural assignment gives each thread one column, but softmax
-adds up along *rows*, so every total needs a five-step exchange between threads. Giving each thread
-a whole row instead leaves one exchange. This was the largest single improvement.
+Keeping the output in registers needs the softmax to rescale individual values inside a fragment,
+and which position holds which row is undocumented. The kernel originally found out by experiment:
+fill a fragment with markers, write it out, read back where each landed. That pattern turned out to
+follow a short formula, which the kernel now uses; the experiment still runs once at startup to
+confirm the formula matches the card, and it falls back if not.
 
 ---
 
 ### 4.5 Tile programming
 
-NVIDIA now offers a higher-level style where work is described **per block rather than per
-thread**. A tile is a fixed-size array the whole block owns, one call multiplies two of them, and
-register allocation, load scheduling, bank-conflict avoidance and synchronisation all become the
-compiler's job. The attention kernel written this way contains no thread indexing at all.
+NVIDIA now offers a higher-level style where work is described **per block rather than per thread**.
+A tile is a fixed-size array the whole block owns, one call multiplies two of them, and register
+allocation, load scheduling, bank-conflict avoidance and synchronisation all become the compiler's
+job. The attention kernel written this way contains no thread indexing at all. A third complete
+implementation was built in this style, running the same maths as the other two and covering head
+sizes from 8 to 256.
 
-A third complete implementation was built in this style, running the same maths as the other two
-and covering head sizes from 8 to 256.
+**Four precision modes, selectable at run time.** Only the two multiplications' inputs are narrowed;
+the softmax, the running totals, the accumulator and the data going in and out stay at full
+precision in every mode. fp32 runs on the general-purpose units — no tensor core performs a
+full-precision multiply — and at ~1e-6 it is the most accurate kernel in the project; fp16 and TF32
+reach the matrix hardware at ~1e-3, bf16 at ~4e-3. Narrowing the inputs is what moves the work onto
+the faster units.
 
-**Four precision modes, selectable at run time.** Only the two multiplications' inputs are narrowed
-— the softmax, the running totals, the accumulator, and the data going in and out stay at full
-precision in every mode.
+**A free transpose.** The first multiplication needs the Keys turned on their side. Rather than
+shuffling the whole tile through scratch memory, the Key tile is *declared* with its dimensions
+reversed, so the values are read in transposed order at no cost.
 
-| Mode | Runs on | Accuracy |
-| --- | --- | --- |
-| fp32 | General-purpose units | ~1e-6 — the most accurate kernel in the project |
-| fp16 | Matrix-multiply hardware | ~1e-3 |
-| TF32 | Matrix-multiply hardware | ~1e-3 |
-| bf16 | Matrix-multiply hardware | ~4e-3 |
+**Reading data in place.** The same layout mechanism separates the spacing between rows from the row
+length, which lets the kernel read Query, Key and Value where they already sit — goal D, in the tile
+kernel.
 
-No tensor core performs a full-precision multiply, so the fp32 mode necessarily runs on the
-general-purpose units. Narrowing the inputs is what moves the work onto the faster hardware.
+**Splitting long key ranges.** With too few sequences and heads to fill the card, the Keys are split
+across extra blocks, each writing its partial result and running totals for a second pass to fold
+together.
 
-**A free transpose.** The first multiplication needs the Keys turned on their side. Doing that
-literally means shuffling the whole tile through scratch memory once per tile. Instead the Key tile
-is *declared* with its dimensions reversed, so the values are read in transposed order at no cost.
-
-**Reading data in place.** The same layout mechanism decouples the spacing between rows from the
-row length, which lets the kernel read Query, Key and Value where they already sit rather than
-requiring copies — goal D, in the tile kernel.
-
-**Splitting long key ranges.** When there are too few sequences and heads to fill the card, the
-kernel splits the Keys across extra blocks, writes each block's partial result and running totals
-to scratch space, and folds them together in a second pass.
-
-**Block sizes are measured, not derived.** Every combination of head size, precision mode, and
-whether masking is used has its own tile shape, chosen by sweeping them rather than by reasoning.
-
-When the toolkit is too old to support any of this, the file compiles into a stub that declines,
-so the other two kernels are unaffected.
+Every combination of head size, precision mode and masking has its own tile shape, swept rather than
+reasoned about. When the toolkit is too old to support any of this, the file compiles into a stub
+that declines, so the other two kernels are unaffected.
 
 ---
 
@@ -714,27 +691,6 @@ so the other two kernels are unaffected.
 
 The section opened by saying the bar is PyTorch's own fused attention. This is that measurement:
 all three implementations and PyTorch's, on the attention step alone, timed alternately in one run.
-
-Milliseconds on the left, speedup over PyTorch on the right. Higher is better in the ratio columns;
-below 1.00× means PyTorch wins.
-
-| Case | SDPA | scalar | wmma | tile | scalar × | wmma × | tile × | control |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| tiny | 0.028 | 0.015 | 0.017 | 0.018 | 1.89× | 1.70× | 1.53× | 0.986× |
-| tiny causal | 0.026 | 0.016 | 0.014 | 0.016 | 1.68× | 1.85× | 1.66× | *1.185×* |
-| tiny padded | 0.072 | 0.018 | 0.019 | 0.019 | 4.01× | 3.79× | 3.76× | *0.891×* |
-| tiny causal+pad | 0.072 | 0.018 | 0.019 | 0.019 | 3.98× | 3.81× | 3.77× | 1.011× |
-| default | 0.086 | 0.145 | 0.031 | 0.073 | 0.59× | **2.76×** | 1.17× | 0.987× |
-| default causal | 0.074 | 0.143 | 0.030 | 0.063 | 0.52× | **2.48×** | 1.18× | 1.027× |
-| default padded | 0.107 | 0.150 | 0.039 | 0.097 | 0.72× | **2.73×** | 1.11× | 0.979× |
-| default caus+pad | 0.107 | 0.147 | 0.038 | 0.096 | 0.73× | **2.79×** | 1.12× | 0.985× |
-| long seq | 1.611 | 2.766 | 0.461 | 0.865 | 0.58× | **3.49×** | 1.86× | 0.999× |
-| long seq causal | 0.988 | 2.153 | 0.297 | 0.494 | 0.46× | **3.32×** | 2.00× | 0.988× |
-| odd shape | 0.105 | 0.023 | 0.018 | 0.020 | 4.56× | **5.75×** | 5.21× | 0.980× |
-| wide head_dim | 0.032 | 0.060 | 0.023 | 0.026 | 0.54× | 1.38× | 1.21× | 1.000× |
-| wide caus+pad | 0.076 | 0.036 | 0.040 | 0.081 | 2.13× | 1.91× | 0.94× | 0.994× |
-| head_dim 256 | 0.035 | 0.179 | 0.034 | 0.132 | 0.19× | *1.03×* | 0.26× | *1.104×* |
-| head_dim 256 causal | 0.077 | 0.162 | 0.068 | 0.458 | 0.47× | 1.12× | 0.17× | *1.057×* |
 
 Run it with:
 
@@ -744,38 +700,132 @@ cmd.exe /c scripts\devenv.bat python scripts\bench_attention_vs_sdpa.py
 
 ![Attention time for four implementations across every test shape](images/attention-comparison.png)
 
-*Every case, every implementation, on one axis. The scale is logarithmic because the range is
-200:1 — `long seq` takes 2.766 ms where `tiny causal` takes 0.014 ms, and on a linear axis
-everything but the long-sequence rows would collapse to nothing. Grouped rather than stacked: the
-four bars are alternatives for the same work, not parts that add up.*
-
-**The tensor-core kernel wins every row.** It beats PyTorch's fused attention everywhere, by 1.7×
-to 5.8×, and beats both of the other implementations everywhere too. That settles which one is the
-default.
-
-**The simple kernel is not a serious competitor, and the pattern says why.** It beats PyTorch on
-small and awkward shapes — 4.0× on the tiny padded case, 4.6× on the odd shape — and loses badly on
-everything substantial, down to 0.46× on long causal sequences. It wins where the work is too small
-for anyone's tensor cores to matter and launch overhead decides, and loses as soon as real
-arithmetic does.
-
-**The tile kernel is consistently second.** It beats PyTorch on all but one row, but never beats
-the hand-written kernel — closest on long sequences (2.00× against 3.32×), furthest apart at
-head_dim 256, where it collapses to 0.17×.
-
-**One row does not support a claim.** At head_dim 256 the tensor-core kernel reads 1.03× against a
-control of 1.104×, meaning the run-to-run variation on that case is larger than the difference
-being measured. The honest reading is that it *ties* with PyTorch there, not that it wins. The
-causal version at 1.12× against a 1.057× control barely clears. Two other rows are marked for the
-same reason: `tiny causal` and `tiny padded` have controls of 1.185× and 0.891×, though their
-effects are large enough to survive it.
-
-That head_dim 256 tie is the one place PyTorch is not beaten, and it is the same shape that gives
-the weakest end-to-end result in section 8 — shape 8, at 1.41×.
+The tensor-core kernel wins every case — 1.7× to 5.8× over PyTorch, and over both other
+implementations too — which settles which one is the default. The pattern among the losers is the
+useful part: the simple kernel beats PyTorch only where the work is too small for anyone's tensor
+cores to matter and launch overhead decides, and falls to 0.46× as soon as real arithmetic does,
+while the tile kernel is consistently second and never first. One reading does not support a claim
+— at head_dim 256 the tensor-core kernel reads 1.03× against a control of 1.104×, so the
+run-to-run variation is larger than the difference being measured, and the honest reading is a tie
+rather than a win. That is the one place PyTorch is not beaten, and it is the same shape that gives
+the weakest end-to-end result among the shapes that fit the card in section 9: shape 8, at 1.80×.
 
 ---
 
-## 5. The Optimizations Implemented
+## 5. AI Involvement During Development
+
+The large optimizations are the obvious ones. Keeping the score grid on the chip, reaching the
+tensor cores, fusing neighbouring steps — those follow from reading the profile and knowing what a
+GPU is bad at. Where AI earned its place was everything after that: the smaller changes that would
+not otherwise have been found, or would have been found and judged not worth the time. By the end
+that work was running unattended.
+
+### 5.1 The tools, and what they enabled
+
+**Claude Opus** did the bulk of the kernel writing, debugging, measurement and documentation,
+working from a procedure adapted from **CUDA-Agent**, a published CUDA kernel development agent from
+ByteDance and Tsinghua. **Gemini Flash** handled supporting questions and concept checks.
+
+**What that made possible is breadth.** No single kernel wins everywhere, so the project is a matrix
+of them: four attention kernels, four number formats as an axis independent of the kernel, six
+specialised head sizes plus a general path, four other kernels, and block shapes swept per head
+size, per format and per masking mode. That is 11 kernel definitions across roughly 6,600 lines of
+CUDA, with 41 measurement scripts and 2,700 lines of recorded results behind them — more surface
+area than could have been written and tuned by hand in the time available.
+
+**The dashboard in section 8 exists for the same reason.** It is a web application, and none of it
+is GPU work: days of effort producing no kernel at all, which is exactly the kind of thing that gets
+skipped under time pressure. Built quickly, it paid for itself — every measurement rule is enforced
+by the tool rather than remembered by whoever is running it, and its profiling is what located the
+launch-bound region and the memory limits the optimizations were then aimed at.
+
+### 5.2 The optimization development loop
+
+The obvious optimizations run out quickly. What is left after them is a long tail of changes worth a
+percent or two each, and that tail is where a person's limit shows — not because any one of them is
+difficult, but because there are many, most will fail, and proposing, building and measuring one
+carefully enough to tell a small gain from noise costs about the same whether the answer turns out
+to be yes or no. Taken one at a time, the sensible move is always to skip the small ones.
+
+They stack, though: ten changes worth 1% each beat one worth 5%. So the tail was handed to a loop
+that runs closed. It proposes a change, builds it, times it against the current best and keeps or
+reverts it on a fixed rule, then starts again. A rejected candidate costs minutes rather than an
+afternoon, which is what stops the small ones being worth skipping.
+
+```mermaid
+flowchart TD
+    research["agent studies the kernels<br/>and proposes candidates"] --> ledger[("the ledger — the candidate list,<br/>and every past verdict")]
+    ledger --> pick["agent takes the<br/>next candidate"]
+    pick --> base["measure the current best"]
+    base --> build["implement the proposal"]
+    build --> retime["time the two alternately,<br/>alongside a control"]
+    retime --> ana["compare and analyse"]
+    ana --> g{"clears the rule?"}
+    g -->|"no"| drop["reverted"]
+    g -->|"yes"| keep["kept"]
+    drop --> record["written up, either way"]
+    keep --> record
+    record -.-> ledger
+
+    classDef ai fill:#f1f5f9,stroke:#64748b,color:#0f172a;
+    classDef store fill:#e2e8f0,stroke:#475569,color:#0f172a;
+    classDef mrun fill:#dcfce7,stroke:#16a34a,color:#0f172a;
+    classDef bad fill:#fecdd3,stroke:#e11d48,color:#9f1239;
+    class research,pick,build,ana ai;
+    class ledger,record store;
+    class base,retime,g,keep mrun;
+    class drop bad;
+```
+
+Grey is the agent working, green a measurement. Both outcomes are written back, so an idea that
+lost is not proposed a second time.
+
+The rule is arithmetic: a change is kept only if all thirteen shapes still pass the accuracy check,
+the overall score improves, and no single shape gets more than 1% slower — anything else is reverted
+on the spot. Every cycle writes its row either way, rejection being the normal outcome rather than
+the exception, and a recorded rejection is what stops the same idea coming round again. What the
+rule cannot catch is a change that is faster because it quietly made the problem smaller: a kernel
+that stops covering a case, a constant fitted on one shape and applied to all of them. Those pass
+every numeric check, so the system prompt the loop works to states up front what may be changed and
+what may not.
+
+The system prompt itself is [here](docs/goal_prompt.md), and the ledger of every cycle it has run
+is [here](docs/OPTIMIZATION_LEDGER.md).
+
+![Speed after each cycle of the loop](images/geomean-by-iteration.png)
+
+The gain here is throughput, not insight. Every cycle is a full rebuild, a correctness check and a
+timed comparison against the current best, run on every candidate whether it survives or not —
+careful, repetitive work, and exactly the part of optimizing that gets dropped when there is not
+enough of the day left for it. Running it unattended changed what was worth attempting at all: an
+idea no longer had to look promising enough to justify the time it would cost, only plausible enough
+to join a list. Eighteen cycles took the thirteen shapes from 6.83× to about 9.6× over the PyTorch
+baseline — roughly 40% — and almost none of that time was mine.
+
+### 5.3 Working with AI, not instead of it
+
+Neither side of this would have worked alone.
+
+**AI supplied speed and coverage.** Eleven kernels written against unfamiliar interfaces, with block
+shapes swept across every head size and number format, is more work than the time allowed. It also
+suggested things I would not have reached for — the base-2 softmax, and classifying whole tiles of
+keys rather than testing every score.
+
+**I supplied the judgement, once rather than continuously.** AI is equally confident when it is
+wrong, so someone has to decide what is actually true. Closing the loop did not remove that; it
+moved it into the rules written beforehand and the ledger read afterwards. Every case where section
+10.3 records the understanding being wrong before it was right was caught by a measurement, never by
+reading the output.
+
+The foundation in CUDA and GPU architecture is what made that judgement possible — and what made
+the rules worth handing to a loop in the first place. Without it I could not have told a real
+optimization from a plausible-sounding one, or known that a kernel using 13% of the matrix-multiply
+hardware has something left to give. AI without that check produces confident nonsense; the
+knowledge without AI produces one carefully tuned kernel instead of eleven.
+
+---
+
+## 6. The Optimizations Implemented
 
 The changes fall into two groups. **Kernel-level** optimizations change what the kernels compute or
 which one runs. **Execution-level** optimizations change nothing inside any kernel — the same work
@@ -785,82 +835,96 @@ Within each group, items are ordered by impact.
 
 ---
 
-### 5.1 Kernel-level optimizations
+### 6.1 Kernel-level optimizations
 
 | # | Optimization | Goal | Effect |
 | :---: | --- | :---: | --- |
 | 1 | Fused attention — the score grid never leaves the chip | A | Largest change; grows with sequence length |
 | 2 | Attention on the matrix-multiply hardware | A | 1.21× – 2.66× |
-| 3 | The whole post-attention chain as one kernel | F | 5.6× on that chain at small model widths |
-| 4 | Sorting key tiles by type instead of testing every score | B | Removes most of the instruction stream |
-| 5 | Skipping masked-out regions entirely | B | Large on masked inputs |
-| 6 | Fused feed-forward multiply + activation | F | 1.05× – 1.16× |
-| 7 | fp16 instead of TF32 | A | Up to 1.17× |
-| 8 | One combined Query/Key/Value multiplication | C | Removes 24 clean-up kernels per pass |
-| 9 | Fused residual add + normalisation | F | One less memory round trip per normalisation |
-| 10 | Writing results straight out instead of staging them | A | Frees 8–16 KB of fast memory; more work resident |
-| 11 | Splitting long key ranges across the chip | A | Helps when there is too little work to fill the card |
-| 12 | Normalisation rewritten to one warp per row | F | Large on that step, small share of the total |
-| 13 | Softmax computed in base 2 | A | Trades a slow instruction for a fast one |
+| 3 | The projections and feed-forward multiplication on a custom matrix kernel | — | 1.2× – 1.7× on those multiplications |
+| 4 | The whole post-attention chain as one kernel | F | 5.6× on that chain at small model widths |
+| 5 | Sorting key tiles by type instead of testing every score | B | Removes most of the instruction stream |
+| 6 | Skipping masked-out regions entirely | B | Large on masked inputs |
+| 7 | Fused feed-forward multiply + activation | F | 1.05× – 1.16× |
+| 8 | fp16 instead of TF32 | A | Up to 1.17× |
+| 9 | fp16 values feeding the multiplications | — | 1.09× overall, across three changes |
+| 10 | Overlapped key/value loading | A | 1.03× |
+| 11 | One combined Query/Key/Value multiplication | C | Removes 24 clean-up kernels per pass |
+| 12 | Fused residual add + normalisation | F | One less memory round trip per normalisation |
+| 13 | Writing results straight out instead of staging them | A | Frees 8–16 KB of fast memory; more work resident |
+| 14 | Splitting long key ranges across the chip | A | Helps when there is too little work to fill the card |
+| 15 | Normalisation rewritten to one warp per row | F | Large on that step, small share of the total |
+| 16 | Softmax computed in base 2 | A | Trades a slow instruction for a fast one |
+| 17 | Softmax kept in the multiply units' own registers | A | 1.01×; frees 6–10 KB per block |
+| 18 | Writing four results at a time out of the multiply kernel | — | 1.01× |
 
-**1 · Fused attention.** One kernel walks the score grid a tile at a time, building, scaling,
-masking, softmaxing and using each tile while it is still in fast local memory. The full grid is
-never written anywhere. Running totals for each row are carried along and corrected as new tiles
-arrive. This is the change goal A was written for, and the reason the speedup grows with sequence
-length.
+**1 · Fused attention.** One kernel walks the score grid a tile at a time, building, masking,
+softmaxing and using each tile while it is still in fast local memory. The full grid is never
+written anywhere, which is why the speedup grows with sequence length.
 
 **2 · Attention on the matrix-multiply hardware.** Both of attention's multiplications run on the
 card's dedicated units rather than its general-purpose ones.
 
-**3 · The whole post-attention chain as one kernel.** Everything after attention — normalise,
-expand, activate, shrink, normalise again — works one row at a time, so a single kernel can carry a
-block of rows through the entire chain without writing anything in between. Worth 5.6× on that
-chain at narrow model widths. It is used only below a width of 64, above which being locked to a
-fixed tile costs more than the saved traffic.
+**3 · The projections and the feed-forward multiplication on a custom matrix kernel.** These went to
+PyTorch's library routine, which at narrow inputs does not use the matrix-multiply hardware at all.
+A hand-written fp16 kernel runs the same multiplications 1.2× to 1.7× faster.
 
-**4 · Sorting key tiles by type instead of testing every score.** The original checked four
-conditions for every entry in the grid — in range, in range, allowed by masking, allowed by the
-mask table — plus the address arithmetic underneath. Inspecting the compiled output showed the two
-multiplications were **1.5% of the instructions** and roughly half the rest was this bookkeeping.
-Now each tile is classified once: tiles wholly inside the valid region carry no per-entry checks at
-all, and only tiles on the boundary pay for them.
+**4 · The whole post-attention chain as one kernel.** Everything after attention works one row at a
+time, so a single kernel can carry a block of rows through all of it without writing anything in
+between. Used only below a model width of 64, above which the fixed tile costs more than it saves.
 
-**5 · Skipping masked-out regions entirely.** Where each word may only look at earlier words, over
-half the grid would be computed and discarded. The kernel is told the mask is triangular rather
-than handed it as data, so it stops early instead.
+**5 · Sorting key tiles by type instead of testing every score.** The original checked four
+conditions for every entry in the grid; the two multiplications were **1.5% of the instructions**.
+Each tile is now classified once, and only tiles on the boundary pay per-entry checks.
 
-**6 · Fused feed-forward multiply + activation.** The activation is applied while the result is
+**6 · Skipping masked-out regions entirely.** Where each word may only look at earlier words, over
+half the grid would be computed and discarded. The kernel is told the mask is triangular rather than
+handed it as data, so it stops early instead.
+
+**7 · Fused feed-forward multiply + activation.** The activation is applied while the result is
 still in registers, so the multiplication's output is never written out and read back.
 
-**7 · fp16 instead of TF32.** The multiply units run about twice as fast on fp16, and both formats
+**8 · fp16 instead of TF32.** The multiply units run about twice as fast on fp16, and both formats
 carry the same number of precision digits — speed at no accuracy cost.
 
-**8 · One combined Query/Key/Value multiplication.** Three narrow multiplications became one wide
+**9 · fp16 values feeding the multiplications.** Item 8 changed what the multiply units compute in;
+this changes what is handed to them. Where the next multiplication will take fp16 anyway, the step
+before it writes fp16 directly — no conversion, and half as much data moved.
+
+**10 · Overlapped key/value loading.** The kernel used to fetch a batch of Keys and Values, wait for
+it, then compute. It now fetches the next batch while still using the current one, so the wait
+disappears.
+
+**11 · One combined Query/Key/Value multiplication.** Three narrow multiplications became one wide
 one, which fills the card in a single pass and removes the clean-up passes of problem 3.
 
-**9 · Fused residual add + normalisation.** Every normalisation follows a residual addition, so the
+**12 · Fused residual add + normalisation.** Every normalisation follows a residual addition, so the
 two are one kernel and the sum stays on the chip.
 
-**10 · Writing results straight out instead of staging them.** The output used to be parked in fast
-local memory before being written to main memory. Writing it directly frees 8–16 KB per block,
-which lets more blocks run at once — from three to four at most head sizes, and one to two at the
-largest.
+**13 · Writing results straight out instead of staging them.** The output used to be parked in fast
+local memory first. Writing it directly frees 8–16 KB per block, which lets more blocks run at once.
 
-**11 · Splitting long key ranges across the chip.** With few sequences and few heads there is not
+**14 · Splitting long key ranges across the chip.** With few sequences and few heads there is not
 enough independent work to occupy the card, so the key range is split across extra blocks and
 combined afterwards.
 
-**12 · Normalisation rewritten to one warp per row.** Each row's totals are accumulated by direct
-register-to-register exchange within one small group of threads, rather than through shared
-memory.
+**15 · Normalisation rewritten to one warp per row.** Each row's totals are exchanged directly
+between threads' registers, rather than through shared memory.
 
-**13 · Softmax computed in base 2.** The card has a fast instruction for powers of two but reaches
+**16 · Softmax computed in base 2.** The card has a fast instruction for powers of two but reaches
 powers of *e* by a slower route. Folding a constant into the earlier scaling converts one into the
 other exactly.
 
+**17 · Softmax kept in the multiply units' own registers.** The score tile used to be written to
+fast local memory, read back, softmaxed and written again. The multiply units already leave it in
+the threads' registers, so each row's maximum and sum are found there instead.
+
+**18 · Writing four results at a time out of the multiply kernel.** The kernel wrote one value per
+instruction, which leaves each memory transaction partly empty. Writing four at once fills it.
+
 ---
 
-### 5.2 Execution-level optimizations
+### 6.2 Execution-level optimizations
 
 | # | Optimization | Goal | Effect |
 | :---: | --- | :---: | --- |
@@ -873,35 +937,28 @@ other exactly.
 | 7 | Splitting the batch when memory runs out | — | Prevents outright failure |
 
 **1 · Recording and replaying the kernel sequence — a CUDA graph.** Section 3.3 showed that below
-512 words the card finishes each kernel before the next arrives and waits, so making kernels faster
-does not help. Recording the sequence once and replaying it as a single instruction removes that
-wait. No arithmetic changes, and the code verifies the replayed output is identical before using a
-recording. It is switched on only below a measured size threshold; above it there is nothing to
-reclaim.
+512 words the card finishes each kernel before the next arrives and waits. Recording the sequence
+once and replaying it as a single instruction removes that wait. It is switched on only below a
+measured size threshold; above it there is nothing to reclaim.
 
 **2 · Reading Query/Key/Value in place.** The kernels are told how the data is laid out and read it
-where it sits, rather than having it copied into shape first. Only the spacing between rows
-changes, never the arrangement within a row, so reads stay as efficient as before.
+where it sits, rather than having it copied into shape first.
 
 **3 · Choosing the right kernel automatically per shape.** The tensor-core kernel is used wherever
 it applies, the simpler one where it does not. There is deliberately **no fallback to PyTorch's own
-attention**: an earlier version handed shapes over whenever PyTorch measured faster, silently
-sending two of the fourteen test shapes to code this project did not write. Removing that cost 0.8%
-on one shape and *gained* 5.5% on the other, where the reason for sending it away had stopped being
-true. A shape no kernel covers now reports an error.
+attention**: removing one cost 0.8% on a shape and *gained* 5.5% on another. A shape no kernel
+covers reports an error.
 
-**4 · Checking the mask once per pass.** The default settings still supply a mask marking
-everything valid. Detecting that requires reading a value back from the card, which stalls
-everything, so it is done once per pass and cached — which is also what makes recording the kernel
-sequence possible, since a recording cannot contain such a read.
+**4 · Checking the mask once per pass.** The default settings still supply a mask marking everything
+valid. Detecting that means reading a value back from the card, which stalls everything, so it is
+done once and cached — which is also what makes recording the sequence possible.
 
 **5 · Building the mask once and reusing it.** It depends only on the sequence length, so it is
 built the first time it is needed and kept.
 
 **6 · A catch-all kernel for uncommon head sizes.** The specialised kernels cover the common head
-sizes. Since there is no fallback, anything else — a model width of 768 over 8 heads, for instance
-— would otherwise fail. A general version of the simple kernel takes its sizes as ordinary
-arguments and covers everything left over.
+sizes. Since there is no fallback, a general version of the simple kernel takes its sizes as
+ordinary arguments and covers everything left over.
 
 **7 · Splitting the batch when memory runs out.** The largest test shapes can exceed the card's
 8 GB, and on Windows an oversized allocation does not fail cleanly — it spills into system memory
@@ -909,41 +966,27 @@ and crawls. The peak requirement is predicted, and the batch split when it would
 
 ---
 
-### 5.3 Tuning the block shapes
+### 6.3 Tuning the block shapes
 
-A **block** is a group of threads that together handle one piece of the problem. For attention its
-shape is two numbers: how many words it takes at a time, and how many Keys it compares them against
-per step. Together they decide how much fast local memory the block needs, and so how many blocks
-fit on a processor at once.
-
-This changes nothing about what is computed — it only selects constants. But it is worth more than
-most of the structural changes, and its effect multiplies with all of them.
-
-**The shapes can only be measured, not reasoned about.** Past a certain size the compiler runs out
-of registers and spills to slow memory, and the penalty is a cliff: at 64 dimensions per head one
-tile size runs in **1.5 ms** and the next size up in **10.9 ms**. Sweeping every sensible shape
-instead of picking a plausible one took the tile kernel from **16.8 ms to 1.3 ms**. Each combination
-of head size, precision and masking gets its own shape, because the winner moves with all three.
-
-**Two rules keep a sweep trustworthy**, both learned by getting them wrong:
-
-- **Never compare timings from different runs.** One shape appeared to win by 1.58× when measured
-  separately, and placed fourth of five when candidates were timed alternately in one run.
-- **Score short and long sequences together.** Raw milliseconds weight a 2048-word case about ten
-  times a 128-word one, so an early sweep scored only long cases and picked a shape 20% worse on
-  short ones.
-
-**One useful result was negative.** Later changes freed a third of each block's local memory, and
-spending it on a wider key tile lost about half the speed — a wider tile doubles the data staged per
-step without adding parallelism, and the Query is already in registers. The memory is better left as
-headroom for more blocks.
-
-A shape is only valid for the kernel it was measured on: any change to a block's memory needs moves
-the trade-off, and the sweep has to be repeated.
+A **block** is a group of threads working on one piece of the problem, and for attention its shape
+is two numbers: how many words it takes at a time, and how many Keys it compares them against per
+step. Together they fix how much fast local memory the block needs, and so how many blocks fit on a
+processor at once. Choosing them changes nothing about what is computed, but it is worth more than
+most of the structural changes and its effect multiplies with all of them. The shapes can only be
+measured, not reasoned about: past a certain size the compiler runs out of registers and spills to
+slow memory, and the penalty is a cliff — at 64 dimensions per head one tile size runs in **1.5 ms**
+and the next size up in **10.9 ms**. Sweeping every sensible shape instead of picking a plausible
+one took the tile kernel from **16.8 ms to 1.3 ms**, and each combination of head size, precision
+and masking gets its own, because the winner moves with all three. Two rules keep a sweep honest,
+both learned by getting them wrong: never compare timings from separate runs, and score short and
+long sequences together. One result was usefully negative — later changes freed a third of each
+block's local memory, and spending it on a wider key tile lost about half the speed, so it is better
+left as headroom for more blocks. A shape is only valid for the kernel it was measured on: any
+change to a block's memory needs moves the trade-off, and the sweep has to be repeated.
 
 ---
 
-## 6. Architecture and Dispatch
+## 7. Architecture and Dispatch
 
 Several kernels now exist for the same job, so something has to choose between them. The full
 decision graph, with every rule and its location in the source, is in
@@ -955,7 +998,7 @@ deliberate constraint rather than an accident of the design, for two reasons: a 
 card would stall it, and recording the kernel sequence for replay is only possible if the sequence
 contains no such decisions.
 
-### 6.1 The forward pass
+### 7.1 The forward pass
 
 
 ```mermaid
@@ -1003,7 +1046,7 @@ Measured with PyTorch's synchronisation debugger, a settled forward pass perform
 between card and processor. The mask check is the only point that ever needs one, and its answer is
 remembered against the mask itself, so it costs one wait during warm-up and none afterwards.
 
-### 6.2 Choosing the attention kernel
+### 7.2 Choosing the attention kernel
 
 ```mermaid
 flowchart TD
@@ -1036,11 +1079,11 @@ an awkward shape to a prebuilt implementation. This one does not, because implem
 the task — a shape nothing covers is reported rather than quietly served by code this project did
 not write. All fourteen graded test shapes run on the tensor-core kernel.
 
-The layout check at the top is optimization 2 from section 5.2: when Query, Key and Value are three
+The layout check at the top is optimization 2 from section 6.2: when Query, Key and Value are three
 slices of one result, as the combined multiply leaves them, they are read where they sit and the
 copy never happens.
 
-### 6.3 Inside the attention kernel
+### 7.3 Inside the attention kernel
 
 
 ```mermaid
@@ -1095,8 +1138,8 @@ flowchart TD
     classDef glb fill:#e0f2fe,stroke:#0284c7,color:#0f172a;
     classDef gate fill:#f1f5f9,stroke:#64748b,color:#0f172a;
     classDef box fill:transparent,stroke:#94a3b8;
-    class pf,pp,pz,g2 reg;
-    class pq,stage,g1,sm shm;
+    class pf,pp,pz,g1,sm,g2 reg;
+    class pq,stage shm;
     class part,comb,d1,d2,norm glb;
     class sp,dir gate;
     class entry,out glb;
@@ -1104,15 +1147,15 @@ flowchart TD
 ```
 
 Green is a value held in registers, the fastest storage a thread has, amber the chip's fast shared
-memory, blue the card's main memory. Sections 6.1 and 6.2 stop at the launch; this is what the
+memory, blue the card's main memory. Sections 7.1 and 7.2 stop at the launch; this is what the
 chosen kernel does once the card is running it.
 
 The loop is the algorithm of section 4.1: **score, softmax, accumulate**, one batch of Keys at a
 time. Two things in it are worth pointing at. The Query and the answer are green for the whole
-loop — they are loaded into registers once and stay there, so the only traffic each time round is
-the batch of Keys and Values. And softmax appears twice: the exponential and the running totals are
-done per batch, but the division that finishes it cannot happen until every Key has been seen, so
-it waits until *Finish*.
+loop — loaded into registers once and left there — and since optimization 17 the scores are too, so
+the only thing touching shared memory each time round is the batch of Keys and Values. And softmax
+appears twice: the exponential and the running totals are done per batch, but the division that
+finishes it cannot happen until every Key has been seen, so it waits until *Finish*.
 
 **The softmax lane assignment.** Step 2 gives each thread a whole row rather than a column, which
 section 4.4 measured at 1.94× — the largest single improvement in the kernel:
@@ -1132,7 +1175,7 @@ flowchart LR
         direction TB
         n1["each thread takes<br/>a whole row instead"]
         n2["so it can add up<br/>its own row by itself"]
-        n3["only <b>one</b> exchange left,<br/>between the two threads<br/>sharing a row"]
+        n3["only <b>two</b> exchanges left,<br/>among the four threads<br/>sharing a row"]
         n4["the largest single<br/>improvement in the kernel"]
         n1 --> n2 --> n3 --> n4
     end
@@ -1147,12 +1190,12 @@ flowchart LR
     class old,new box;
 ```
 
-A thread group is 32 threads and a stripe is 16 rows, so on the right exactly two threads share
-each row — which is the one exchange that remains.
+The matrix units leave each 16-row stripe spread so that four threads hold one row between them,
+which is the two exchanges that remain.
 
 ---
 
-### 6.4 Precision is a separate choice
+### 7.4 Precision is a separate choice
 
 Which kernel runs and which number format it computes in are **independent**. They used to be one
 setting, which meant asking for a precision also meant asking for a kernel. Splitting them means
@@ -1170,7 +1213,7 @@ The choice only arises for full-precision input — data already supplied in a 1
 computed in that format, since narrowing further is pointless and widening cannot recover what was
 lost.
 
-### 6.5 The decisions and their thresholds
+### 7.5 The decisions and their thresholds
 
 | Decision | Threshold | What happens past it |
 | --- | --- | --- |
@@ -1178,6 +1221,9 @@ lost.
 | Cached recordings kept | 4 | Further shapes run normally |
 | Release a recording's memory | 25% of the card | Released rather than held |
 | Fuse the whole post-attention block | model width 64 | Four separate kernels |
+| Projections on the custom matrix kernel | 2,097,152 rows | PyTorch's own routine — the edge of tested ground |
+| fp16 into the projection multiply | 1,024 rows, as a minimum | Below it, full precision; the conversion costs more than it saves |
+| fp16 for the normalised value | model width 128 | Full precision; at width 1024 it is a 15% loss |
 | Warp-per-row normalisation | width 256 | One thread per value instead |
 | Split the batch | 85% of card memory predicted | Batch split into pieces |
 | Split long key ranges | grid fills under 1/8 of the card | Single pass |
@@ -1188,14 +1234,14 @@ measurement behind it in [csrc/TUNING.md](csrc/TUNING.md).
 
 ---
 
-## 7. Dashboard and Profiling
+## 8. Dashboard and Profiling
 
 Four attention kernels, four precision modes, several execution switches and fourteen graded
 shapes make far more combinations worth measuring than is comfortable to drive by hand. A local web
 page wraps the existing benchmark scripts so a configuration can be picked, run and read as a
 table.
 
-### 7.1 What it is
+### 8.1 What it is
 
 A page served locally in a browser, built from Python's standard library and one hand-written HTML
 file. No new dependencies, no build step. It is started from the project directory:
@@ -1233,7 +1279,7 @@ worst error, how many values failed, the two timings and the resulting speedup. 
 run finishes, and the raw log sits underneath so any number can be checked against what the harness
 actually printed.*
 
-### 7.2 The measurement rules it enforces
+### 8.2 The measurement rules it enforces
 
 The point of the page is not convenience. It is that the rules which make a measurement meaningful
 are easy to forget when running things by hand, so they are built in.
@@ -1252,7 +1298,7 @@ are easy to forget when running things by hand, so they are built in.
   divisible by the head count, a shape too large for the card — each is caught before starting,
   rather than after 5 to 15 seconds of loading.
 
-### 7.3 Profiling
+### 8.3 Profiling
 
 Two NVIDIA tools answer different questions, and both are driven from the Profile tab.
 
@@ -1292,284 +1338,109 @@ optimizations target memory traffic rather than operation count.*
 than an error. Inside a traced process the custom kernels could not be compiled, and the model used
 to respond by quietly falling back to a prebuilt attention — so the profile measured library code
 instead of this project's kernels and looked entirely normal. Removing that fallback, described in
-section 5.2, turned it into a loud failure. A profiler that silently measures the wrong program is
+section 6.2, turned it into a loud failure. A profiler that silently measures the wrong program is
 worse than one that refuses to run.
 
 ---
 
-## 8. Results
+## 9. Results
 
 All fourteen graded shapes, measured on the hardware in section 2.1. Every one passes the accuracy
-check, with **zero** failing values out of the billions compared.
-
+check, with **zero** failing values out of the 6.93 billion compared.
 
 | Measure | Speedup |
 | --- | ---: |
-| Geometric mean | **8.13×** |
-| Median | **9.39×** |
-| Best — shape 2, batch 1 | **39.67×** |
-| Worst — shape 8, d_model 1024 | **1.41×** |
+| Geometric mean | **10.04×** |
+| Median | **13.75×** |
+| Best — shape 3, batch 4 | **46.93×** |
+| Worst — shape 6, batch 10,000 | **1.52×** |
 | Shapes at or above 4× | 11 of 14 |
 | Shapes failing the accuracy check | **0 of 14** |
 
 ![Speedup on each of the 14 official test shapes](images/speedup-by-shape.png)
 
-### 8.1 Reading the spread
+### 9.1 Reading the spread
 
-The range is wide — 1.41× to 39.67× — and it is not random. It tracks exactly what sections 3.2 and
-3.3 predicted about where the baseline wastes time.
+The range is wide — 1.52× to 46.93× — and it is not random. It tracks what sections 3.2 and 3.3
+predicted about where the baseline wastes time, with one addition they did not: at the top of the
+size range the card itself, not the code, sets the limit.
 
-**The biggest gains are where the card was idle.** Shapes 2 and 3 have a batch of 1 and 4. There is
-so little work per instruction that the baseline spends most of its time waiting to be given
-something to do rather than computing. Removing that wait is worth 39.7× and 23.4×, and almost
-none of it is faster arithmetic.
+**The biggest gains are where the card was idle.** Shapes 2, 3 and 4 have batches of 1, 4 and 16,
+and shape 12 a sequence of 32. There is so little work per instruction that the baseline spends most
+of its time waiting to be given something to do rather than computing. Removing that wait is worth
+33.7×, 46.9×, 24.8× and 28.5×, and almost none of it is faster arithmetic.
 
 **The next tier is where the score grid dominates.** Shapes 13 and 14 have the longest sequences in
 the set, so the grid — which grows quadratically — is the largest thing in the model. Never writing
-it out is worth 15.1× and 22.8×.
+it out is worth 21.2× and 14.9×.
 
-**The smallest gain is where the baseline was already efficient.** Shape 8 is the widest model at
-1024, where the feed-forward network dwarfs attention and the card is kept busy either way. At
-1.41× the optimizations still help, but there was less waste to remove.
+**The two smallest gains are both cases where the baseline was already efficient**, which is a
+statement about the denominator rather than about the kernels. Shape 8 is the widest model at 1024,
+where the feed-forward network dwarfs attention and the card is kept busy either way; its
+multiplications are 77% of its time, and the custom kernel already runs them 1.5× to 1.7× faster
+than the library. Shape 6 is a batch of 10,000, whose working set does not fit in 8 GB — it runs its
+whole forward pass at about a quarter of the memory speed the same kernels reach on shapes that do
+fit. Both are limited by something no kernel change reaches, which is why they read 1.80× and 1.52×
+while everything else is above 3×.
 
 **Shapes 9 and 10 are the honest low points among the attention-heavy cases.** One and two heads
 give the card very few independent pieces of work, so much of it sits idle no matter how the kernel
-is written. Splitting the key range recovers some of this, but not all — this is the case the
-kernel is least suited to.
+is written. Splitting the key range recovers some of this, but not all.
 
-### 8.2 Shape 14, and the limits of an 8 GB card
+### 9.2 Shape 14, and the limits of an 8 GB card
 
 Shape 14 is a batch of 32 sequences of 100,000 words at a width of 1024. Its input alone is
-**12.2 GB**, against a card with **8 GB** of memory. It does not fit, and no kernel optimization
-changes that.
-
-The model handles it by **slicing the batch**: rather than processing all 32 sequences together, it
-processes them in pieces and joins the results. The reported figure of 1.89 seconds is therefore
-per slice, and the whole batch takes proportionally longer — the 2,346 seconds the run took overall
-is dominated by this one shape.
-
-Two details make this more than a convenience.
-
-**It is predicted, not discovered by failing.** On Windows an over-large allocation does not raise a
-clean error — it spills into system memory and slows to a crawl, which is far harder to diagnose
-than a crash. So the model estimates the peak requirement before starting and splits up front when
-it would exceed 85% of the card, falling back to halving the batch if it turns out to have
-underestimated.
-
-**Slicing is not free of consequences for the numbers.** The matrix-multiply library chooses its
-method partly from how many rows it is given, so a sliced run does slightly different arithmetic
-from a whole one — measured at about 6.5e-4 of movement. That is why the chosen slice size is
-cached per shape rather than re-derived: a result that changes depending on how the work happened
-to be divided is not a result. Shape 14 still passes with its worst error at 7.4e-4, comfortably
-inside the budget.
-
-This is the one place where the hardware, rather than the implementation, sets the ceiling. A card
-with more memory would run the shape whole and report a single figure; this one cannot, and the
-report says so rather than quoting a number that hides it.
+**12.2 GB** against a card with **8 GB**, so it does not fit, and no kernel optimization changes
+that. The model slices the batch instead — processing the sequences in pieces and joining the
+results — which is why the reported 1.56 seconds is per slice, and why this one shape accounts for
+1,748 seconds of the run on its own. Two things make that more than a convenience. It is predicted
+rather than discovered by failing: on Windows an over-large allocation does not raise a clean error,
+it spills into system memory and crawls, so the peak is estimated before starting and the batch
+split when it would exceed 85% of the card. And it is not free of consequences for the numbers,
+because the matrix-multiply library picks its method partly from how many rows it is given, so a
+sliced run does slightly different arithmetic from a whole one — about 6.5e-4 of movement, which is
+why the slice size is cached per shape rather than re-derived, and shape 14 still passes with its
+worst error at 7.5e-4. This is the one place where the hardware rather than the implementation sets
+the ceiling, and shape 6 is the same story one size down.
 
 ---
 
-## 9. Limitations
+## 10. Limitations
 
-### 9.1 The matrix-multiply hardware is barely used
+### 10.1 The matrix-multiply hardware is barely used
 
 The kernels were written to reach the card's matrix-multiply units, and they do — but the counters
-show they spend very little time actually running them.
+show every one of them is limited by memory rather than by arithmetic. The attention kernel keeps
+the matrix units busy only **13%** of the time and occupies **22%** of what the card could be
+running at once, the consequence of each thread holding 128 registers, which is what keeps the Query
+and the running output on chip in the first place. Two things follow: the remaining headroom is
+real, since nothing is near the card's arithmetic limit, and it will not come from doing less
+arithmetic, because the kernels are waiting on data. Further gains have to come from moving less of
+it, or from keeping more work resident so the waiting overlaps with something useful. One
+measurement is already ideal — the attention kernel reads exactly 4 memory sectors per request
+against a best case of 4 — so what it reads is efficient; there is simply a lot of it.
 
-| Kernel | Time | Arithmetic | Memory | Matrix units | Occupancy | Verdict |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Attention | 30.2 µs | 27.7% | 64.8% | **13.1%** | 22.4% | leans memory |
-| Add + normalise | 23.2 µs | 46.8% | 82.9% | 0% | 85.5% | memory bound |
-| Multiply + activate | 95.7 µs | 32.6% | 83.9% | **29.3%** | 61.6% | memory bound |
-
-Every kernel is limited by memory rather than by arithmetic. The attention kernel keeps the
-matrix-multiply units busy only 13% of the time, and occupies 22% of what the card could be running
-at once — the consequence of each thread holding 128 registers, which is what keeps the Query and
-the running output on chip in the first place.
-
-Two things follow. **The remaining headroom is real**, since nothing here is near the card's
-arithmetic limit. And **it will not come from doing less arithmetic** — the kernels are waiting on
-data. Further gains have to come from moving less of it, or from keeping more work resident so the
-waiting overlaps with something useful.
-
-One measurement in that table is already ideal: the attention kernel reads exactly 4 memory sectors
-per request against a best case of 4, so its access pattern cannot be improved. What it reads is
-efficient; there is simply a lot of it.
-
-### 9.2 Everything is tuned for exactly one machine
+### 10.2 Everything is tuned for exactly one machine
 
 None of the numbers that make this fast were derived. They were measured, on one card, and they do
-not transfer.
-
-| Constant | Value | What it decides |
-| --- | ---: | --- |
-| Graph capture gate | 524,288 | Whether the kernel sequence is recorded and replayed |
-| Fused block width limit | 64 | Whether the whole post-attention chain becomes one kernel |
-| Warp-per-row limit | 256 | Which normalisation kernel runs |
-| Block shapes | per head size, format and masking | Every attention kernel's tile size |
-
-On a faster card several of these move in ways that are not obvious. The graph gate, for instance,
-should get **larger**, not smaller: it marks the point where the card stops running out of work
-between instructions, and a quicker card reaches that point at a bigger workload. Someone reusing
-this on other hardware would need to re-measure all of it, and the sweeps that produced these values
-take hours.
-
-The build is equally specific. It expects Windows, Microsoft's C++ compiler pinned to one version,
+not transfer: the graph-capture gate, the width below which the post-attention chain fuses, the
+normalisation crossover and every attention block shape are all constants fitted to this hardware.
+On a faster card several move in ways that are not obvious — the graph gate should get **larger**,
+not smaller, because it marks the point where the card stops running out of work between
+instructions, and a quicker card reaches that point at a bigger workload. Anyone reusing this
+elsewhere would have to re-measure all of it, and the sweeps that produced these values take hours.
+The build is equally specific: it expects Windows, Microsoft's C++ compiler pinned to one version,
 and a Microsoft-only tool to locate it. Nothing here has been run on Linux.
 
-
-### 9.3 The understanding behind this is newer than the results suggest
+### 10.3 The understanding behind this is newer than the results suggest
 
 I had a solid foundation in the basics of CUDA and GPU architecture. What was new was the specific
 ground this project stands on — FlashAttention, the tensor-core interfaces, the tile programming
-model, and this particular toolchain — and that was learned over a few days while building against
-it. The results are measured and they hold, but the understanding underneath the newer parts is
-uneven, and in several places it was demonstrably wrong before it was right.
+model, and this particular toolchain — learned over a few days while building against it. The
+results are measured and they hold, but the understanding underneath the newer parts is uneven, and
+in several places it was demonstrably wrong before it was right. The design carries the same mark:
+the architecture in section 7 grew as each piece was understood rather than being planned once, so
+several of its gates exist because of a measurement rather than because the structure needed them.
+A second attempt would likely be simpler and — given that section 10.1 shows the kernels are nowhere
+near the card's limits — faster; more time would go there before it went on new features.
 
-The design carries the same mark. The architecture in section 6 grew as each piece was understood
-rather than being planned once, so several of its gates exist because of a measurement rather than
-because the structure needed them. A second attempt would likely be simpler, and — given that
-section 9.1 shows the kernels are nowhere near the card's limits — faster. More time would go there
-before it went on new features.
-
----
-
-## 10. AI Involvement During Development
-
-The large optimizations are the obvious ones. Keeping the score grid on the chip, reaching the
-tensor cores, fusing neighbouring steps — those follow from reading the profile and knowing what a
-GPU is bad at. Where AI earned its place was everything after that: suggesting and implementing the
-smaller optimizations that would not otherwise have been found, or would have been found and judged
-not worth the time.
-
-### 10.1 The tools, and what they enabled
-
-**Claude Opus** did the bulk of the kernel writing, debugging, measurement and documentation,
-working from a procedure adapted from **CUDA-Agent** — a published CUDA kernel development agent
-from ByteDance and Tsinghua. **Gemini Flash** handled supporting questions and concept checks.
-
-**What that made possible is breadth.** The project is not one kernel but a matrix of them, because
-no single kernel wins everywhere:
-
-| | Coverage |
-| --- | --- |
-| Attention kernels | 4 — tensor-core, tuned scalar, general scalar, tile |
-| Number formats | 4 — fp32, TF32, fp16, bf16, as an axis independent of the kernel |
-| Head sizes specialised | 6, plus a general path covering everything to 2048 |
-| Other kernels | 4 — two normalisation variants, fused multiply + activation, fused post-attention block |
-| Block shapes | Swept per head size, per format, per masking mode |
-
-That is 11 kernel definitions across roughly 5,700 lines of CUDA, with 32 measurement scripts and
-2,400 lines of recorded tuning results behind them. Writing and tuning that surface area by hand in
-the time available would not have been possible.
-
-**The dashboard in section 7 exists for the same reason.** It is a web application — a server, a
-job queue, a page that reads the harness's own argument definitions out of the source so it never
-falls out of step with them — and none of it is GPU work. On its own it would have been days of
-effort that produced no kernel at all, which is exactly the kind of thing that gets skipped under
-time pressure. Built quickly, it paid for itself: every measurement rule in section 7.2 is enforced
-by the tool rather than remembered by the person running it, and the profiling in section 7.3 is
-what located the launch-bound region and the memory limits that the optimizations were then aimed
-at.
-
-### 10.2 The optimization development loop
-
-Everything in section 10.1 came out of one cycle, run over and over. There are two gates in it, and
-both of them are me.
-
-```mermaid
-flowchart TD
-    cycle(["start of a cycle"]) --> propose["research agent proposes<br/>an optimization"]
-    propose --> g1{"worth testing?"}
-    g1 -->|"yes"| base["measure the current best"]
-    g1 -->|"no"| propose
-    base --> build["implement the proposal"]
-    build --> retime["time the two alternately,<br/>alongside a control"]
-    retime --> ana["compare and analyse"]
-    ana --> verdict["agent proposes<br/>keep or reject"]
-    verdict --> g2{"do I agree?"}
-    g2 -->|"reject"| drop["reverted"]
-    g2 -->|"keep"| keep["Recorded and Commited"]
-    drop --> nxt(["next cycle"])
-    keep --> nxt
-    nxt -.-> propose
-
-    classDef ai fill:#f1f5f9,stroke:#64748b,color:#0f172a;
-    classDef me fill:#fef3c7,stroke:#d97706,color:#0f172a;
-    classDef mrun fill:#dcfce7,stroke:#16a34a,color:#0f172a;
-    classDef bad fill:#fecdd3,stroke:#e11d48,color:#9f1239;
-    class propose,build,ana,verdict ai;
-    class g1,g2 me;
-    class base,retime,keep mrun;
-    class drop bad;
-```
-
-Grey is the agent working, amber a decision I make.
-
-**The loop could close without me.** Neither gate is strictly necessary. The second one is already
-arithmetic: run the control, take the spread, keep only what clears it. The first is a priority
-call, which a ranked queue of candidates could make just as well. Give each proposal its own branch
-and revert automatically on a regression, and the cycle runs unattended.
-
-**I kept both gates anyway.** The first reason is that I wanted to learn this, and the way that
-happened was seeing a proposal, predicting what it would do, and being wrong in front of a
-measurement. An unattended loop would have produced the same kernels and left me unable to defend a
-single decision inside them.
-
-The second is that measurement only catches what it measures. It compares speed against a control
-and accuracy against a tolerance, and it is good at that. It does not catch a proposal that is
-faster because it quietly made the problem smaller — a kernel that stops covering a case, a
-constant fitted on one shape and applied to all of them. Those pass every numeric check. Only
-someone who knows what the kernel was meant to do will stop them.
-
-The cost is throughput. The loop runs no faster than I can read it, and that is the trade taken
-deliberately: fewer cycles, each one understood.
-
-### 10.3 What it could not be trusted with
-
-AI is confident whether or not it is right. A wrong answer arrives just as quickly, and sounds just
-as reasonable, as a correct one — so reading the output is not enough to tell them apart. The same
-goes for the kernels themselves: one that produces slightly wrong numbers looks exactly like one
-that produces right numbers until something compares them.
-
-This happened repeatedly. The three examples in section 9.3 were all confident, plausible and
-wrong, and not one of them was spotted by reading. Every one was caught by running a measurement.
-
-That is why the rules in section 7.2 matter so much here. They exist to make checking cheap enough
-to do every single time, rather than occasionally:
-
-- time two versions alternately, so they face the same conditions
-- always run a control — the same version against itself — to see how much the machine varies
-- ignore any difference smaller than that variation
-- re-measure the current best alongside anything claiming to beat it
-
-Two habits come from the same problem. Every optimization that can be turned off **was left
-switchable**, so its benefit can be measured instead of assumed. And every tuned constant is written
-down in `csrc/TUNING.md` next to the measurement that produced it, so any number can be traced back
-to a run rather than to somebody's memory of one.
-
-### 10.4 Working with AI, not instead of it
-
-Neither side of this project would have worked alone.
-
-**AI supplied speed and coverage.** Writing eleven kernels against unfamiliar interfaces, and
-sweeping block shapes across every head size and number format, is more work than the time allowed.
-It also suggested things I would not have reached for — the base-2 softmax, and classifying key
-tiles rather than testing every score, both came from that direction.
-
-**I supplied the judgement about what to keep.** Section 10.3 is the reason: AI is equally
-confident when it is wrong, so someone has to decide what is actually true. That meant knowing
-which questions were worth measuring, recognising when an answer was too good to believe, and
-noticing when an explanation had been repeated so often that nobody had checked it. The three
-reversals in section 9.3 were all found that way.
-
-The foundation in CUDA and GPU architecture is what made that judgement possible. Without it I
-could not have told a real optimization from a plausible-sounding one, or known that a kernel using
-13% of the matrix-multiply hardware has something left to give. AI without that check produces
-confident nonsense; the knowledge without AI produces one carefully tuned kernel instead of
-eleven.
-
-The working pattern that came out of it was simple. AI proposed, I decided what was worth testing,
-and the measurement settled it. Everything in the project that looks like discipline — the
-switches, the control runs, the tuning record — exists to keep that last step honest, because it is
-the only part neither of us can argue our way past.
