@@ -146,11 +146,17 @@ reaches. The per-case reasoning is in [TechnicalReport.md](TechnicalReport.md), 
 
 | Requirement | Detail |
 | --- | --- |
+| Graphics card | An NVIDIA card. Compute capability 8.0 or newer for the tensor-core kernel; older cards fall back to the simple one |
+| Operating system | Windows. Every command below is PowerShell or `cmd`, and the build script finds MSVC the Windows way |
 | CUDA Toolkit | 13.3 or newer |
-| PyTorch | 2.12 with CUDA support |
+| PyTorch | 2.12 or newer, with CUDA support (2.12 and 2.13 both build here) |
 | Python | 3.10 or newer |
 | Compiler | MSVC — Visual Studio with the "Desktop development with C++" workload |
 | Build tool | `ninja` |
+
+The commands in this README are written for **PowerShell** or `cmd`. In Git Bash a backslash is an
+escape character, so `scripts\devenv.bat` arrives as `scriptsdevenv.bat` — use forward slashes
+there, or run them from PowerShell.
 
 The GPU code is compiled on your own machine on first use, so a C++ compiler is genuinely required.
 There is no PyTorch-only shortcut: the kernels *are* the project, and a build that fails stops the
@@ -184,8 +190,9 @@ It should finish with:
 [build_ext] OK -> ...\build\transformer_kernels.pyd
 ```
 
-The first build takes about 70 seconds. After that it is near-instant, and editing any GPU source
-file triggers a rebuild automatically — there is no separate build step to remember.
+A cold build — no `build/` directory at all — takes two to four minutes; measured here at 156 s
+against PyTorch 2.13 and 214 s against 2.12. After that it is near-instant, and editing any GPU
+source file triggers a rebuild automatically, so there is no separate build step to remember.
 
 Visual Studio's compiler is not available in an ordinary terminal, only in its own developer
 prompt. `scripts\build_ext.bat` finds it and sets that up for you, which is why the command goes
@@ -224,7 +231,7 @@ value; a slower one wants a smaller one.
 To re-derive it on your own machine:
 
 ```bash
-cmd.exe /c scripts\devenv.bat python scriptsb_graph.py --recommend
+cmd.exe /c scripts\devenv.bat python scripts\ab_graph.py --recommend
 ```
 
 It sweeps the size axis and prints the value to use. Put that number in `_GRAPH_MAX_ACTIVATION`
@@ -255,6 +262,15 @@ cmd.exe /c scripts\build_ext.bat
 If that version is not installed, the script lists the ones that are.
 
 **"'vswhere.exe' is not recognized."** Harmless. The build succeeds anyway.
+
+**"Cannot open include file: 'ATen/ops/…​.h'", naming a header that is plainly there.** Windows'
+260-character path limit, not a broken PyTorch install. Some ATen headers have very long names, so a
+deeply nested Python environment pushes them over the line and the compiler reports them as missing.
+Move the environment — or the repository — somewhere shorter, or enable long paths:
+
+```powershell
+reg add HKLM\SYSTEM\CurrentControlSet\Control\FileSystem /v LongPathsEnabled /t REG_DWORD /d 1 /f
+```
 
 **It runs, but is slower than expected.** Check which kernel actually ran by passing `--attn-impl`.
 

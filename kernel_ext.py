@@ -418,24 +418,32 @@ def get_kernels(verbose: bool = False):
             f"-gencode=arch=compute_{arch},code=compute_{arch}",
         ]
 
+        # CUDA 13.3's CCCL headers break under MSVC's traditional preprocessor;
+        # this is the fix NVIDIA's own error names. It belongs on BOTH build
+        # paths, not just the cuTile one: fused_attention.cu reaches the same
+        # headers either way, so while it was tile-only, a toolkit without
+        # cuTile could not build at all -- and the no-tile retry below always
+        # died here instead of reporting the tile build's real error.
+        base_cflags = []
+        if sys.platform == "win32":
+            base_cuda_flags += ["-Xcompiler", "/Zc:preprocessor"]
+            base_cflags = ["/Zc:preprocessor"]
+
         def do_load(with_tile: bool):
             cuda_flags = list(base_cuda_flags)
-            cflags = None
+            cflags = list(base_cflags)
             if with_tile:
                 cuda_flags += [
                     "-std=c++20",       # <cuda_tile.h> refuses anything older
                     "-enable-tile",     # without it __tile_global__ is ignored
                     "-DTRANSFORMER_HAVE_TILE",
-                    # CUDA 13.3's CCCL headers break under MSVC's traditional
-                    # preprocessor; this is the fix NVIDIA's own error names.
-                    "-Xcompiler", "/Zc:preprocessor",
                 ]
-                cflags = ["/std:c++20", "/Zc:preprocessor"]
+                cflags += ["/std:c++20"] if sys.platform == "win32" else ["-std=c++20"]
             return load(
                 name="transformer_kernels",
                 sources=_SOURCES,
                 build_directory=_BUILD_DIR,
-                extra_cflags=cflags,
+                extra_cflags=cflags or None,
                 extra_cuda_cflags=cuda_flags,
                 verbose=verbose,
             )
@@ -450,11 +458,13 @@ def get_kernels(verbose: bool = False):
                 # tile_attention.cu then compiles to its declining stub.
                 #
                 # If the retry ALSO fails, report the tile build's error rather
-                # than the retry's. An ordinary compile error in
-                # fused_attention.cu fails both, and the retry's flags lack
-                # /Zc:preprocessor -- so the second failure surfaces as CUDA
-                # 13.3's CCCL preprocessor complaint and buries the real
-                # message. That cost a debugging session once.
+                # than the retry's: an ordinary compile error in
+                # fused_attention.cu fails both, and the tile build is the one
+                # whose message names the actual line. The retry used to be
+                # actively misleading here -- its flags omitted
+                # /Zc:preprocessor, so it always died on CUDA 13.3's CCCL
+                # preprocessor complaint and buried the real error. That cost a
+                # debugging session once; the flag is now in base_cflags.
                 try:
                     _kernels = do_load(with_tile=False)
                     _tile_enabled = False

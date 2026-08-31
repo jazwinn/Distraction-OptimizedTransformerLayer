@@ -5,6 +5,8 @@
 # Everything else the project imports (argparse, http.server, json, math, os,
 # statistics, subprocess, time, dataclasses, typing) ships with the standard
 # library -- including the dashboard, which adds no dependencies of its own.
+# The one exception is matplotlib, at the bottom, which only the two chart
+# scripts use.
 #
 # The line below points pip at PyTorch's own package index so it installs a
 # build with GPU support. Plain PyPI gives the default build, which on Windows
@@ -20,3 +22,10 @@ torch>=2.12
 # csrc/ on first use. There is no prebuilt-attention fallback: if the extension
 # does not build, the benchmark raises rather than measuring something else.
 ninja
+
+# Only needed to regenerate the charts in images/ -- scripts/plot_speedups.py
+# and scripts/plot_ledger_progress.py, which draw speedup-by-shape.png and
+# geomean-by-iteration.png. Nothing in the benchmark, the kernels, the
+# verification scripts or the dashboard imports it, so a run that only measures
+# does not need it installed.
+matplotlib
