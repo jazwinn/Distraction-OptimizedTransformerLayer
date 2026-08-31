@@ -1,0 +1,22 @@
+flowchart TD
+    research["agent studies the kernels<br/>and proposes candidates"] --> ledger[("the ledger — the candidate list,<br/>and every past verdict")]
+    ledger --> pick["agent takes the<br/>next candidate"]
+    pick --> base["measure the current best"]
+    base --> build["implement the proposal"]
+    build --> retime["time the two alternately,<br/>alongside a control"]
+    retime --> ana["compare and analyse"]
+    ana --> g{"clears the rule?"}
+    g -->|"no"| drop["reverted"]
+    g -->|"yes"| keep["kept"]
+    drop --> record["written up, either way"]
+    keep --> record
+    record -.-> ledger
+
+    classDef ai fill:#f1f5f9,stroke:#64748b,color:#0f172a;
+    classDef store fill:#e2e8f0,stroke:#475569,color:#0f172a;
+    classDef mrun fill:#dcfce7,stroke:#16a34a,color:#0f172a;
+    classDef bad fill:#fecdd3,stroke:#e11d48,color:#9f1239;
+    class research,pick,build,ana ai;
+    class ledger,record store;
+    class base,retime,g,keep mrun;
+    class drop bad;
